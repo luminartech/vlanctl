@@ -1,12 +1,6 @@
 use crate::config::{Profile, Vlan};
 use crate::net::Cmd;
 
-/// One VLAN's bring-up: the interface name chosen plus its ordered commands.
-pub struct VlanBringup {
-    pub interface: String,
-    pub commands: Vec<Cmd>,
-}
-
 /// Build the ordered commands to bring up a single VLAN on `device`,
 /// using the interface name `iface` (e.g. "vlan0").
 pub fn bringup_commands(iface: &str, device: &str, vlan: &Vlan) -> Vec<Cmd> {
@@ -121,7 +115,7 @@ mod tests {
 
     #[test]
     fn allocate_skips_existing_units() {
-        let mut p: Profile = toml::from_str(
+        let p: Profile = toml::from_str(
             "name=\"t\"\n[[vlan]]\nid=1\naddress=\"1.1.1.1/24\"\n[[vlan]]\nid=2\naddress=\"2.2.2.2/24\"\n",
         )
         .unwrap();
