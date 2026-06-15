@@ -1,6 +1,10 @@
 name = "lum_legacy"
 description = "Legacy Luminar sensors: VLAN 10 and VLAN 11 share 192.168.10.0/24"
 
+# Physical adapter the VLANs trunk onto (USB 10/100/1000 LAN). Pinned because
+# auto-detect would otherwise grab en0 (Wi-Fi), which can't carry 802.1Q VLANs.
+device = "en7"
+
 # VLAN 10 — DoIP. Host .90, sensor .150.
 [[vlan]]
 id = 10
