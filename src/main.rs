@@ -19,13 +19,26 @@ fn profile_path(dir: &std::path::Path, name: &str) -> PathBuf {
 }
 
 /// Print the commands a recording runner captured, omitting read-only probes
-/// (`ifconfig -l`) so a dry run previews only the changes it would make.
+/// (device detection) so a dry run previews only the changes it would make.
 fn print_planned_commands(runner: &RecordingRunner) {
     for cmd in &runner.commands {
-        if cmd.program == "ifconfig" && cmd.args == ["-l"] {
+        if is_read_only_probe(cmd) {
             continue;
         }
         println!("{}", cmd.display());
+    }
+}
+
+/// A command that only inspects system state (used during device resolution),
+/// as opposed to one that creates/configures/destroys interfaces or routes.
+fn is_read_only_probe(cmd: &net::Cmd) -> bool {
+    match cmd.program.as_str() {
+        // `networksetup -listallhardwareports` lists adapters.
+        "networksetup" => true,
+        // `ifconfig -l` or `ifconfig <iface>` query; mutations take more args
+        // (e.g. `ifconfig vlan10 create ...`).
+        "ifconfig" => cmd.args.len() <= 1,
+        _ => false,
     }
 }
 

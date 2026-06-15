@@ -157,8 +157,10 @@ mod tests {
     use crate::net::RecordingRunner;
 
     fn profile() -> Profile {
+        // Pin `device` so these tests exercise apply/down orchestration without
+        // depending on device auto-detection (covered in device.rs tests).
         let p: Profile = toml::from_str(
-            "name=\"t\"\n\
+            "name=\"t\"\ndevice=\"en0\"\n\
              [[vlan]]\nid=100\naddress=\"192.168.10.2/24\"\n\
              [[vlan]]\nid=200\naddress=\"10.0.0.5/24\"\n",
         )
@@ -198,14 +200,13 @@ mod tests {
         let state_path = std::env::temp_dir().join("vlanctl-apply-fail.json");
         let _ = std::fs::remove_file(&state_path);
         let mut r = runner_with_device();
-        // Two `ifconfig -l` calls run first (resolve_device, then
-        // live_interfaces), so the command indices are:
-        //   [0]=ifconfig -l, [1]=ifconfig -l,
-        //   [2]=create vlan100, [3]=inet vlan100,
-        //   [4]=create vlan200 (fails here).
+        // With `device` pinned, resolve_device issues no commands, so:
+        //   [0]=ifconfig -l (live_interfaces),
+        //   [1]=create vlan100, [2]=inet vlan100,
+        //   [3]=create vlan200 (fails here).
         // vlan100 is fully configured; vlan200's create fails, so rollback must
         // destroy vlan100 only.
-        r.fail_at = Some(4);
+        r.fail_at = Some(3);
         let err = apply(&mut r, &profile(), &state_path, false).unwrap_err();
         assert!(err.to_string().contains("rolled back"));
 
