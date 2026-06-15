@@ -18,6 +18,17 @@ fn profile_path(dir: &std::path::Path, name: &str) -> PathBuf {
     dir.join(format!("{name}.toml"))
 }
 
+/// Print the commands a recording runner captured, omitting read-only probes
+/// (`ifconfig -l`) so a dry run previews only the changes it would make.
+fn print_planned_commands(runner: &RecordingRunner) {
+    for cmd in &runner.commands {
+        if cmd.program == "ifconfig" && cmd.args == ["-l"] {
+            continue;
+        }
+        println!("{}", cmd.display());
+    }
+}
+
 /// macOS: root has uid 0. Bail if not elevated.
 fn require_root() -> Result<()> {
     // SAFETY: getuid is always safe to call and has no preconditions.
@@ -62,9 +73,7 @@ fn main() -> Result<()> {
                     .stdout
                     .insert("ifconfig -l".to_string(), "lo0 en0".to_string());
                 commands::apply(&mut runner, &p, &state_path, true)?;
-                for cmd in &runner.commands {
-                    println!("{}", cmd.display());
-                }
+                print_planned_commands(&runner);
             } else {
                 require_root()?;
                 let mut runner = SystemRunner;
@@ -76,9 +85,7 @@ fn main() -> Result<()> {
             if dry_run {
                 let mut runner = RecordingRunner::default();
                 commands::down(&mut runner, &state_path, true)?;
-                for cmd in &runner.commands {
-                    println!("{}", cmd.display());
-                }
+                print_planned_commands(&runner);
             } else {
                 require_root()?;
                 let mut runner = SystemRunner;

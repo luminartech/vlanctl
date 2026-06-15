@@ -1,0 +1,15 @@
+# profiles/example.toml
+name = "example"
+description = "Sample two-VLAN sensor profile"
+
+[[vlan]]
+id = 100
+address = "192.168.10.2/24"
+
+  [[vlan.route]]
+  destination = "192.168.20.0/24"
+  gateway = "192.168.10.1"
+
+[[vlan]]
+id = 200
+address = "10.0.0.5/24"
