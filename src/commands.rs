@@ -107,10 +107,10 @@ pub fn list_profiles(dir: &Path) -> Result<Vec<String>> {
     }
     for entry in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
         let path = entry?.path();
-        if path.extension().and_then(|e| e.to_str()) == Some("toml") {
-            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                names.push(stem.to_string());
-            }
+        if path.extension().and_then(|e| e.to_str()) == Some("toml")
+            && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+        {
+            names.push(stem.to_string());
         }
     }
     names.sort();
