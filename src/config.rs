@@ -55,6 +55,24 @@ impl Profile {
             if !seen.insert(vlan.id) {
                 bail!("duplicate vlan id {} in profile '{}'", vlan.id, self.name);
             }
+            // Only IPv4 is supported: netmask computation assumes a /0../32
+            // prefix, so an IPv6 address would otherwise crash at apply time.
+            if !vlan.address.addr().is_ipv4() {
+                bail!(
+                    "vlan {} address {} is not IPv4 (IPv6 is unsupported)",
+                    vlan.id,
+                    vlan.address
+                );
+            }
+            for route in &vlan.routes {
+                if route.destination != "default" && route.destination.parse::<IpNet>().is_err() {
+                    bail!(
+                        "vlan {} route destination '{}' is not a CIDR or \"default\"",
+                        vlan.id,
+                        route.destination
+                    );
+                }
+            }
         }
         Ok(())
     }
@@ -117,5 +135,30 @@ address = "10.0.0.5/24"
     fn rejects_empty_vlan_list() {
         let err = profile_with("").unwrap_err();
         assert!(err.to_string().contains("no [[vlan]] entries"));
+    }
+
+    #[test]
+    fn rejects_ipv6_address() {
+        let err = profile_with("[[vlan]]\nid = 100\naddress = \"fe80::1/64\"\n").unwrap_err();
+        assert!(err.to_string().contains("not IPv4"));
+    }
+
+    #[test]
+    fn rejects_invalid_route_destination() {
+        let err = profile_with(
+            "[[vlan]]\nid = 100\naddress = \"192.168.1.2/24\"\n\
+             [[vlan.route]]\ndestination = \"not-a-cidr\"\ngateway = \"192.168.1.1\"\n",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("not a CIDR"));
+    }
+
+    #[test]
+    fn accepts_default_route_destination() {
+        profile_with(
+            "[[vlan]]\nid = 100\naddress = \"192.168.1.2/24\"\n\
+             [[vlan.route]]\ndestination = \"default\"\ngateway = \"192.168.1.1\"\n",
+        )
+        .unwrap();
     }
 }
