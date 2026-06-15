@@ -110,11 +110,14 @@ considered and rejected as YAGNI for swapping a handful of profiles):
 1. Load and fully **validate** the profile before touching the network.
 2. If another profile is currently active (per the state file), **tear it down** first.
 3. Resolve the physical device (auto-detect or `device` override).
-4. For each VLAN, in order:
-   - `ifconfig vlanN create vlan <id> vlandev <device>` (macOS assigns the `vlanN` unit).
-   - Assign address: `ifconfig vlanN inet <ip> netmask <mask>` (and `mtu` if set).
-   - Add each route: `route add <destination> <gateway>`.
-5. **Record** every interface created and the active profile name in the state file.
+4. The interface for a VLAN is `vlan<id>` — the kernel unit number is chosen to
+   match the 802.1Q id (VLAN 10 → `vlan10`). If `vlan<id>` already exists and was
+   not created by vlanctl, apply aborts with a clear error before touching anything.
+5. For each VLAN, in order:
+   - `ifconfig vlan<id> create vlan <id> vlandev <device>`.
+   - Assign address: `ifconfig vlan<id> inet <ip> netmask <mask>` (and `mtu` if set).
+   - Add each route (gateway or interface-scoped, per the route definition).
+6. **Record** every interface created and the active profile name in the state file.
 
 ### Rollback
 
@@ -125,10 +128,11 @@ leaving the system in its pre-apply state rather than half-configured.
 ### State file
 
 `apply`/`down`/`status` rely on a small JSON state file at
-`/usr/local/var/vlanctl/state.json` recording the active profile and the `vlanN`
-interfaces the tool created. This is necessary because macOS assigns arbitrary
-`vlanN` unit numbers at creation time, so they cannot be re-derived later. `status`
-reconciles this recorded state against live `ifconfig` output and flags drift.
+`/usr/local/var/vlanctl/state.json` recording the active profile and the
+interfaces the tool created. Interface names are now derivable (`vlan<id>`), but
+the state still records which profile is active so `down`/`status` work without
+re-reading a profile, and so teardown is robust to later profile edits. `status`
+reconciles the recorded state against live `ifconfig` output and flags drift.
 
 `down` destroys the recorded interfaces for the target profile and clears the
 corresponding state.

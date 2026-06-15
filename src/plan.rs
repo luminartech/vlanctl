@@ -73,23 +73,15 @@ fn ipv4_netmask(prefix: u8) -> String {
     )
 }
 
-/// Allocate interface names for a profile's VLANs, starting at the first free
-/// vlan unit number not already present in `existing` (live interface names).
-pub fn allocate_interfaces(profile: &Profile, existing: &[String]) -> Vec<String> {
-    let mut names = Vec::new();
-    let mut unit = 0u32;
-    for _ in &profile.vlans {
-        loop {
-            let candidate = format!("vlan{unit}");
-            if !existing.contains(&candidate) && !names.contains(&candidate) {
-                names.push(candidate);
-                unit += 1;
-                break;
-            }
-            unit += 1;
-        }
-    }
-    names
+/// Interface name for each VLAN: `vlan<id>`, so the kernel interface number
+/// matches the 802.1Q id (VLAN 10 -> `vlan10`). VLAN ids are unique within a
+/// profile, so the resulting names are unique too.
+pub fn interface_names(profile: &Profile) -> Vec<String> {
+    profile
+        .vlans
+        .iter()
+        .map(|v| format!("vlan{}", v.id))
+        .collect()
 }
 
 #[cfg(test)]
@@ -165,13 +157,12 @@ mod tests {
     }
 
     #[test]
-    fn allocate_skips_existing_units() {
+    fn interface_names_match_vlan_ids() {
         let p: Profile = toml::from_str(
-            "name=\"t\"\n[[vlan]]\nid=1\naddress=\"1.1.1.1/24\"\n[[vlan]]\nid=2\naddress=\"2.2.2.2/24\"\n",
+            "name=\"t\"\n[[vlan]]\nid=10\naddress=\"1.1.1.1/24\"\n[[vlan]]\nid=11\naddress=\"2.2.2.2/24\"\n",
         )
         .unwrap();
         p.validate().unwrap();
-        let names = allocate_interfaces(&p, &["vlan0".to_string()]);
-        assert_eq!(names, vec!["vlan1", "vlan2"]);
+        assert_eq!(interface_names(&p), vec!["vlan10", "vlan11"]);
     }
 }

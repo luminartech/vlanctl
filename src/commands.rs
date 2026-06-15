@@ -1,9 +1,9 @@
 use crate::config::Profile;
 use crate::device::resolve_device;
 use crate::net::{Cmd, CommandRunner};
-use crate::plan::{allocate_interfaces, bringup_commands, teardown_commands};
+use crate::plan::{bringup_commands, interface_names, teardown_commands};
 use crate::state::State;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use std::path::Path;
 
 /// List live interface names from `ifconfig -l`.
@@ -30,8 +30,19 @@ pub fn apply<R: CommandRunner>(
     }
 
     let device = resolve_device(runner, profile.device.as_deref())?;
+    let interfaces = interface_names(profile);
+
+    // The interface for each VLAN is `vlan<id>`. Refuse to touch one that
+    // already exists and is not ours (e.g. a stale leftover or another tool's).
     let existing = live_interfaces(runner)?;
-    let interfaces = allocate_interfaces(profile, &existing);
+    for iface in &interfaces {
+        if existing.contains(iface) {
+            bail!(
+                "interface {iface} already exists and was not created by vlanctl; \
+                 refusing to touch it (destroy it manually if it is stale)"
+            );
+        }
+    }
 
     let mut created: Vec<String> = Vec::new();
     for (iface, vlan) in interfaces.iter().zip(&profile.vlans) {
@@ -89,7 +100,7 @@ pub fn down<R: CommandRunner>(runner: &mut R, state_path: &Path, dry_run: bool) 
 
 /// Render the full bring-up plan for a profile as displayable command lines.
 pub fn show_plan(profile: &Profile, device: &str) -> Vec<String> {
-    let interfaces = allocate_interfaces(profile, &[]);
+    let interfaces = interface_names(profile);
     let mut lines = Vec::new();
     for (iface, vlan) in interfaces.iter().zip(&profile.vlans) {
         for cmd in bringup_commands(iface, device, vlan) {
@@ -169,15 +180,16 @@ mod tests {
         let _ = std::fs::remove_file(&state_path);
         let mut r = runner_with_device();
         let created = apply(&mut r, &profile(), &state_path, false).unwrap();
-        assert_eq!(created, vec!["vlan0", "vlan1"]);
+        // Interface name = vlan<id>, so ids 100/200 -> vlan100/vlan200.
+        assert_eq!(created, vec!["vlan100", "vlan200"]);
 
         let rendered: Vec<String> = r.commands.iter().map(|c| c.display()).collect();
-        assert!(rendered.contains(&"ifconfig vlan0 create vlan 100 vlandev en0".to_string()));
-        assert!(rendered.contains(&"ifconfig vlan1 create vlan 200 vlandev en0".to_string()));
+        assert!(rendered.contains(&"ifconfig vlan100 create vlan 100 vlandev en0".to_string()));
+        assert!(rendered.contains(&"ifconfig vlan200 create vlan 200 vlandev en0".to_string()));
 
         let state = State::load(&state_path).unwrap();
         assert_eq!(state.active_profile.as_deref(), Some("t"));
-        assert_eq!(state.interfaces, vec!["vlan0", "vlan1"]);
+        assert_eq!(state.interfaces, vec!["vlan100", "vlan200"]);
         std::fs::remove_file(&state_path).unwrap();
     }
 
@@ -189,18 +201,18 @@ mod tests {
         // Two `ifconfig -l` calls run first (resolve_device, then
         // live_interfaces), so the command indices are:
         //   [0]=ifconfig -l, [1]=ifconfig -l,
-        //   [2]=create vlan0, [3]=inet vlan0,
-        //   [4]=create vlan1 (fails here).
-        // vlan0 is fully configured; vlan1's create fails, so rollback must
-        // destroy vlan0 only.
+        //   [2]=create vlan100, [3]=inet vlan100,
+        //   [4]=create vlan200 (fails here).
+        // vlan100 is fully configured; vlan200's create fails, so rollback must
+        // destroy vlan100 only.
         r.fail_at = Some(4);
         let err = apply(&mut r, &profile(), &state_path, false).unwrap_err();
         assert!(err.to_string().contains("rolled back"));
 
-        // vlan0 was created then destroyed during rollback; vlan1 never was.
+        // vlan100 was created then destroyed during rollback; vlan200 never was.
         let rendered: Vec<String> = r.commands.iter().map(|c| c.display()).collect();
-        assert!(rendered.contains(&"ifconfig vlan0 destroy".to_string()));
-        assert!(!rendered.contains(&"ifconfig vlan1 destroy".to_string()));
+        assert!(rendered.contains(&"ifconfig vlan100 destroy".to_string()));
+        assert!(!rendered.contains(&"ifconfig vlan200 destroy".to_string()));
         // No state file should be written on failure.
         assert_eq!(State::load(&state_path).unwrap(), State::default());
         let _ = std::fs::remove_file(&state_path);
@@ -228,7 +240,24 @@ mod tests {
     #[test]
     fn show_plan_lists_commands() {
         let lines = show_plan(&profile(), "en0");
-        assert_eq!(lines[0], "ifconfig vlan0 create vlan 100 vlandev en0");
+        assert_eq!(lines[0], "ifconfig vlan100 create vlan 100 vlandev en0");
+    }
+
+    #[test]
+    fn apply_errors_if_interface_already_exists() {
+        let state_path = std::env::temp_dir().join("vlanctl-apply-collision.json");
+        let _ = std::fs::remove_file(&state_path);
+        let mut r = RecordingRunner::default();
+        // vlan100 (the interface for VLAN id 100) is already live.
+        r.stdout
+            .insert("ifconfig -l".to_string(), "lo0 en0 vlan100".to_string());
+        let err = apply(&mut r, &profile(), &state_path, false).unwrap_err();
+        assert!(err.to_string().contains("already exists"));
+        // Nothing was created and no state was written.
+        let rendered: Vec<String> = r.commands.iter().map(|c| c.display()).collect();
+        assert!(!rendered.iter().any(|c| c.contains("create")));
+        assert_eq!(State::load(&state_path).unwrap(), State::default());
+        let _ = std::fs::remove_file(&state_path);
     }
 
     #[test]
