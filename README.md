@@ -42,7 +42,34 @@ id = 200
 address = "10.0.0.5/24"
 ```
 
-See `profiles/example.toml`.
+### Routes
+
+Each `[[vlan.route]]` is one of two kinds:
+
+- **Gateway route** — has a `gateway`, emitted as `route add <destination> <gateway>`.
+- **Interface-scoped route** — omit `gateway`, and the route is bound to that
+  VLAN's own interface: a single host (`/32`) becomes
+  `route add -host <ip> -interface vlanN`, anything else
+  `route add -net <cidr> -interface vlanN`.
+
+Interface-scoped routes are needed when several VLANs share a subnet (so a
+sensor's traffic is pinned to the right interface) and for per-interface
+multicast (e.g. SOME/IP-SD discovery):
+
+```toml
+[[vlan]]
+id = 11
+address = "192.168.10.87/24"
+
+  [[vlan.route]]            # reach the sensor via this VLAN's interface
+  destination = "192.168.10.151/32"
+
+  [[vlan.route]]            # SOME/IP-SD multicast on this interface
+  destination = "239.255.0.255/32"
+```
+
+See `profiles/example.toml` (gateway route) and `profiles/lum.toml` /
+`profiles/lum_legacy.toml` (interface-scoped routes for real sensor setups).
 
 ## Notes
 

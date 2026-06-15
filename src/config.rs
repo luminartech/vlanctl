@@ -28,7 +28,10 @@ pub struct Vlan {
 #[derive(Debug, Deserialize, PartialEq)]
 pub struct Route {
     pub destination: String,
-    pub gateway: IpAddr,
+    /// Next-hop gateway. If omitted, the route is scoped to the VLAN's own
+    /// interface (`route add ... -interface vlanN`) instead of a gateway.
+    #[serde(default)]
+    pub gateway: Option<IpAddr>,
 }
 
 impl Profile {
@@ -160,5 +163,16 @@ address = "10.0.0.5/24"
              [[vlan.route]]\ndestination = \"default\"\ngateway = \"192.168.1.1\"\n",
         )
         .unwrap();
+    }
+
+    #[test]
+    fn route_without_gateway_is_interface_scoped() {
+        let p = profile_with(
+            "[[vlan]]\nid = 10\naddress = \"192.168.10.90/24\"\n\
+             [[vlan.route]]\ndestination = \"192.168.10.150/32\"\n",
+        )
+        .unwrap();
+        assert_eq!(p.vlans[0].routes[0].gateway, None);
+        assert_eq!(p.vlans[0].routes[0].destination, "192.168.10.150/32");
     }
 }

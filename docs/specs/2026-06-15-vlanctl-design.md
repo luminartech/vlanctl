@@ -66,7 +66,13 @@ address = "10.0.0.5/24"
   - `mtu` (int, optional): interface MTU.
   - `[[vlan.route]]` (array, optional): routes to add once the VLAN is up.
     - `destination` (string, required): CIDR or `default`.
-    - `gateway` (string, required): next-hop IP.
+    - `gateway` (string, optional): next-hop IP. If present, emits
+      `route add <destination> <gateway>`. If omitted, the route is scoped to
+      this VLAN's own interface: a single host (`/32`) emits
+      `route add -host <ip> -interface vlanN`, otherwise
+      `route add -net <cidr> -interface vlanN`. Interface-scoped routes are
+      required when VLANs share a subnet and for per-interface multicast
+      (e.g. SOME/IP-SD).
 
 ## Interface Binding
 

@@ -1,5 +1,6 @@
 use crate::config::{Profile, Vlan};
 use crate::net::Cmd;
+use ipnet::IpNet;
 
 /// Build the ordered commands to bring up a single VLAN on `device`,
 /// using the interface name `iface` (e.g. "vlan0").
@@ -19,12 +20,35 @@ pub fn bringup_commands(iface: &str, device: &str, vlan: &Vlan) -> Vec<Cmd> {
         cmds.push(Cmd::new("ifconfig", &[iface, "mtu", &mtu.to_string()]));
     }
     for route in &vlan.routes {
-        cmds.push(Cmd::new(
-            "route",
-            &["add", &route.destination, &route.gateway.to_string()],
-        ));
+        match &route.gateway {
+            // Gateway route: next-hop is an explicit address.
+            Some(gateway) => {
+                let gateway = gateway.to_string();
+                cmds.push(Cmd::new("route", &["add", &route.destination, &gateway]));
+            }
+            // Interface-scoped route via this VLAN's own interface. Required
+            // when several VLANs share a subnet, and for per-interface
+            // multicast (e.g. SOME/IP-SD).
+            None => cmds.push(interface_route_command(&route.destination, iface)),
+        }
     }
     cmds
+}
+
+/// Build a `route add ... -interface <iface>` command for a destination with no
+/// gateway. A single-host destination (e.g. a `/32`) uses `-host` with the bare
+/// address; anything else uses `-net` with the original CIDR.
+fn interface_route_command(destination: &str, iface: &str) -> Cmd {
+    if destination == "default" {
+        return Cmd::new("route", &["add", "default", "-interface", iface]);
+    }
+    if let Ok(net) = destination.parse::<IpNet>()
+        && net.prefix_len() == net.max_prefix_len()
+    {
+        let host = net.addr().to_string();
+        return Cmd::new("route", &["add", "-host", &host, "-interface", iface]);
+    }
+    Cmd::new("route", &["add", "-net", destination, "-interface", iface])
 }
 
 /// Commands to tear down a single interface. Destroying the vlan interface
@@ -96,7 +120,7 @@ mod tests {
         v.mtu = Some(1500);
         v.routes.push(Route {
             destination: "192.168.20.0/24".to_string(),
-            gateway: "192.168.10.1".parse::<IpAddr>().unwrap(),
+            gateway: Some("192.168.10.1".parse::<IpAddr>().unwrap()),
         });
         let cmds = bringup_commands("vlan0", "en10", &v);
         let rendered: Vec<String> = cmds.iter().map(|c| c.display()).collect();
@@ -109,6 +133,27 @@ mod tests {
                 "route add 192.168.20.0/24 192.168.10.1",
             ]
         );
+    }
+
+    #[test]
+    fn interface_routes_without_gateway() {
+        let mut v = vlan(10, "192.168.10.90/24");
+        // Host route to the sensor, pinned to this VLAN's interface.
+        v.routes.push(Route {
+            destination: "192.168.10.150/32".to_string(),
+            gateway: None,
+        });
+        // A network route (non-/32) uses -net with the CIDR.
+        v.routes.push(Route {
+            destination: "239.255.0.0/24".to_string(),
+            gateway: None,
+        });
+        let rendered: Vec<String> = bringup_commands("vlan0", "en10", &v)
+            .iter()
+            .map(|c| c.display())
+            .collect();
+        assert!(rendered.contains(&"route add -host 192.168.10.150 -interface vlan0".to_string()));
+        assert!(rendered.contains(&"route add -net 239.255.0.0/24 -interface vlan0".to_string()));
     }
 
     #[test]
