@@ -22,11 +22,11 @@ pub fn apply<R: CommandRunner>(
     state_path: &Path,
     dry_run: bool,
 ) -> Result<Vec<String>> {
-    // Tear down whatever is currently active.
+    // Tear down whatever is currently active. The local `state` is rewritten
+    // wholesale below, so there is no need to reload it after `down`.
     let mut state = State::load(state_path)?;
     if state.active_profile.is_some() {
         down(runner, state_path, dry_run)?;
-        state = State::load(state_path)?;
     }
 
     let device = resolve_device(runner, profile.device.as_deref())?;
@@ -132,15 +132,21 @@ mod tests {
         let state_path = std::env::temp_dir().join("vlanctl-apply-fail.json");
         let _ = std::fs::remove_file(&state_path);
         let mut r = runner_with_device();
-        // Commands: [0]=ifconfig -l, [1]=create vlan0, [2]=inet vlan0,
-        // [3]=create vlan1. Fail at index 3 (second create).
-        r.fail_at = Some(3);
+        // Two `ifconfig -l` calls run first (resolve_device, then
+        // live_interfaces), so the command indices are:
+        //   [0]=ifconfig -l, [1]=ifconfig -l,
+        //   [2]=create vlan0, [3]=inet vlan0,
+        //   [4]=create vlan1 (fails here).
+        // vlan0 is fully configured; vlan1's create fails, so rollback must
+        // destroy vlan0 only.
+        r.fail_at = Some(4);
         let err = apply(&mut r, &profile(), &state_path, false).unwrap_err();
         assert!(err.to_string().contains("rolled back"));
 
-        // vlan0 was created then destroyed during rollback.
+        // vlan0 was created then destroyed during rollback; vlan1 never was.
         let rendered: Vec<String> = r.commands.iter().map(|c| c.display()).collect();
         assert!(rendered.contains(&"ifconfig vlan0 destroy".to_string()));
+        assert!(!rendered.contains(&"ifconfig vlan1 destroy".to_string()));
         // No state file should be written on failure.
         assert_eq!(State::load(&state_path).unwrap(), State::default());
         let _ = std::fs::remove_file(&state_path);
