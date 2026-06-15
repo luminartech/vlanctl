@@ -9,8 +9,8 @@ differently-configured lidar sensors.
 vlanctl list                       # list profiles in ./profiles
 vlanctl show <profile>             # print the commands a profile would run
 vlanctl validate <profile>         # check a profile without applying
-sudo vlanctl apply <profile>       # bring it up
-vlanctl apply <profile> --dry-run  # print commands without running them
+sudo vlanctl apply [profile]       # bring it up (defaults to the `lum` profile)
+vlanctl apply [profile] --dry-run  # print commands without running them
 sudo vlanctl down                  # tear down the active profile
 vlanctl status                     # what is currently up
 ```
