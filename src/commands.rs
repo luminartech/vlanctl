@@ -87,7 +87,14 @@ fn rollback<R: CommandRunner>(runner: &mut R, created: &[String]) {
 /// is true, the teardown commands are still produced but state is not cleared.
 pub fn down<R: CommandRunner>(runner: &mut R, state_path: &Path, dry_run: bool) -> Result<()> {
     let state = State::load(state_path)?;
+    // A reboot drops the VLAN interfaces but leaves the state file intact, so
+    // recorded interfaces may already be gone. Only tear down ones still live;
+    // destroying a missing interface would error and is a no-op anyway.
+    let live = live_interfaces(runner)?;
     for iface in state.interfaces.iter().rev() {
+        if !live.contains(iface) {
+            continue;
+        }
         for cmd in teardown_commands(iface) {
             runner.run(&cmd)?;
         }
@@ -186,8 +193,10 @@ mod tests {
         assert_eq!(created, vec!["vlan100", "vlan200"]);
 
         let rendered: Vec<String> = r.commands.iter().map(|c| c.display()).collect();
-        assert!(rendered.contains(&"ifconfig vlan100 create vlan 100 vlandev en0".to_string()));
-        assert!(rendered.contains(&"ifconfig vlan200 create vlan 200 vlandev en0".to_string()));
+        assert!(rendered.contains(&"ifconfig vlan100 create".to_string()));
+        assert!(rendered.contains(&"ifconfig vlan100 vlan 100 vlandev en0".to_string()));
+        assert!(rendered.contains(&"ifconfig vlan200 create".to_string()));
+        assert!(rendered.contains(&"ifconfig vlan200 vlan 200 vlandev en0".to_string()));
 
         let state = State::load(&state_path).unwrap();
         assert_eq!(state.active_profile.as_deref(), Some("t"));
@@ -202,11 +211,11 @@ mod tests {
         let mut r = runner_with_device();
         // With `device` pinned, resolve_device issues no commands, so:
         //   [0]=ifconfig -l (live_interfaces),
-        //   [1]=create vlan100, [2]=inet vlan100,
-        //   [3]=create vlan200 (fails here).
+        //   [1]=create vlan100, [2]=vlan vlan100, [3]=inet vlan100,
+        //   [4]=create vlan200 (fails here).
         // vlan100 is fully configured; vlan200's create fails, so rollback must
         // destroy vlan100 only.
-        r.fail_at = Some(3);
+        r.fail_at = Some(4);
         let err = apply(&mut r, &profile(), &state_path, false).unwrap_err();
         assert!(err.to_string().contains("rolled back"));
 
@@ -228,8 +237,16 @@ mod tests {
         };
         state.save(&state_path).unwrap();
         let mut r = RecordingRunner::default();
+        r.stdout
+            .insert("ifconfig -l".to_string(), "lo0 en0 vlan0 vlan1".to_string());
         down(&mut r, &state_path, false).unwrap();
-        let rendered: Vec<String> = r.commands.iter().map(|c| c.display()).collect();
+        // Drop the `ifconfig -l` probe; assert on the teardown commands only.
+        let rendered: Vec<String> = r
+            .commands
+            .iter()
+            .map(|c| c.display())
+            .filter(|c| c != "ifconfig -l")
+            .collect();
         assert_eq!(
             rendered,
             vec!["ifconfig vlan1 destroy", "ifconfig vlan0 destroy"]
@@ -239,9 +256,35 @@ mod tests {
     }
 
     #[test]
+    fn down_skips_interfaces_no_longer_live() {
+        // Regression: after a reboot the kernel drops the VLAN interfaces, but
+        // the state file still records them. `down` must not fail trying to
+        // destroy interfaces that are already gone.
+        let state_path = std::env::temp_dir().join("vlanctl-down-reboot.json");
+        State {
+            active_profile: Some("t".to_string()),
+            interfaces: vec!["vlan10".to_string(), "vlan11".to_string()],
+        }
+        .save(&state_path)
+        .unwrap();
+        let mut r = RecordingRunner::default();
+        // vlan10 survived (somehow), vlan11 is gone. Only vlan10 should be
+        // destroyed; the missing vlan11 is silently skipped.
+        r.stdout
+            .insert("ifconfig -l".to_string(), "lo0 en0 vlan10".to_string());
+        down(&mut r, &state_path, false).unwrap();
+        let rendered: Vec<String> = r.commands.iter().map(|c| c.display()).collect();
+        assert!(rendered.contains(&"ifconfig vlan10 destroy".to_string()));
+        assert!(!rendered.contains(&"ifconfig vlan11 destroy".to_string()));
+        assert_eq!(State::load(&state_path).unwrap(), State::default());
+        std::fs::remove_file(&state_path).unwrap();
+    }
+
+    #[test]
     fn show_plan_lists_commands() {
         let lines = show_plan(&profile(), "en0");
-        assert_eq!(lines[0], "ifconfig vlan100 create vlan 100 vlandev en0");
+        assert_eq!(lines[0], "ifconfig vlan100 create");
+        assert_eq!(lines[1], "ifconfig vlan100 vlan 100 vlandev en0");
     }
 
     #[test]

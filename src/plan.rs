@@ -9,11 +9,13 @@ pub fn bringup_commands(iface: &str, device: &str, vlan: &Vlan) -> Vec<Cmd> {
     let addr = vlan.address.addr().to_string();
     let netmask = ipv4_netmask(vlan.address.prefix_len());
 
+    // macOS applies the 802.1Q tag and parent binding in a *separate* call from
+    // `create`: a combined `create vlan <id> vlandev <dev>` creates the pseudo-
+    // device but silently leaves it unbound (vlan 0, parent <none>). `vlan` and
+    // `vlandev` must both be set together, after the interface exists.
     let mut cmds = vec![
-        Cmd::new(
-            "ifconfig",
-            &[iface, "create", "vlan", &id, "vlandev", device],
-        ),
+        Cmd::new("ifconfig", &[iface, "create"]),
+        Cmd::new("ifconfig", &[iface, "vlan", &id, "vlandev", device]),
         Cmd::new("ifconfig", &[iface, "inet", &addr, "netmask", &netmask]),
     ];
     if let Some(mtu) = vlan.mtu {
@@ -119,7 +121,8 @@ mod tests {
         assert_eq!(
             rendered,
             vec![
-                "ifconfig vlan0 create vlan 100 vlandev en10",
+                "ifconfig vlan0 create",
+                "ifconfig vlan0 vlan 100 vlandev en10",
                 "ifconfig vlan0 inet 192.168.10.2 netmask 255.255.255.0",
                 "ifconfig vlan0 mtu 1500",
                 "route add 192.168.20.0/24 192.168.10.1",
