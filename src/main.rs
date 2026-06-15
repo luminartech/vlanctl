@@ -40,7 +40,8 @@ fn main() -> Result<()> {
         }
         Command::Show { profile } => {
             let p = Profile::load(&profile_path(&cli.profiles_dir, &profile))?;
-            // Use a recording runner to resolve the device without side effects.
+            // Resolve the device against the live system; `ifconfig -l` is a
+            // read-only query, so this has no side effects.
             let mut probe = SystemRunner;
             let device = device::resolve_device(&mut probe, p.device.as_deref())?;
             for line in commands::show_plan(&p, &device) {
