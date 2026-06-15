@@ -87,6 +87,55 @@ pub fn down<R: CommandRunner>(runner: &mut R, state_path: &Path, dry_run: bool) 
     Ok(())
 }
 
+/// Render the full bring-up plan for a profile as displayable command lines.
+pub fn show_plan(profile: &Profile, device: &str) -> Vec<String> {
+    let interfaces = allocate_interfaces(profile, &[]);
+    let mut lines = Vec::new();
+    for (iface, vlan) in interfaces.iter().zip(&profile.vlans) {
+        for cmd in bringup_commands(iface, device, vlan) {
+            lines.push(cmd.display());
+        }
+    }
+    lines
+}
+
+/// List profile names (file stems) found in `dir`.
+pub fn list_profiles(dir: &Path) -> Result<Vec<String>> {
+    let mut names = Vec::new();
+    if !dir.exists() {
+        return Ok(names);
+    }
+    for entry in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
+        let path = entry?.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("toml") {
+            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                names.push(stem.to_string());
+            }
+        }
+    }
+    names.sort();
+    Ok(names)
+}
+
+/// A human-readable status report: active profile and whether each recorded
+/// interface is still live.
+pub fn status<R: CommandRunner>(runner: &mut R, state_path: &Path) -> Result<String> {
+    let state = State::load(state_path)?;
+    let live = live_interfaces(runner)?;
+    let mut report = String::new();
+    match &state.active_profile {
+        None => report.push_str("No active profile.\n"),
+        Some(name) => {
+            report.push_str(&format!("Active profile: {name}\n"));
+            for iface in &state.interfaces {
+                let present = if live.contains(iface) { "up" } else { "MISSING" };
+                report.push_str(&format!("  {iface}: {present}\n"));
+            }
+        }
+    }
+    Ok(report)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -168,6 +217,41 @@ mod tests {
             vec!["ifconfig vlan1 destroy", "ifconfig vlan0 destroy"]
         );
         assert_eq!(State::load(&state_path).unwrap(), State::default());
+        std::fs::remove_file(&state_path).unwrap();
+    }
+
+    #[test]
+    fn show_plan_lists_commands() {
+        let lines = show_plan(&profile(), "en0");
+        assert_eq!(lines[0], "ifconfig vlan0 create vlan 100 vlandev en0");
+    }
+
+    #[test]
+    fn list_profiles_finds_toml_stems() {
+        let dir = std::env::temp_dir().join("vlanctl-profiles-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.toml"), "name=\"a\"").unwrap();
+        std::fs::write(dir.join("b.toml"), "name=\"b\"").unwrap();
+        std::fs::write(dir.join("notes.txt"), "x").unwrap();
+        let names = list_profiles(&dir).unwrap();
+        assert_eq!(names, vec!["a", "b"]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn status_flags_missing_interface() {
+        let state_path = std::env::temp_dir().join("vlanctl-status.json");
+        State {
+            active_profile: Some("t".to_string()),
+            interfaces: vec!["vlan0".to_string(), "vlan9".to_string()],
+        }
+        .save(&state_path)
+        .unwrap();
+        let mut r = RecordingRunner::default();
+        r.stdout.insert("ifconfig -l".to_string(), "lo0 en0 vlan0".to_string());
+        let report = status(&mut r, &state_path).unwrap();
+        assert!(report.contains("vlan0: up"));
+        assert!(report.contains("vlan9: MISSING"));
         std::fs::remove_file(&state_path).unwrap();
     }
 }
