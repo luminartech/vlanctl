@@ -4,10 +4,12 @@ use anyhow::{Result, bail};
 /// Resolve the physical Ethernet device to attach VLANs to.
 ///
 /// If `override_device` is set, use it verbatim. Otherwise auto-detect: take the
-/// `en*` interfaces, drop Wi-Fi (which cannot carry 802.1Q VLANs), and prefer
-/// the one with an active link. A single active wired interface wins; several
-/// active ones are ambiguous (error, asking the user to pin `device`); if none
-/// are active, fall back to the first wired interface.
+/// `en*` interfaces and drop Wi-Fi (which cannot carry 802.1Q VLANs). Auto-pick
+/// only when the choice is unambiguous:
+/// - exactly one active-link wired interface -> use it;
+/// - several active -> error (ask the user to pin `device`);
+/// - none active but exactly one wired interface exists -> use it;
+/// - none active and several wired exist -> error (ask the user to pin `device`).
 pub fn resolve_device<R: CommandRunner>(
     runner: &mut R,
     override_device: Option<&str>,
@@ -38,10 +40,17 @@ pub fn resolve_device<R: CommandRunner>(
 
     match active.as_slice() {
         [one] => Ok(one.clone()),
-        [] => Ok(wired[0].clone()),
-        many => bail!(
+        many if many.len() > 1 => bail!(
             "multiple active Ethernet interfaces ({}); set `device` in the profile to choose one",
             many.join(", ")
+        ),
+        // No active link: only auto-pick when there is a single wired adapter;
+        // otherwise refuse to guess and make the user choose.
+        _ if wired.len() == 1 => Ok(wired[0].clone()),
+        _ => bail!(
+            "multiple wired Ethernet interfaces and none has an active link ({}); \
+             set `device` in the profile to choose one",
+            wired.join(", ")
         ),
     }
 }
@@ -144,12 +153,23 @@ mod tests {
     }
 
     #[test]
-    fn falls_back_to_first_wired_when_none_active() {
+    fn uses_sole_wired_when_none_active() {
         let mut r = runner();
+        // Only one wired candidate (en7); no status seeded -> inactive.
+        r.stdout
+            .insert("ifconfig -l".to_string(), "lo0 en0 en7".to_string());
+        assert_eq!(resolve_device(&mut r, None).unwrap(), "en7");
+    }
+
+    #[test]
+    fn errors_when_multiple_wired_none_active() {
+        let mut r = runner();
+        // Two wired candidates (en4, en7), neither with an active link.
         r.stdout
             .insert("ifconfig -l".to_string(), "lo0 en0 en4 en7".to_string());
-        // No status lines seeded -> all wired candidates read as inactive.
-        assert_eq!(resolve_device(&mut r, None).unwrap(), "en4");
+        let err = resolve_device(&mut r, None).unwrap_err().to_string();
+        assert!(err.contains("none has an active link"));
+        assert!(err.contains("en4") && err.contains("en7"));
     }
 
     #[test]
