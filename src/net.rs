@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use std::process::Command;
 
 /// One external command to execute (program + args), e.g. `ifconfig vlan0 create`.

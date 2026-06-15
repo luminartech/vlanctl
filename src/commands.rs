@@ -128,7 +128,11 @@ pub fn status<R: CommandRunner>(runner: &mut R, state_path: &Path) -> Result<Str
         Some(name) => {
             report.push_str(&format!("Active profile: {name}\n"));
             for iface in &state.interfaces {
-                let present = if live.contains(iface) { "up" } else { "MISSING" };
+                let present = if live.contains(iface) {
+                    "up"
+                } else {
+                    "MISSING"
+                };
                 report.push_str(&format!("  {iface}: {present}\n"));
             }
         }
@@ -154,7 +158,8 @@ mod tests {
 
     fn runner_with_device() -> RecordingRunner {
         let mut r = RecordingRunner::default();
-        r.stdout.insert("ifconfig -l".to_string(), "lo0 en0".to_string());
+        r.stdout
+            .insert("ifconfig -l".to_string(), "lo0 en0".to_string());
         r
     }
 
@@ -248,7 +253,8 @@ mod tests {
         .save(&state_path)
         .unwrap();
         let mut r = RecordingRunner::default();
-        r.stdout.insert("ifconfig -l".to_string(), "lo0 en0 vlan0".to_string());
+        r.stdout
+            .insert("ifconfig -l".to_string(), "lo0 en0 vlan0".to_string());
         let report = status(&mut r, &state_path).unwrap();
         assert!(report.contains("vlan0: up"));
         assert!(report.contains("vlan9: MISSING"));

@@ -1,5 +1,5 @@
 use crate::net::{Cmd, CommandRunner};
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 
 /// Resolve the physical Ethernet device to attach VLANs to.
 /// If `override_device` is set, use it; otherwise pick the first active
@@ -18,7 +18,9 @@ pub fn resolve_device<R: CommandRunner>(
         .find(|name| name.starts_with("en"));
     match candidate {
         Some(name) => Ok(name.to_string()),
-        None => bail!("could not auto-detect an Ethernet (enX) device; set `device` in the profile"),
+        None => {
+            bail!("could not auto-detect an Ethernet (enX) device; set `device` in the profile")
+        }
     }
 }
 
@@ -38,8 +40,10 @@ mod tests {
     #[test]
     fn picks_first_en_interface() {
         let mut r = RecordingRunner::default();
-        r.stdout
-            .insert("ifconfig -l".to_string(), "lo0 en0 en10 bridge0".to_string());
+        r.stdout.insert(
+            "ifconfig -l".to_string(),
+            "lo0 en0 en10 bridge0".to_string(),
+        );
         let dev = resolve_device(&mut r, None).unwrap();
         assert_eq!(dev, "en0");
     }
@@ -47,7 +51,8 @@ mod tests {
     #[test]
     fn errors_when_no_en_interface() {
         let mut r = RecordingRunner::default();
-        r.stdout.insert("ifconfig -l".to_string(), "lo0 bridge0".to_string());
+        r.stdout
+            .insert("ifconfig -l".to_string(), "lo0 bridge0".to_string());
         assert!(resolve_device(&mut r, None).is_err());
     }
 }

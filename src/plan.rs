@@ -9,7 +9,10 @@ pub fn bringup_commands(iface: &str, device: &str, vlan: &Vlan) -> Vec<Cmd> {
     let netmask = ipv4_netmask(vlan.address.prefix_len());
 
     let mut cmds = vec![
-        Cmd::new("ifconfig", &[iface, "create", "vlan", &id, "vlandev", device]),
+        Cmd::new(
+            "ifconfig",
+            &[iface, "create", "vlan", &id, "vlandev", device],
+        ),
         Cmd::new("ifconfig", &[iface, "inet", &addr, "netmask", &netmask]),
     ];
     if let Some(mtu) = vlan.mtu {
@@ -110,7 +113,10 @@ mod tests {
 
     #[test]
     fn teardown_destroys_interface() {
-        assert_eq!(teardown_commands("vlan3")[0].display(), "ifconfig vlan3 destroy");
+        assert_eq!(
+            teardown_commands("vlan3")[0].display(),
+            "ifconfig vlan3 destroy"
+        );
     }
 
     #[test]

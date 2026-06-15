@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use ipnet::IpNet;
 use serde::Deserialize;
 use std::net::IpAddr;
@@ -36,8 +36,8 @@ impl Profile {
     pub fn load(path: &Path) -> Result<Profile> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading profile {}", path.display()))?;
-        let profile: Profile = toml::from_str(&text)
-            .with_context(|| format!("parsing profile {}", path.display()))?;
+        let profile: Profile =
+            toml::from_str(&text).with_context(|| format!("parsing profile {}", path.display()))?;
         profile.validate()?;
         Ok(profile)
     }
@@ -109,8 +109,7 @@ address = "10.0.0.5/24"
 
     #[test]
     fn rejects_out_of_range_id() {
-        let err = profile_with("[[vlan]]\nid = 5000\naddress = \"1.1.1.1/24\"\n")
-            .unwrap_err();
+        let err = profile_with("[[vlan]]\nid = 5000\naddress = \"1.1.1.1/24\"\n").unwrap_err();
         assert!(err.to_string().contains("out of range"));
     }
 
