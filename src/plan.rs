@@ -28,13 +28,28 @@ pub fn bringup_commands(iface: &str, device: &str, vlan: &Vlan) -> Vec<Cmd> {
                 let gateway = gateway.to_string();
                 cmds.push(Cmd::new("route", &["add", &route.destination, &gateway]));
             }
-            // Interface-scoped route via this VLAN's own interface. Required
-            // when several VLANs share a subnet, and for per-interface
-            // multicast (e.g. SOME/IP-SD).
+            // Interface-scoped route via this VLAN's own interface, for
+            // per-interface multicast (e.g. SOME/IP-SD) and out-of-subnet
+            // destinations. A destination that already falls inside this VLAN's
+            // own connected subnet is skipped: the connected route reaches it
+            // via normal ARP, whereas a `-host ... -interface` route installs a
+            // permanent self-MAC ARP entry that breaks resolution entirely.
+            None if destination_in_subnet(&route.destination, &vlan.address) => {}
             None => cmds.push(interface_route_command(&route.destination, iface)),
         }
     }
     cmds
+}
+
+/// True when `destination` (a CIDR or bare address, e.g. `192.168.11.151/32`)
+/// falls entirely within the VLAN's own connected subnet `addr`. Such a
+/// destination is reached by the connected route and needs no explicit route.
+/// Non-CIDR destinations like `default` are never contained.
+fn destination_in_subnet(destination: &str, addr: &IpNet) -> bool {
+    destination
+        .parse::<IpNet>()
+        .map(|dest| addr.contains(&dest))
+        .unwrap_or(false)
 }
 
 /// Build a `route add ... -interface <iface>` command for a destination with no
@@ -133,12 +148,18 @@ mod tests {
     #[test]
     fn interface_routes_without_gateway() {
         let mut v = vlan(10, "192.168.10.90/24");
-        // Host route to the sensor, pinned to this VLAN's interface.
+        // A host inside this VLAN's own subnet is reached by the connected
+        // route; an explicit -interface route would break ARP, so it is skipped.
         v.routes.push(Route {
             destination: "192.168.10.150/32".to_string(),
             gateway: None,
         });
-        // A network route (non-/32) uses -net with the CIDR.
+        // An out-of-subnet host still gets a -host -interface route.
+        v.routes.push(Route {
+            destination: "10.9.9.9/32".to_string(),
+            gateway: None,
+        });
+        // A multicast network route (non-/32, out of subnet) uses -net.
         v.routes.push(Route {
             destination: "239.255.0.0/24".to_string(),
             gateway: None,
@@ -147,8 +168,18 @@ mod tests {
             .iter()
             .map(|c| c.display())
             .collect();
-        assert!(rendered.contains(&"route add -host 192.168.10.150 -interface vlan0".to_string()));
+        assert!(!rendered.iter().any(|c| c.contains("192.168.10.150")));
+        assert!(rendered.contains(&"route add -host 10.9.9.9 -interface vlan0".to_string()));
         assert!(rendered.contains(&"route add -net 239.255.0.0/24 -interface vlan0".to_string()));
+    }
+
+    #[test]
+    fn destination_in_subnet_detects_containment() {
+        let addr: IpNet = "192.168.11.87/24".parse().unwrap();
+        assert!(destination_in_subnet("192.168.11.151/32", &addr));
+        assert!(!destination_in_subnet("239.255.0.255/32", &addr));
+        assert!(!destination_in_subnet("10.0.0.1/32", &addr));
+        assert!(!destination_in_subnet("default", &addr));
     }
 
     #[test]
