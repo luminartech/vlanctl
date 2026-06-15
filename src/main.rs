@@ -1,3 +1,11 @@
+mod cli;
+mod commands;
+mod config;
+mod device;
+mod net;
+mod plan;
+mod state;
+
 fn main() {
-    println!("Hello, world!");
+    println!("vlanctl");
 }
