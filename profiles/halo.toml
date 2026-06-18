@@ -7,9 +7,11 @@ description = "Halo A3 (LUM Gen FW): untagged UDP data path + VLAN 12 telnet."
 [[interface]]
 address = "192.168.1.100/24"
 
-  # Data sensor — out of the host's /24, so reached via an on-link route.
+  # Data sensor — out of the host's /24, reached via an on-link route + static
+  # ARP (the sensor doesn't answer ARP; macOS would otherwise self-MAC it).
   [[interface.route]]
   destination = "192.168.10.151/32"
+  mac = "3a:42:f7:79:32:2e"
 
   # SOME/IP-SD multicast group.
   [[interface.route]]
