@@ -30,10 +30,14 @@ pub struct Interface {
 #[derive(Debug, Deserialize, PartialEq)]
 pub struct Route {
     pub destination: String,
-    /// Next-hop gateway. If omitted, the route is scoped to the VLAN's own
-    /// interface (`route add ... -interface vlanN`) instead of a gateway.
+    /// Next-hop gateway. If omitted, the route is scoped to the owning
+    /// interface (`route add ... -interface <iface>`) instead of a gateway.
     #[serde(default)]
     pub gateway: Option<IpAddr>,
+    /// Static ARP entry (`arp -s <host> <mac>`) for an on-link host the kernel
+    /// cannot resolve itself. Only valid on a gatewayless /32 route.
+    #[serde(default)]
+    pub mac: Option<String>,
 }
 
 impl Profile {
@@ -80,6 +84,28 @@ impl Profile {
                         route.destination
                     );
                 }
+                if let Some(mac) = &route.mac {
+                    if route.gateway.is_some() {
+                        bail!(
+                            "route '{}' has both a gateway and a mac (mutually exclusive)",
+                            route.destination
+                        );
+                    }
+                    let is_host = route
+                        .destination
+                        .parse::<IpNet>()
+                        .map(|n| n.prefix_len() == n.max_prefix_len())
+                        .unwrap_or(false);
+                    if !is_host {
+                        bail!(
+                            "route '{}' has a mac but is not a single host (/32 required)",
+                            route.destination
+                        );
+                    }
+                    if !is_valid_mac(mac) {
+                        bail!("route '{}' has an invalid MAC '{}'", route.destination, mac);
+                    }
+                }
             }
         }
         if untagged > 1 {
@@ -91,6 +117,15 @@ impl Profile {
         }
         Ok(())
     }
+}
+
+/// True if `s` is six colon-separated groups of one or two hex digits.
+fn is_valid_mac(s: &str) -> bool {
+    let groups: Vec<&str> = s.split(':').collect();
+    groups.len() == 6
+        && groups
+            .iter()
+            .all(|g| (1..=2).contains(&g.len()) && g.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
 #[cfg(test)]
@@ -209,5 +244,45 @@ address = "10.0.0.5/24"
         )
         .unwrap_err();
         assert!(err.to_string().contains("at most one"));
+    }
+
+    #[test]
+    fn accepts_mac_on_gatewayless_host_route() {
+        let p = profile_with(
+            "[[interface]]\naddress = \"192.168.1.100/24\"\n\
+             [[interface.route]]\ndestination = \"192.168.10.151/32\"\nmac = \"3a:42:f7:79:32:2e\"\n",
+        )
+        .unwrap();
+        assert_eq!(p.interfaces[0].routes[0].mac.as_deref(), Some("3a:42:f7:79:32:2e"));
+    }
+
+    #[test]
+    fn rejects_mac_with_gateway() {
+        let err = profile_with(
+            "[[interface]]\naddress = \"192.168.1.2/24\"\n\
+             [[interface.route]]\ndestination = \"192.168.10.151/32\"\ngateway = \"192.168.1.1\"\nmac = \"3a:42:f7:79:32:2e\"\n",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("gateway"));
+    }
+
+    #[test]
+    fn rejects_mac_on_non_host_route() {
+        let err = profile_with(
+            "[[interface]]\naddress = \"192.168.1.2/24\"\n\
+             [[interface.route]]\ndestination = \"192.168.10.0/24\"\nmac = \"3a:42:f7:79:32:2e\"\n",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("/32") || err.to_string().contains("single host"));
+    }
+
+    #[test]
+    fn rejects_malformed_mac() {
+        let err = profile_with(
+            "[[interface]]\naddress = \"192.168.1.2/24\"\n\
+             [[interface.route]]\ndestination = \"192.168.10.151/32\"\nmac = \"not-a-mac\"\n",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("MAC") || err.to_string().contains("mac"));
     }
 }
