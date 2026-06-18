@@ -1,7 +1,7 @@
 use crate::config::Profile;
 use crate::device::resolve_device;
 use crate::net::{Cmd, CommandRunner};
-use crate::plan::{bringup_commands, interface_names, teardown_commands};
+use crate::plan::{bringup_commands, iface_name, interface_names, teardown_commands};
 use crate::state::State;
 use anyhow::{Context, Result, bail};
 use std::path::Path;
@@ -10,6 +10,22 @@ use std::path::Path;
 fn live_interfaces<R: CommandRunner>(runner: &mut R) -> Result<Vec<String>> {
     let out = runner.run(&Cmd::new("ifconfig", &["-l"]))?;
     Ok(out.split_whitespace().map(|s| s.to_string()).collect())
+}
+
+/// IPv4 addresses currently configured on `device` (parsed from `ifconfig`),
+/// used to make untagged-interface apply idempotent.
+fn device_inet_addresses<R: CommandRunner>(runner: &mut R, device: &str) -> Result<Vec<String>> {
+    let out = runner.run(&Cmd::new("ifconfig", &[device]))?;
+    Ok(out
+        .lines()
+        .filter_map(|line| {
+            let mut toks = line.split_whitespace();
+            match toks.next() {
+                Some("inet") => toks.next().map(|a| a.to_string()),
+                _ => None,
+            }
+        })
+        .collect())
 }
 
 /// Bring up `profile`. Tears down any active profile first, then creates each
@@ -30,10 +46,10 @@ pub fn apply<R: CommandRunner>(
     }
 
     let device = resolve_device(runner, profile.device.as_deref())?;
-    let interfaces = interface_names(profile);
+    let interfaces = interface_names(profile); // tagged names, for the guard + state
 
-    // The interface for each VLAN is `vlan<id>`. Refuse to touch one that
-    // already exists and is not ours (e.g. a stale leftover or another tool's).
+    // Refuse to touch a vlan<id> sub-interface that already exists and is not
+    // ours. The physical device is never guarded — untagged apply is additive.
     let existing = live_interfaces(runner)?;
     for iface in &interfaces {
         if existing.contains(iface) {
@@ -45,22 +61,44 @@ pub fn apply<R: CommandRunner>(
     }
 
     let mut created: Vec<String> = Vec::new();
-    for (iface, vlan) in interfaces.iter().zip(&profile.vlans) {
-        for cmd in bringup_commands(iface, &device, vlan) {
-            // Record the interface as created as soon as the `create` succeeds,
-            // so rollback can destroy it even if a later command fails.
-            let is_create = cmd.args.get(1).map(|a| a == "create").unwrap_or(false);
-            match runner.run(&cmd) {
-                Ok(_) => {
-                    if is_create {
-                        created.push(iface.clone());
+    for interface in &profile.interfaces {
+        match interface.vlan {
+            // Untagged: configure the parent device, idempotently. If the alias
+            // address is already present, a previous apply set it up (and its
+            // routes) — skip. Untagged config is never recorded or torn down.
+            None => {
+                let addr = interface.address.addr().to_string();
+                if device_inet_addresses(runner, &device)?.contains(&addr) {
+                    continue;
+                }
+                for cmd in bringup_commands(interface, &device) {
+                    if let Err(e) = runner.run(&cmd) {
+                        rollback(runner, &created);
+                        return Err(e).with_context(|| {
+                            format!("applying profile '{}'; rolled back", profile.name)
+                        });
                     }
                 }
-                Err(e) => {
-                    rollback(runner, &created);
-                    return Err(e).with_context(|| {
-                        format!("applying profile '{}'; rolled back", profile.name)
-                    });
+            }
+            // Tagged: create the vlan sub-interface, recording it as soon as the
+            // `create` succeeds so rollback can destroy it if a later step fails.
+            Some(_) => {
+                let iface = iface_name(interface, &device);
+                for cmd in bringup_commands(interface, &device) {
+                    let is_create = cmd.args.get(1).map(|a| a == "create").unwrap_or(false);
+                    match runner.run(&cmd) {
+                        Ok(_) => {
+                            if is_create {
+                                created.push(iface.clone());
+                            }
+                        }
+                        Err(e) => {
+                            rollback(runner, &created);
+                            return Err(e).with_context(|| {
+                                format!("applying profile '{}'; rolled back", profile.name)
+                            });
+                        }
+                    }
                 }
             }
         }
@@ -107,14 +145,12 @@ pub fn down<R: CommandRunner>(runner: &mut R, state_path: &Path, dry_run: bool) 
 
 /// Render the full bring-up plan for a profile as displayable command lines.
 pub fn show_plan(profile: &Profile, device: &str) -> Vec<String> {
-    let interfaces = interface_names(profile);
-    let mut lines = Vec::new();
-    for (iface, vlan) in interfaces.iter().zip(&profile.vlans) {
-        for cmd in bringup_commands(iface, device, vlan) {
-            lines.push(cmd.display());
-        }
-    }
-    lines
+    profile
+        .interfaces
+        .iter()
+        .flat_map(|interface| bringup_commands(interface, device))
+        .map(|cmd| cmd.display())
+        .collect()
 }
 
 /// List profile names (file stems) found in `dir`.
@@ -168,8 +204,20 @@ mod tests {
         // depending on device auto-detection (covered in device.rs tests).
         let p: Profile = toml::from_str(
             "name=\"t\"\ndevice=\"en0\"\n\
-             [[vlan]]\nid=100\naddress=\"192.168.10.2/24\"\n\
-             [[vlan]]\nid=200\naddress=\"10.0.0.5/24\"\n",
+             [[interface]]\nvlan=100\naddress=\"192.168.10.2/24\"\n\
+             [[interface]]\nvlan=200\naddress=\"10.0.0.5/24\"\n",
+        )
+        .unwrap();
+        p.validate().unwrap();
+        p
+    }
+
+    fn untagged_profile() -> Profile {
+        let p: Profile = toml::from_str(
+            "name=\"halo\"\ndevice=\"en0\"\n\
+             [[interface]]\naddress=\"192.168.1.100/24\"\n\
+             [[interface.route]]\ndestination=\"192.168.10.151/32\"\n\
+             [[interface]]\nvlan=12\naddress=\"192.168.10.1/24\"\n",
         )
         .unwrap();
         p.validate().unwrap();
@@ -302,6 +350,35 @@ mod tests {
         assert!(!rendered.iter().any(|c| c.contains("create")));
         assert_eq!(State::load(&state_path).unwrap(), State::default());
         let _ = std::fs::remove_file(&state_path);
+    }
+
+    #[test]
+    fn apply_untagged_configures_parent_and_records_only_vlan() {
+        let state_path = std::env::temp_dir().join("vlanctl-apply-untagged.json");
+        let _ = std::fs::remove_file(&state_path);
+        let mut r = runner_with_device(); // "ifconfig -l" -> "lo0 en0"; "ifconfig en0" -> empty
+        let created = apply(&mut r, &untagged_profile(), &state_path, false).unwrap();
+        assert_eq!(created, vec!["vlan12"]); // only the tagged interface is recorded
+        let rendered: Vec<String> = r.commands.iter().map(|c| c.display()).collect();
+        assert!(rendered.contains(&"ifconfig en0 inet 192.168.1.100 netmask 255.255.255.0 alias".to_string()));
+        assert!(rendered.contains(&"route add -host 192.168.10.151 -interface en0".to_string()));
+        assert!(rendered.contains(&"ifconfig vlan12 create".to_string()));
+    }
+
+    #[test]
+    fn apply_untagged_skips_when_alias_already_present() {
+        let state_path = std::env::temp_dir().join("vlanctl-apply-untagged-idem.json");
+        let _ = std::fs::remove_file(&state_path);
+        let mut r = runner_with_device();
+        r.stdout.insert(
+            "ifconfig en0".to_string(),
+            "\tinet 192.168.1.100 netmask 0xffffff00 broadcast 192.168.1.255".to_string(),
+        );
+        apply(&mut r, &untagged_profile(), &state_path, false).unwrap();
+        let rendered: Vec<String> = r.commands.iter().map(|c| c.display()).collect();
+        assert!(!rendered.iter().any(|c| c.contains("alias")));
+        assert!(!rendered.iter().any(|c| c.contains("route add -host 192.168.10.151")));
+        assert!(rendered.contains(&"ifconfig vlan12 create".to_string())); // tagged still applied
     }
 
     #[test]

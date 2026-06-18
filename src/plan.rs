@@ -1,44 +1,72 @@
-use crate::config::{Profile, Vlan};
+use crate::config::{Interface, Profile, Route};
 use crate::net::Cmd;
 use ipnet::IpNet;
 
-/// Build the ordered commands to bring up a single VLAN on `device`,
-/// using the interface name `iface` (e.g. "vlan0").
-pub fn bringup_commands(iface: &str, device: &str, vlan: &Vlan) -> Vec<Cmd> {
-    let id = vlan.id.to_string();
-    let addr = vlan.address.addr().to_string();
-    let netmask = ipv4_netmask(vlan.address.prefix_len());
-
-    // macOS applies the 802.1Q tag and parent binding in a *separate* call from
-    // `create`: a combined `create vlan <id> vlandev <dev>` creates the pseudo-
-    // device but silently leaves it unbound (vlan 0, parent <none>). `vlan` and
-    // `vlandev` must both be set together, after the interface exists.
-    let mut cmds = vec![
-        Cmd::new("ifconfig", &[iface, "create"]),
-        Cmd::new("ifconfig", &[iface, "vlan", &id, "vlandev", device]),
-        Cmd::new("ifconfig", &[iface, "inet", &addr, "netmask", &netmask]),
-    ];
-    if let Some(mtu) = vlan.mtu {
-        cmds.push(Cmd::new("ifconfig", &[iface, "mtu", &mtu.to_string()]));
+/// Interface name this entry configures: `vlan<id>` for a tagged interface,
+/// or the parent `device` itself for an untagged one.
+pub fn iface_name(interface: &Interface, device: &str) -> String {
+    match interface.vlan {
+        Some(id) => format!("vlan{id}"),
+        None => device.to_string(),
     }
-    for route in &vlan.routes {
+}
+
+/// Build the ordered commands to bring up one interface on `device`.
+pub fn bringup_commands(interface: &Interface, device: &str) -> Vec<Cmd> {
+    let name = iface_name(interface, device);
+    let addr = interface.address.addr().to_string();
+    let netmask = ipv4_netmask(interface.address.prefix_len());
+
+    let mut cmds = Vec::new();
+    match interface.vlan {
+        // Tagged: create the vlan pseudo-device, then bind tag+parent in a
+        // SEPARATE call (a combined `create ... vlandev` leaves it unbound),
+        // then assign the address.
+        Some(id) => {
+            let id = id.to_string();
+            cmds.push(Cmd::new("ifconfig", &[&name, "create"]));
+            cmds.push(Cmd::new("ifconfig", &[&name, "vlan", &id, "vlandev", device]));
+            cmds.push(Cmd::new("ifconfig", &[&name, "inet", &addr, "netmask", &netmask]));
+        }
+        // Untagged: add the address as an alias on the parent device. `down`
+        // never removes it; apply skips this interface when the address is
+        // already configured.
+        None => {
+            cmds.push(Cmd::new(
+                "ifconfig",
+                &[&name, "inet", &addr, "netmask", &netmask, "alias"],
+            ));
+        }
+    }
+    if let Some(mtu) = interface.mtu {
+        cmds.push(Cmd::new("ifconfig", &[&name, "mtu", &mtu.to_string()]));
+    }
+    for route in &interface.routes {
         match &route.gateway {
-            // Gateway route: next-hop is an explicit address.
             Some(gateway) => {
                 let gateway = gateway.to_string();
                 cmds.push(Cmd::new("route", &["add", &route.destination, &gateway]));
             }
-            // Interface-scoped route via this VLAN's own interface, for
-            // per-interface multicast (e.g. SOME/IP-SD) and out-of-subnet
-            // destinations. A destination that already falls inside this VLAN's
-            // own connected subnet is skipped: the connected route reaches it
-            // via normal ARP, whereas a `-host ... -interface` route installs a
-            // permanent self-MAC ARP entry that breaks resolution entirely.
-            None if destination_in_subnet(&route.destination, &vlan.address) => {}
-            None => cmds.push(interface_route_command(&route.destination, iface)),
+            // A gatewayless destination inside this interface's own connected
+            // subnet is reached by the connected route; an explicit
+            // `-host ... -interface` route would install a self-MAC ARP entry
+            // that breaks resolution, so it is skipped.
+            None if destination_in_subnet(&route.destination, &interface.address) => {}
+            None => cmds.push(interface_route_command(&route.destination, &name)),
         }
     }
     cmds
+}
+
+/// Names of the VLAN sub-interfaces this profile creates (`vlan<id>`), in order.
+/// Untagged interfaces configure the parent device and are not named here, so
+/// they are never recorded in state or torn down.
+pub fn interface_names(profile: &Profile) -> Vec<String> {
+    profile
+        .interfaces
+        .iter()
+        .filter_map(|i| i.vlan.map(|id| format!("vlan{id}")))
+        .collect()
 }
 
 /// True when `destination` (a CIDR or bare address, e.g. `192.168.11.151/32`)
@@ -90,30 +118,14 @@ fn ipv4_netmask(prefix: u8) -> String {
     )
 }
 
-/// Interface name for each VLAN: `vlan<id>`, so the kernel interface number
-/// matches the 802.1Q id (VLAN 10 -> `vlan10`). VLAN ids are unique within a
-/// profile, so the resulting names are unique too.
-pub fn interface_names(profile: &Profile) -> Vec<String> {
-    profile
-        .vlans
-        .iter()
-        .map(|v| format!("vlan{}", v.id))
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Route, Vlan};
+    use crate::config::{Interface, Route};
     use std::net::IpAddr;
 
-    fn vlan(id: u16, cidr: &str) -> Vlan {
-        Vlan {
-            id,
-            address: cidr.parse().unwrap(),
-            mtu: None,
-            routes: vec![],
-        }
+    fn tagged(id: u16, cidr: &str) -> Interface {
+        Interface { vlan: Some(id), address: cidr.parse().unwrap(), mtu: None, routes: vec![] }
     }
 
     #[test]
@@ -124,53 +136,58 @@ mod tests {
     }
 
     #[test]
-    fn bringup_creates_assigns_and_routes() {
-        let mut v = vlan(100, "192.168.10.2/24");
+    fn tagged_creates_assigns_and_routes() {
+        let mut v = tagged(100, "192.168.10.2/24");
         v.mtu = Some(1500);
         v.routes.push(Route {
             destination: "192.168.20.0/24".to_string(),
             gateway: Some("192.168.10.1".parse::<IpAddr>().unwrap()),
         });
-        let cmds = bringup_commands("vlan0", "en10", &v);
-        let rendered: Vec<String> = cmds.iter().map(|c| c.display()).collect();
+        let rendered: Vec<String> = bringup_commands(&v, "en10").iter().map(|c| c.display()).collect();
         assert_eq!(
             rendered,
             vec![
-                "ifconfig vlan0 create",
-                "ifconfig vlan0 vlan 100 vlandev en10",
-                "ifconfig vlan0 inet 192.168.10.2 netmask 255.255.255.0",
-                "ifconfig vlan0 mtu 1500",
+                "ifconfig vlan100 create",
+                "ifconfig vlan100 vlan 100 vlandev en10",
+                "ifconfig vlan100 inet 192.168.10.2 netmask 255.255.255.0",
+                "ifconfig vlan100 mtu 1500",
                 "route add 192.168.20.0/24 192.168.10.1",
             ]
         );
     }
 
     #[test]
-    fn interface_routes_without_gateway() {
-        let mut v = vlan(10, "192.168.10.90/24");
-        // A host inside this VLAN's own subnet is reached by the connected
-        // route; an explicit -interface route would break ARP, so it is skipped.
-        v.routes.push(Route {
-            destination: "192.168.10.150/32".to_string(),
-            gateway: None,
-        });
-        // An out-of-subnet host still gets a -host -interface route.
-        v.routes.push(Route {
-            destination: "10.9.9.9/32".to_string(),
-            gateway: None,
-        });
-        // A multicast network route (non-/32, out of subnet) uses -net.
-        v.routes.push(Route {
-            destination: "239.255.0.0/24".to_string(),
-            gateway: None,
-        });
-        let rendered: Vec<String> = bringup_commands("vlan0", "en10", &v)
-            .iter()
-            .map(|c| c.display())
-            .collect();
-        assert!(!rendered.iter().any(|c| c.contains("192.168.10.150")));
-        assert!(rendered.contains(&"route add -host 10.9.9.9 -interface vlan0".to_string()));
-        assert!(rendered.contains(&"route add -net 239.255.0.0/24 -interface vlan0".to_string()));
+    fn tagged_routes_without_gateway() {
+        let mut v = tagged(10, "192.168.10.90/24");
+        v.routes.push(Route { destination: "192.168.10.150/32".to_string(), gateway: None });
+        v.routes.push(Route { destination: "10.9.9.9/32".to_string(), gateway: None });
+        v.routes.push(Route { destination: "239.255.0.0/24".to_string(), gateway: None });
+        let rendered: Vec<String> = bringup_commands(&v, "en10").iter().map(|c| c.display()).collect();
+        assert!(!rendered.iter().any(|c| c.contains("192.168.10.150"))); // in-subnet -> skipped
+        assert!(rendered.contains(&"route add -host 10.9.9.9 -interface vlan10".to_string()));
+        assert!(rendered.contains(&"route add -net 239.255.0.0/24 -interface vlan10".to_string()));
+    }
+
+    #[test]
+    fn untagged_configures_parent_with_alias_and_routes() {
+        let mut u = Interface { vlan: None, address: "192.168.1.100/24".parse().unwrap(), mtu: None, routes: vec![] };
+        u.routes.push(Route { destination: "192.168.10.151/32".to_string(), gateway: None });
+        let rendered: Vec<String> = bringup_commands(&u, "en16").iter().map(|c| c.display()).collect();
+        assert_eq!(
+            rendered,
+            vec![
+                "ifconfig en16 inet 192.168.1.100 netmask 255.255.255.0 alias",
+                "route add -host 192.168.10.151 -interface en16",
+            ]
+        );
+    }
+
+    #[test]
+    fn untagged_skips_in_subnet_gatewayless_route() {
+        let mut u = Interface { vlan: None, address: "192.168.10.1/24".parse().unwrap(), mtu: None, routes: vec![] };
+        u.routes.push(Route { destination: "192.168.10.152/32".to_string(), gateway: None });
+        let rendered: Vec<String> = bringup_commands(&u, "en16").iter().map(|c| c.display()).collect();
+        assert_eq!(rendered, vec!["ifconfig en16 inet 192.168.10.1 netmask 255.255.255.0 alias"]);
     }
 
     #[test]
@@ -193,7 +210,7 @@ mod tests {
     #[test]
     fn interface_names_match_vlan_ids() {
         let p: Profile = toml::from_str(
-            "name=\"t\"\n[[vlan]]\nid=10\naddress=\"1.1.1.1/24\"\n[[vlan]]\nid=11\naddress=\"2.2.2.2/24\"\n",
+            "name=\"t\"\n[[interface]]\nvlan=10\naddress=\"1.1.1.1/24\"\n[[interface]]\nvlan=11\naddress=\"2.2.2.2/24\"\n",
         )
         .unwrap();
         p.validate().unwrap();
