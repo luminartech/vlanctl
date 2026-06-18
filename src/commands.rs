@@ -73,6 +73,9 @@ pub fn apply<R: CommandRunner>(
                 }
                 for cmd in bringup_commands(interface, &device) {
                     if let Err(e) = runner.run(&cmd) {
+                        if cmd.best_effort {
+                            continue;
+                        }
                         rollback(runner, &created);
                         return Err(e).with_context(|| {
                             format!("applying profile '{}'; rolled back", profile.name)
@@ -93,6 +96,9 @@ pub fn apply<R: CommandRunner>(
                             }
                         }
                         Err(e) => {
+                            if cmd.best_effort {
+                                continue;
+                            }
                             rollback(runner, &created);
                             return Err(e).with_context(|| {
                                 format!("applying profile '{}'; rolled back", profile.name)
@@ -391,6 +397,46 @@ mod tests {
         let names = list_profiles(&dir).unwrap();
         assert_eq!(names, vec!["a", "b"]);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn mac_profile() -> Profile {
+        let p: Profile = toml::from_str(
+            "name=\"halo\"\ndevice=\"en0\"\n\
+             [[interface]]\naddress=\"192.168.1.100/24\"\n\
+             [[interface.route]]\ndestination=\"192.168.10.151/32\"\nmac=\"3a:42:f7:79:32:2e\"\n",
+        )
+        .unwrap();
+        p.validate().unwrap();
+        p
+    }
+
+    #[test]
+    fn apply_tolerates_best_effort_arp_d_failure() {
+        let state_path = std::env::temp_dir().join("vlanctl-apply-best-effort.json");
+
+        // First run, no failures: capture the command list and find the arp -d index.
+        let _ = std::fs::remove_file(&state_path);
+        let mut r = runner_with_device();
+        let created = apply(&mut r, &mac_profile(), &state_path, false).unwrap();
+        assert!(created.is_empty()); // untagged-only profile records nothing
+        let rendered: Vec<String> = r.commands.iter().map(|c| c.display()).collect();
+        assert!(rendered.contains(&"arp -d 192.168.10.151".to_string()));
+        assert!(rendered.contains(&"arp -s 192.168.10.151 3a:42:f7:79:32:2e".to_string()));
+        let arp_d_index = r
+            .commands
+            .iter()
+            .position(|c| c.args.first().map(|a| a == "-d").unwrap_or(false))
+            .unwrap();
+
+        // Second run: remove the state file first so no `down` runs (keeping command
+        // indices identical to the first run), make `arp -d` fail, and confirm apply
+        // still succeeds and still runs `arp -s`.
+        let _ = std::fs::remove_file(&state_path);
+        let mut r2 = runner_with_device();
+        r2.fail_at = Some(arp_d_index);
+        apply(&mut r2, &mac_profile(), &state_path, false).unwrap(); // must NOT error
+        let rendered2: Vec<String> = r2.commands.iter().map(|c| c.display()).collect();
+        assert!(rendered2.contains(&"arp -s 192.168.10.151 3a:42:f7:79:32:2e".to_string()));
     }
 
     #[test]

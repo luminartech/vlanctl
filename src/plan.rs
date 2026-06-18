@@ -47,12 +47,25 @@ pub fn bringup_commands(interface: &Interface, device: &str) -> Vec<Cmd> {
                 let gateway = gateway.to_string();
                 cmds.push(Cmd::new("route", &["add", &route.destination, &gateway]));
             }
-            // A gatewayless destination inside this interface's own connected
-            // subnet is reached by the connected route; an explicit
-            // `-host ... -interface` route would install a self-MAC ARP entry
-            // that breaks resolution, so it is skipped.
-            None if destination_in_subnet(&route.destination, &interface.address) => {}
-            None => cmds.push(interface_route_command(&route.destination, &name)),
+            None => {
+                // A gatewayless destination inside this interface's own
+                // connected subnet is reached by the connected route; an
+                // explicit `-host ... -interface` route would install a
+                // self-MAC ARP entry that breaks resolution, so it is skipped.
+                if !destination_in_subnet(&route.destination, &interface.address) {
+                    cmds.push(interface_route_command(&route.destination, &name));
+                }
+                // Static ARP for an on-link host the kernel can't resolve.
+                // Validation guarantees mac => gatewayless /32, so the address
+                // parse below always succeeds.
+                if let Some(mac) = &route.mac
+                    && let Ok(net) = route.destination.parse::<IpNet>()
+                {
+                    let host = net.addr().to_string();
+                    cmds.push(Cmd::new_best_effort("arp", &["-d", &host]));
+                    cmds.push(Cmd::new("arp", &["-s", &host, mac]));
+                }
+            }
         }
     }
     cmds
@@ -142,6 +155,7 @@ mod tests {
         v.routes.push(Route {
             destination: "192.168.20.0/24".to_string(),
             gateway: Some("192.168.10.1".parse::<IpAddr>().unwrap()),
+            mac: None,
         });
         let rendered: Vec<String> = bringup_commands(&v, "en10").iter().map(|c| c.display()).collect();
         assert_eq!(
@@ -159,9 +173,9 @@ mod tests {
     #[test]
     fn tagged_routes_without_gateway() {
         let mut v = tagged(10, "192.168.10.90/24");
-        v.routes.push(Route { destination: "192.168.10.150/32".to_string(), gateway: None });
-        v.routes.push(Route { destination: "10.9.9.9/32".to_string(), gateway: None });
-        v.routes.push(Route { destination: "239.255.0.0/24".to_string(), gateway: None });
+        v.routes.push(Route { destination: "192.168.10.150/32".to_string(), gateway: None, mac: None });
+        v.routes.push(Route { destination: "10.9.9.9/32".to_string(), gateway: None, mac: None });
+        v.routes.push(Route { destination: "239.255.0.0/24".to_string(), gateway: None, mac: None });
         let rendered: Vec<String> = bringup_commands(&v, "en10").iter().map(|c| c.display()).collect();
         assert!(!rendered.iter().any(|c| c.contains("192.168.10.150"))); // in-subnet -> skipped
         assert!(rendered.contains(&"route add -host 10.9.9.9 -interface vlan10".to_string()));
@@ -171,7 +185,7 @@ mod tests {
     #[test]
     fn untagged_configures_parent_with_alias_and_routes() {
         let mut u = Interface { vlan: None, address: "192.168.1.100/24".parse().unwrap(), mtu: None, routes: vec![] };
-        u.routes.push(Route { destination: "192.168.10.151/32".to_string(), gateway: None });
+        u.routes.push(Route { destination: "192.168.10.151/32".to_string(), gateway: None, mac: None });
         let rendered: Vec<String> = bringup_commands(&u, "en16").iter().map(|c| c.display()).collect();
         assert_eq!(
             rendered,
@@ -185,7 +199,7 @@ mod tests {
     #[test]
     fn untagged_skips_in_subnet_gatewayless_route() {
         let mut u = Interface { vlan: None, address: "192.168.10.1/24".parse().unwrap(), mtu: None, routes: vec![] };
-        u.routes.push(Route { destination: "192.168.10.152/32".to_string(), gateway: None });
+        u.routes.push(Route { destination: "192.168.10.152/32".to_string(), gateway: None, mac: None });
         let rendered: Vec<String> = bringup_commands(&u, "en16").iter().map(|c| c.display()).collect();
         assert_eq!(rendered, vec!["ifconfig en16 inet 192.168.10.1 netmask 255.255.255.0 alias"]);
     }
@@ -215,5 +229,29 @@ mod tests {
         .unwrap();
         p.validate().unwrap();
         assert_eq!(interface_names(&p), vec!["vlan10", "vlan11"]);
+    }
+
+    #[test]
+    fn gatewayless_host_route_with_mac_emits_static_arp() {
+        let mut u = Interface { vlan: None, address: "192.168.1.100/24".parse().unwrap(), mtu: None, routes: vec![] };
+        u.routes.push(Route {
+            destination: "192.168.10.151/32".to_string(),
+            gateway: None,
+            mac: Some("3a:42:f7:79:32:2e".to_string()),
+        });
+        let cmds = bringup_commands(&u, "en16");
+        let rendered: Vec<String> = cmds.iter().map(|c| c.display()).collect();
+        assert_eq!(
+            rendered,
+            vec![
+                "ifconfig en16 inet 192.168.1.100 netmask 255.255.255.0 alias",
+                "route add -host 192.168.10.151 -interface en16",
+                "arp -d 192.168.10.151",
+                "arp -s 192.168.10.151 3a:42:f7:79:32:2e",
+            ]
+        );
+        // The arp -d must be best-effort.
+        let arp_d = cmds.iter().find(|c| c.args.first().map(|a| a == "-d").unwrap_or(false)).unwrap();
+        assert!(arp_d.best_effort);
     }
 }
