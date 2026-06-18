@@ -6,6 +6,9 @@ use std::process::Command;
 pub struct Cmd {
     pub program: String,
     pub args: Vec<String>,
+    /// When true, a run failure is ignored by apply instead of being a hard
+    /// error (used for `arp -d`, which fails when no entry exists).
+    pub best_effort: bool,
 }
 
 impl Cmd {
@@ -13,7 +16,15 @@ impl Cmd {
         Cmd {
             program: program.to_string(),
             args: args.iter().map(|s| s.to_string()).collect(),
+            best_effort: false,
         }
+    }
+
+    /// Like `new`, but a run failure is ignored by apply.
+    pub fn new_best_effort(program: &str, args: &[&str]) -> Cmd {
+        let mut cmd = Cmd::new(program, args);
+        cmd.best_effort = true;
+        cmd
     }
 
     /// Render as a shell-like string for display (show / dry-run).
@@ -87,5 +98,13 @@ mod tests {
         };
         assert!(r.run(&Cmd::new("a", &[])).is_ok());
         assert!(r.run(&Cmd::new("b", &[])).is_err());
+    }
+
+    #[test]
+    fn best_effort_flag_is_set_correctly() {
+        assert_eq!(Cmd::new("arp", &["-s", "x"]).best_effort, false);
+        let be = Cmd::new_best_effort("arp", &["-d", "x"]);
+        assert_eq!(be.best_effort, true);
+        assert_eq!(be.display(), "arp -d x"); // flag does not affect rendering
     }
 }
