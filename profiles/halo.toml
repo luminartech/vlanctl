@@ -1,24 +1,26 @@
 name = "halo"
-description = "Halo A3 (LUM Gen FW): telnet debug on VLAN 12. See note re: untagged data path."
+description = "Halo A3 (LUM Gen FW): untagged UDP data path + VLAN 12 telnet."
 
-# Real Halo layout (from halo_vlan_up.sh), which differs from Iris:
-#   - Telnet debug:  VLAN 12,  sensor 192.168.10.152,  host 192.168.10.1/24.
-#   - UDP data path: UNTAGGED, sensor 192.168.10.151,  host 192.168.1.100/24,
-#     plus an on-link /32 route to .151 and the SOME/IP-SD multicast group.
-#
-# vlanctl can only express the *tagged* (VLAN) part. The untagged data path
-# configures the physical parent interface directly, which vlanctl has no model
-# for yet, so bring it up separately (see ~/Downloads/halo_vlan_up.sh) until
-# vlanctl gains an untagged/parent-interface section.
-#
-# HARDWARE NOTE: this requires a USB NIC that actually transmits 802.1Q tags
-# under macOS. The "USB 10/100/1000 LAN" dongle with MAC 98:fc:84:ec:ea:f1
-# (en7) silently drops the tag on TX — the sensor never sees tagged frames and
-# nothing connects. The Realtek dongle (00:e0:4c:..., en16) works. Pin `device`
-# to the good adapter if auto-detect might pick the bad one.
+# Untagged UDP data path: sensor 192.168.10.151 (out-of-subnet), host
+# 192.168.1.100/24, plus the SOME/IP-SD multicast group. vlanctl configures the
+# parent device directly and leaves it configured on `down`.
+[[interface]]
+address = "192.168.1.100/24"
 
-# VLAN 12 — telnet debug. Host .1, sensor .152. The sensor is reached by the
-# connected /24 route (normal ARP); no explicit route needed.
-[[vlan]]
-id = 12
+  # Data sensor — out of the host's /24, so reached via an on-link route.
+  [[interface.route]]
+  destination = "192.168.10.151/32"
+
+  # SOME/IP-SD multicast group.
+  [[interface.route]]
+  destination = "239.255.0.255/32"
+
+# VLAN 12 — telnet debug. Sensor .152, reached by the connected /24 route.
+[[interface]]
+vlan = 12
 address = "192.168.10.1/24"
+
+# HARDWARE NOTE: requires a USB NIC that transmits 802.1Q tags under macOS.
+# The 98:fc:84:ec:ea:f1 dongle (en7) silently drops tags on TX; the Realtek
+# dongle (00:e0:4c:..., en16) works. Pin `device` to the good adapter if
+# auto-detect might pick the bad one.
