@@ -55,14 +55,17 @@ pub fn bringup_commands(interface: &Interface, device: &str) -> Vec<Cmd> {
                 if !destination_in_subnet(&route.destination, &interface.address) {
                     cmds.push(interface_route_command(&route.destination, &name));
                 }
-                // Static ARP for an on-link host the kernel can't resolve.
-                // Validation guarantees mac => gatewayless /32, so the address
-                // parse below always succeeds.
+                // Static ARP for an on-link host the kernel can't resolve. The
+                // `-host ... -interface` route above leaves an LLINFO entry that
+                // would otherwise resolve to our own MAC (a self-MAC black-hole);
+                // `arp -s` overwrites it with the real MAC. (No preceding
+                // `arp -d`: on macOS that deletes the freshly-added host route,
+                // breaking the `arp -s`.) Validation guarantees mac => gatewayless
+                // /32, so the address parse below always succeeds.
                 if let Some(mac) = &route.mac
                     && let Ok(net) = route.destination.parse::<IpNet>()
                 {
                     let host = net.addr().to_string();
-                    cmds.push(Cmd::new_best_effort("arp", &["-d", &host]));
                     cmds.push(Cmd::new("arp", &["-s", &host, mac]));
                 }
             }
@@ -246,12 +249,8 @@ mod tests {
             vec![
                 "ifconfig en16 inet 192.168.1.100 netmask 255.255.255.0 alias",
                 "route add -host 192.168.10.151 -interface en16",
-                "arp -d 192.168.10.151",
                 "arp -s 192.168.10.151 3a:42:f7:79:32:2e",
             ]
         );
-        // The arp -d must be best-effort.
-        let arp_d = cmds.iter().find(|c| c.args.first().map(|a| a == "-d").unwrap_or(false)).unwrap();
-        assert!(arp_d.best_effort);
     }
 }
