@@ -1,4 +1,4 @@
-use crate::config::{Interface, Profile, Route};
+use crate::config::{Interface, Profile};
 use crate::net::Cmd;
 use ipnet::IpNet;
 
