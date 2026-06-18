@@ -74,30 +74,57 @@ Validation — when `mac` is `Some`:
 
 `mac = None` is unchanged behaviour.
 
+### Best-effort commands (`net.rs`)
+
+`arp -d <host>` returns a non-zero exit when no entry exists, but the existing
+`SystemRunner` treats any non-zero exit as a hard failure (and apply rolls
+back). To clear a possibly-absent stale entry without failing apply, `Cmd` gains
+a `best_effort` flag:
+
+```rust
+pub struct Cmd {
+    pub program: String,
+    pub args: Vec<String>,
+    pub best_effort: bool,   // run failure is ignored (not a hard error)
+}
+```
+
+`Cmd::new(...)` sets `best_effort: false` (all existing call sites unchanged). Add
+`Cmd::new_best_effort(program, args)` (or a `.best_effort()` builder) for the
+`arp -d` command. `display()` is unchanged (the flag does not affect rendering);
+`RecordingRunner` records best-effort commands like any other.
+
 ### Command generation (`plan.rs`)
 
 In the per-route loop of `bringup_commands`, after the existing handling of a
-gatewayless route, if the route has a `mac`, append a static-ARP command using
-the destination's bare host address:
+gatewayless route, if the route has a `mac`, append a best-effort `arp -d`
+(clears any stale/auto self-MAC entry) followed by the `arp -s`, using the
+destination's bare host address:
 
 ```
 route add -host 192.168.10.151 -interface en16    # existing (skipped if in-subnet)
-arp -s 192.168.10.151 3a:42:f7:79:32:2e            # new, when mac is set
+arp -d 192.168.10.151                              # new, best-effort (no-op if absent)
+arp -s 192.168.10.151 3a:42:f7:79:32:2e            # new
 ```
 
-- The `arp -s` is emitted whenever a gatewayless route carries a `mac`, ordered
-  immediately after that route's own command(s). The existing in-subnet skip
-  still governs whether the `route add` line is emitted; the `arp -s` line is
-  what forces resolution for an out-of-subnet host.
+- The `arp -d`/`arp -s` pair is emitted whenever a gatewayless route carries a
+  `mac`, ordered immediately after that route's own command(s). The existing
+  in-subnet skip still governs whether the `route add` line is emitted; the
+  `arp -s` line is what forces resolution for an out-of-subnet host.
 - `mac` on a route with a gateway, or on a non-/32, never reaches command
   generation — validation rejects it first.
 
 ### Lifecycle (apply / down / state)
 
-Unchanged from the untagged-interface design:
+Mostly unchanged from the untagged-interface design:
 
+- **Best-effort handling:** apply's command-run loops (both the tagged and
+  untagged branches) must, on a command error, check `cmd.best_effort`: if set,
+  log/ignore and continue; otherwise roll back as today. This lets the
+  `arp -d` no-op when no entry exists.
 - **Idempotency:** apply skips an untagged interface entirely when its alias
-  address is already configured, so its `arp -s` does not re-run on re-apply.
+  address is already configured, so its `arp -d`/`arp -s` do not re-run on
+  re-apply.
 - **down / state:** untagged config (including its ARP entry) persists; `down`
   only destroys recorded `vlan<id>` interfaces, which drops their ARP entries.
 
@@ -107,13 +134,10 @@ Unchanged from the untagged-interface design:
 
 ## Risk / validation checkpoint
 
-macOS may auto-install a self-MAC ARP entry for the `-host ... -interface`
-route. Hardware validation must confirm that `arp -s` yields a **single** entry
-at the real MAC (`3a:42:f7:79:32:2e`), not a duplicate alongside a stale
-self-MAC entry. If a stale entry remains, the fix is a best-effort
-`arp -d <host>` emitted immediately before `arp -s <host> <mac>` (tolerating its
-failure when no entry exists). This is the one open implementation risk; resolve
-it during the hardware check before merge.
+The defensive `arp -d` before `arp -s` clears any auto/stale self-MAC entry, so
+the static entry should be the sole one at the real MAC. Hardware validation
+must still confirm `arp -an` shows `.151` at `3a:42:f7:79:32:2e` as a single
+entry and the data path reaches the sensor.
 
 ## Testing
 
@@ -123,8 +147,12 @@ Unit tests (existing `RecordingRunner` style, no hardware):
   with a gateway; reject `mac` on a non-/32 (e.g. `/24` or `"default"`); reject a
   malformed `mac` string.
 - **plan:** a gatewayless `/32` route with `mac` emits the `route add -host ...
-  -interface <iface>` line followed by `arp -s <host> <mac>`; a route without
-  `mac` emits no `arp` command (regression).
+  -interface <iface>` line, then a best-effort `arp -d <host>`, then
+  `arp -s <host> <mac>`; a route without `mac` emits no `arp` command
+  (regression).
+- **net:** a `best_effort` command whose run fails does not error apply (e.g. via
+  `RecordingRunner` with `fail_at` pointed at the `arp -d`, the apply still
+  succeeds and proceeds to `arp -s`).
 
 Hardware validation (manual, on a good adapter): `vlanctl apply halo`, confirm
 `arp -an` shows `.151` at `3a:42:f7:79:32:2e` (single entry, not self-MAC), and
