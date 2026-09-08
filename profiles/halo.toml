@@ -22,6 +22,25 @@ address = "192.168.1.100/24"
 vlan = 12
 address = "192.168.10.1/24"
 
+# VLAN 10 — DoIP. Host .90, sensor .150.
+[[interface]]
+vlan = 10
+address = "192.168.10.90/24"
+
+  # Host route to the sensor, pinned to this interface.
+  [[interface.route]]
+  destination = "192.168.10.150/32"
+
+# VLAN 11 — SOME/IP. Host .87, sensor .151. (SOME/IP-SD multicast is already
+# carried on the untagged data path above, so it's not duplicated here.)
+[[interface]]
+vlan = 11
+address = "192.168.11.87/24"
+
+  # Host route to the sensor, pinned to this interface.
+  [[interface.route]]
+  destination = "192.168.11.151/32"
+
 # HARDWARE NOTE: requires a USB NIC that transmits 802.1Q tags under macOS.
 # The 98:fc:84:ec:ea:f1 dongle (en7) silently drops tags on TX; the Realtek
 # dongle (00:e0:4c:..., en16) works. Pin `device` to the good adapter if

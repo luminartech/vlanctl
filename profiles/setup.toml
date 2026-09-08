@@ -7,25 +7,23 @@ device = "en12"
 
 # VLAN 10 — DoIP. Host .90, sensor .150.
 [[interface]]
-vlan = 10
-address = "192.168.10.90/24"
+vlan = 12
+address = "192.168.11.90/24"
 
   # Host route to the sensor, pinned to this interface. Required here because
   # VLAN 11 shares 192.168.10.0/24, so the sensor must be reached via vlan10.
   [[interface.route]]
-  destination = "192.168.10.150/32"
+  destination = "192.168.11.150/32"
 
   # DoIP announce route: add here once the announce address is confirmed.
+  # VLAN 10 — DoIP. Host .90, sensor .150.
+  [[interface]]
+  vlan = 10
+  address = "192.168.10.90/24"
 
-# VLAN 11 — SOME/IP. Host .87, sensor .151.
-[[interface]]
-vlan = 11
-address = "192.168.10.87/24"
+    # Host route to the sensor, pinned to this interface. Required here because
+    # VLAN 11 shares 192.168.10.0/24, so the sensor must be reached via vlan10.
+    [[interface.route]]
+    destination = "192.168.10.150/32"
 
-  # Host route to the sensor, pinned to this interface (shared-subnet reason).
-  [[interface.route]]
-  destination = "192.168.10.151/32"
-
-  # SOME/IP-SD multicast group, pinned to this interface.
-  [[interface.route]]
-  destination = "239.255.0.255/32"
+    # DoIP announce route: add here once the announce address is confirmed.
