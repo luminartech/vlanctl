@@ -18,6 +18,28 @@ vlanctl status                     # what is currently up
 A global `--profiles-dir <dir>` (default `profiles`) selects where profiles are
 read from.
 
+## Library use
+
+`vlanctl` is also a library. A consumer supplies a `CommandRunner` and a
+`Platform`:
+
+```rust
+use vlanctl::{commands, config::Profile, net::RecordingRunner, plan::MacOs};
+
+let profile = Profile::load("profiles/lum.toml".as_ref())?;
+let mut runner = RecordingRunner::default();      // or SystemRunner to execute
+commands::apply(&mut runner, &MacOs, &profile, &state_path, true)?;
+for cmd in &runner.commands {
+    println!("{}", cmd.display());
+}
+```
+
+Depend on it without the CLI's argument parser:
+
+```toml
+vlanctl = { git = "…", default-features = false }
+```
+
 ## Profiles
 
 Profiles live in `profiles/*.toml`, one file per profile. Each profile describes
