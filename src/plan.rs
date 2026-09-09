@@ -49,6 +49,64 @@ pub trait Platform {
     fn reverts_parent_config(&self) -> bool;
 }
 
+/// macOS / BSD. The behavior this crate shipped before the `Platform` seam
+/// existed, extracted unchanged.
+pub struct MacOs;
+
+impl Platform for MacOs {
+    fn name(&self) -> &'static str {
+        "macos"
+    }
+
+    fn iface_name(&self, interface: &Interface, device: &str) -> String {
+        iface_name(interface, device)
+    }
+
+    fn bringup_commands(&self, interface: &Interface, device: &str) -> Vec<Cmd> {
+        bringup_commands(interface, device)
+    }
+
+    fn teardown_commands(&self, iface: &str) -> Vec<Cmd> {
+        teardown_commands(iface)
+    }
+
+    fn wants_onlink_host_route(&self, in_subnet: bool) -> bool {
+        // An interface-scoped host route to an in-subnet destination installs
+        // a permanent self-MAC LLINFO entry and black-holes the traffic; the
+        // connected route resolves it correctly instead.
+        !in_subnet
+    }
+
+    fn reverts_parent_config(&self) -> bool {
+        // An untagged entry aliases an address onto the physical device.
+        // Teardown deliberately leaves it: the device may carry unrelated
+        // configuration this crate did not create.
+        false
+    }
+}
+
+/// The platform this build targets.
+///
+/// Returns [`MacOs`] on macOS. Other platforms are unimplemented until 1b
+/// (Linux) and 3 (Windows) — a caller on those platforms must construct a
+/// `Platform` explicitly rather than relying on this.
+#[must_use]
+pub fn host_platform() -> Box<dyn Platform> {
+    #[cfg(target_os = "macos")]
+    {
+        Box::new(MacOs)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        // Deliberate: 1a adds the seam, not the backends. Returning a
+        // silently-wrong platform would be far worse than refusing.
+        unimplemented!(
+            "no Platform implementation for this OS yet; \
+             construct one explicitly (Linux lands in 1b, Windows in 3)"
+        )
+    }
+}
+
 /// Interface name this entry configures: `vlan<id>` for a tagged interface,
 /// or the parent `device` itself for an untagged one.
 pub fn iface_name(interface: &Interface, device: &str) -> String {
@@ -413,5 +471,57 @@ mod tests {
     #[test]
     fn a_platform_controls_reverting_parent_config() {
         assert!(Contrarian.reverts_parent_config());
+    }
+
+    #[test]
+    fn macos_impl_matches_the_free_functions_it_replaces() {
+        let tagged = Interface {
+            vlan: Some(11),
+            address: "192.168.11.87/24".parse().unwrap(),
+            mtu: Some(1500),
+            routes: vec![Route {
+                destination: "239.255.0.255/32".to_string(),
+                gateway: None,
+                mac: None,
+            }],
+        };
+        let untagged = Interface {
+            vlan: None,
+            address: "192.168.1.100/24".parse().unwrap(),
+            mtu: None,
+            routes: vec![Route {
+                destination: "192.168.10.151/32".to_string(),
+                gateway: None,
+                mac: Some("3a:42:f7:79:32:2e".to_string()),
+            }],
+        };
+        for i in [&tagged, &untagged] {
+            assert_eq!(
+                MacOs.bringup_commands(i, "en7"),
+                bringup_commands(i, "en7"),
+                "extraction must not change macOS output"
+            );
+            assert_eq!(MacOs.iface_name(i, "en7"), iface_name(i, "en7"));
+        }
+        assert_eq!(
+            MacOs.teardown_commands("vlan11"),
+            teardown_commands("vlan11")
+        );
+    }
+
+    #[test]
+    fn macos_skips_an_in_subnet_gatewayless_route_and_keeps_parent_config() {
+        assert!(
+            !MacOs.wants_onlink_host_route(true),
+            "an in-subnet interface-scoped host route self-MACs on macOS"
+        );
+        assert!(
+            MacOs.wants_onlink_host_route(false),
+            "out-of-subnet still needs the route"
+        );
+        assert!(
+            !MacOs.reverts_parent_config(),
+            "untagged parent config persists by design on macOS"
+        );
     }
 }
