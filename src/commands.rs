@@ -4,28 +4,49 @@ use crate::net::{Cmd, CommandRunner};
 use crate::plan::{Platform, bringup_commands_for, interface_names};
 use crate::state::State;
 use anyhow::{Context, Result, bail};
+use ipnet::IpNet;
 use std::path::Path;
 
 /// List live interface names from `ifconfig -l`.
-fn live_interfaces<R: CommandRunner>(runner: &mut R) -> Result<Vec<String>> {
+///
+/// `pub(crate)`: also the parser behind [`crate::plan::Platform::list_devices`].
+pub(crate) fn live_interfaces<R: CommandRunner + ?Sized>(runner: &mut R) -> Result<Vec<String>> {
     let out = runner.run(&Cmd::new("ifconfig", &["-l"]))?;
     Ok(out.split_whitespace().map(|s| s.to_string()).collect())
 }
 
-/// IPv4 addresses currently configured on `device` (parsed from `ifconfig`),
-/// used to make untagged-interface apply idempotent.
-fn device_inet_addresses<R: CommandRunner>(runner: &mut R, device: &str) -> Result<Vec<String>> {
+/// IPv4 addresses currently configured on `device`, parsed from the `inet`
+/// lines of `ifconfig <device>` (address plus netmask). Used to make
+/// untagged-interface apply idempotent.
+///
+/// `pub(crate)`: also the parser behind [`crate::plan::Platform::addresses_on`].
+pub(crate) fn device_inet_addresses<R: CommandRunner + ?Sized>(
+    runner: &mut R,
+    device: &str,
+) -> Result<Vec<IpNet>> {
     let out = runner.run(&Cmd::new("ifconfig", &[device]))?;
     Ok(out
         .lines()
         .filter_map(|line| {
             let mut toks = line.split_whitespace();
-            match toks.next() {
-                Some("inet") => toks.next().map(|a| a.to_string()),
-                _ => None,
+            if toks.next() != Some("inet") {
+                return None;
             }
+            let addr = toks.next()?;
+            let prefix = match toks.next() {
+                Some("netmask") => toks.next().and_then(prefix_from_hex_netmask).unwrap_or(32),
+                _ => 32,
+            };
+            format!("{addr}/{prefix}").parse::<IpNet>().ok()
         })
         .collect())
+}
+
+/// Parse an `ifconfig` hex netmask (e.g. `0xffffff00`) into a prefix length.
+fn prefix_from_hex_netmask(hex: &str) -> Option<u8> {
+    let hex = hex.strip_prefix("0x")?;
+    let mask = u32::from_str_radix(hex, 16).ok()?;
+    Some(mask.count_ones() as u8)
 }
 
 /// Bring up `profile`. Tears down any active profile first, then creates each
@@ -80,8 +101,10 @@ pub fn apply<R: CommandRunner>(
             // its own recording/teardown path built deliberately, not this
             // one reused by accident.
             None => {
-                let addr = interface.address.addr().to_string();
-                if device_inet_addresses(runner, &device)?.contains(&addr) {
+                let already_configured = device_inet_addresses(runner, &device)?
+                    .iter()
+                    .any(|net| net.addr() == interface.address.addr());
+                if already_configured {
                     continue;
                 }
                 for cmd in bringup_commands_for(platform, interface, &device) {

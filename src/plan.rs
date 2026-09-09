@@ -1,17 +1,20 @@
 use crate::config::{Interface, Profile, Route};
-use crate::net::Cmd;
+use crate::net::{Cmd, CommandRunner};
+use anyhow::Result;
 use ipnet::IpNet;
 
-/// Per-operating-system command generation.
+/// Per-operating-system command generation and host-state reading.
 ///
-/// Two of these methods return **decisions, not syntax**, and that is
+/// Two of the emission methods return **decisions, not syntax**, and that is
 /// deliberate. The straight-line logic this trait replaces looked universal
 /// but encoded macOS semantics; a port that shared it would silently break
 /// the other platforms. See the dft-side design §4.3.1.
 ///
-/// No implementation exists yet outside the test module's `Contrarian`
-/// double: Task 4 adds `MacOs`, and Task 5 threads this trait through
-/// `commands.rs`.
+/// The state-reading methods (`list_devices`, `addresses_on`, `is_wireless`,
+/// `link_is_active`) exist for the same reason: they parse the output of
+/// OS-specific tools, and a wrong parser silently mis-detects hardware rather
+/// than erroring, so each platform must supply its own rather than inherit
+/// one that happens to compile.
 pub trait Platform {
     /// Short identifier for logs and error messages, e.g. `"macos"`.
     fn name(&self) -> &'static str;
@@ -49,6 +52,20 @@ pub trait Platform {
     /// `true`, because its untagged equivalent is a vSwitch binding that
     /// re-plumbs the NIC and cannot be left behind.
     fn reverts_parent_config(&self) -> bool;
+
+    /// Names of every network device currently on the host, from `ifconfig -l`.
+    fn list_devices(&self, runner: &mut dyn CommandRunner) -> Result<Vec<String>>;
+
+    /// IPv4 addresses currently configured on `device`, from the `inet` lines
+    /// of `ifconfig <device>`.
+    fn addresses_on(&self, runner: &mut dyn CommandRunner, device: &str) -> Result<Vec<IpNet>>;
+
+    /// Whether `device`'s hardware port is Wi-Fi, from
+    /// `networksetup -listallhardwareports`.
+    fn is_wireless(&self, runner: &mut dyn CommandRunner, device: &str) -> Result<bool>;
+
+    /// Whether `ifconfig <device>` reports `status: active`.
+    fn link_is_active(&self, runner: &mut dyn CommandRunner, device: &str) -> Result<bool>;
 }
 
 /// macOS / BSD. The behavior this crate shipped before the `Platform` seam
@@ -84,6 +101,24 @@ impl Platform for MacOs {
         // Teardown deliberately leaves it: the device may carry unrelated
         // configuration this crate did not create.
         false
+    }
+
+    fn list_devices(&self, runner: &mut dyn CommandRunner) -> Result<Vec<String>> {
+        crate::commands::live_interfaces(runner)
+    }
+
+    fn addresses_on(&self, runner: &mut dyn CommandRunner, device: &str) -> Result<Vec<IpNet>> {
+        crate::commands::device_inet_addresses(runner, device)
+    }
+
+    fn is_wireless(&self, runner: &mut dyn CommandRunner, device: &str) -> Result<bool> {
+        Ok(crate::device::wifi_devices(runner)?
+            .iter()
+            .any(|w| w == device))
+    }
+
+    fn link_is_active(&self, runner: &mut dyn CommandRunner, device: &str) -> Result<bool> {
+        crate::device::interface_is_active(runner, device)
     }
 }
 
@@ -511,6 +546,26 @@ mod tests {
         }
         fn reverts_parent_config(&self) -> bool {
             true
+        }
+        // Host-state reads are untested through Contrarian — it exists to
+        // prove the emission/decision methods are honored, not to exercise
+        // parsing. Fixed answers are enough to keep it implementing the
+        // trait.
+        fn list_devices(&self, _runner: &mut dyn CommandRunner) -> Result<Vec<String>> {
+            Ok(vec![])
+        }
+        fn addresses_on(
+            &self,
+            _runner: &mut dyn CommandRunner,
+            _device: &str,
+        ) -> Result<Vec<IpNet>> {
+            Ok(vec![])
+        }
+        fn is_wireless(&self, _runner: &mut dyn CommandRunner, _device: &str) -> Result<bool> {
+            Ok(false)
+        }
+        fn link_is_active(&self, _runner: &mut dyn CommandRunner, _device: &str) -> Result<bool> {
+            Ok(false)
         }
     }
 

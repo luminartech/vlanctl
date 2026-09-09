@@ -58,7 +58,9 @@ pub fn resolve_device<R: CommandRunner>(
 /// Devices whose hardware port is Wi-Fi, from `networksetup -listallhardwareports`.
 /// Output is a series of blocks; a `Hardware Port:` line names the port and the
 /// following `Device:` line names its `enN` interface.
-fn wifi_devices<R: CommandRunner>(runner: &mut R) -> Result<Vec<String>> {
+///
+/// `pub(crate)`: also the parser behind [`crate::plan::Platform::is_wireless`].
+pub(crate) fn wifi_devices<R: CommandRunner + ?Sized>(runner: &mut R) -> Result<Vec<String>> {
     let out = runner.run(&Cmd::new("networksetup", &["-listallhardwareports"]))?;
     let mut wifi = Vec::new();
     let mut current_is_wifi = false;
@@ -77,7 +79,12 @@ fn wifi_devices<R: CommandRunner>(runner: &mut R) -> Result<Vec<String>> {
 }
 
 /// Whether `ifconfig <iface>` reports `status: active`.
-fn interface_is_active<R: CommandRunner>(runner: &mut R, iface: &str) -> Result<bool> {
+///
+/// `pub(crate)`: also the parser behind [`crate::plan::Platform::link_is_active`].
+pub(crate) fn interface_is_active<R: CommandRunner + ?Sized>(
+    runner: &mut R,
+    iface: &str,
+) -> Result<bool> {
     let out = runner.run(&Cmd::new("ifconfig", &[iface]))?;
     Ok(out.lines().any(|line| {
         line.trim()
@@ -90,6 +97,7 @@ fn interface_is_active<R: CommandRunner>(runner: &mut R, iface: &str) -> Result<
 mod tests {
     use super::*;
     use crate::net::RecordingRunner;
+    use crate::plan::{MacOs, Platform};
 
     /// Two Wi-Fi (en0) + USB-LAN (en7) hardware ports, as `networksetup` prints them.
     fn hardware_ports() -> String {
@@ -178,5 +186,52 @@ mod tests {
         r.stdout
             .insert("ifconfig -l".to_string(), "lo0 en0".to_string());
         assert!(resolve_device(&mut r, None).is_err());
+    }
+
+    #[test]
+    fn macos_lists_devices_through_the_platform() {
+        let mut r = RecordingRunner::default();
+        r.stdout
+            .insert("ifconfig -l".to_string(), "lo0 en0 en7".to_string());
+        let devs = MacOs.list_devices(&mut r).expect("listing succeeds");
+        assert_eq!(devs, vec!["lo0", "en0", "en7"]);
+    }
+
+    #[test]
+    fn macos_detects_wireless_from_networksetup() {
+        let mut r = RecordingRunner::default();
+        r.stdout.insert(
+            "networksetup -listallhardwareports".to_string(),
+            // Two ports as networksetup prints them; en0 is Wi-Fi.
+            "Hardware Port: Wi-Fi\nDevice: en0\n\nHardware Port: USB 10/100/1000 LAN\nDevice: en7\n".to_string(),
+        );
+        assert!(MacOs.is_wireless(&mut r, "en0").expect("query succeeds"));
+        assert!(!MacOs.is_wireless(&mut r, "en7").expect("query succeeds"));
+    }
+
+    #[test]
+    fn macos_reads_link_status_through_the_platform() {
+        let mut r = RecordingRunner::default();
+        r.stdout
+            .insert("ifconfig en7".to_string(), "\tstatus: active\n".to_string());
+        r.stdout.insert(
+            "ifconfig en4".to_string(),
+            "\tstatus: inactive\n".to_string(),
+        );
+        assert!(MacOs.link_is_active(&mut r, "en7").expect("query succeeds"));
+        assert!(!MacOs.link_is_active(&mut r, "en4").expect("query succeeds"));
+    }
+
+    #[test]
+    fn macos_reads_addresses_through_the_platform() {
+        let mut r = RecordingRunner::default();
+        r.stdout.insert(
+            "ifconfig en0".to_string(),
+            "\tinet 192.168.1.100 netmask 0xffffff00 broadcast 192.168.1.255".to_string(),
+        );
+        let addrs = MacOs.addresses_on(&mut r, "en0").expect("query succeeds");
+        assert_eq!(addrs.len(), 1);
+        assert_eq!(addrs[0].addr().to_string(), "192.168.1.100");
+        assert_eq!(addrs[0].prefix_len(), 24);
     }
 }
