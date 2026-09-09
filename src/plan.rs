@@ -2,6 +2,53 @@ use crate::config::{Interface, Profile};
 use crate::net::Cmd;
 use ipnet::IpNet;
 
+/// Per-operating-system command generation.
+///
+/// Two of these methods return **decisions, not syntax**, and that is
+/// deliberate. The straight-line logic this trait replaces looked universal
+/// but encoded macOS semantics; a port that shared it would silently break
+/// the other platforms. See the dft-side design §4.3.1.
+///
+/// No implementation exists yet outside the test module's `Contrarian`
+/// double: Task 4 adds `MacOs`, and Task 5 threads this trait through
+/// `commands.rs`.
+pub trait Platform {
+    /// Short identifier for logs and error messages, e.g. `"macos"`.
+    fn name(&self) -> &'static str;
+
+    /// Interface name for a profile entry. `vlan11` on macOS, `eth0.11` on
+    /// Linux, `vEthernet (IrisVlan11)` on Windows. Untagged entries return
+    /// the parent device.
+    fn iface_name(&self, interface: &Interface, device: &str) -> String;
+
+    /// Ordered commands to bring one interface up, addresses and routes
+    /// included.
+    fn bringup_commands(&self, interface: &Interface, device: &str) -> Vec<Cmd>;
+
+    /// Commands to tear one interface down.
+    fn teardown_commands(&self, iface: &str) -> Vec<Cmd>;
+
+    /// Whether a **gatewayless** route should emit an interface-scoped host
+    /// route when the destination is `in_subnet`.
+    ///
+    /// macOS answers `false` for an in-subnet destination: an
+    /// interface-scoped host route there installs a self-MAC LLINFO entry
+    /// and black-holes the traffic, so the connected route must be left to
+    /// resolve it. Linux answers `true` — `ip route add X/32 dev Y` makes the
+    /// destination genuinely on-link, and it is the only way to reach
+    /// several hosts that share one subnet across different VLANs.
+    fn wants_onlink_host_route(&self, in_subnet: bool) -> bool;
+
+    /// Whether teardown may revert configuration applied to the **parent**
+    /// device (as opposed to a VLAN sub-interface it created).
+    ///
+    /// macOS answers `false`: an untagged entry aliases an address onto the
+    /// physical device and that persists by design. Windows must answer
+    /// `true`, because its untagged equivalent is a vSwitch binding that
+    /// re-plumbs the NIC and cannot be left behind.
+    fn reverts_parent_config(&self) -> bool;
+}
+
 /// Interface name this entry configures: `vlan<id>` for a tagged interface,
 /// or the parent `device` itself for an untagged one.
 pub fn iface_name(interface: &Interface, device: &str) -> String {
@@ -313,5 +360,50 @@ mod tests {
                 "arp -s 192.168.10.151 3a:42:f7:79:32:2e",
             ]
         );
+    }
+
+    /// A platform whose answers are the opposite of macOS on both decisions,
+    /// proving the trait actually drives behaviour rather than documenting it.
+    struct Contrarian;
+
+    impl Platform for Contrarian {
+        fn name(&self) -> &'static str {
+            "contrarian"
+        }
+        fn iface_name(&self, interface: &Interface, device: &str) -> String {
+            match interface.vlan {
+                Some(id) => format!("{device}.{id}"),
+                None => device.to_string(),
+            }
+        }
+        fn bringup_commands(&self, _i: &Interface, _d: &str) -> Vec<Cmd> {
+            vec![Cmd::new("true", &[])]
+        }
+        fn teardown_commands(&self, iface: &str) -> Vec<Cmd> {
+            vec![Cmd::new("false", &[iface])]
+        }
+        fn wants_onlink_host_route(&self, _in_subnet: bool) -> bool {
+            true
+        }
+        fn reverts_parent_config(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn a_platform_controls_interface_naming() {
+        let i = Interface {
+            vlan: Some(11),
+            address: "192.168.11.87/24".parse().unwrap(),
+            mtu: None,
+            routes: vec![],
+        };
+        assert_eq!(Contrarian.iface_name(&i, "eth0"), "eth0.11");
+    }
+
+    #[test]
+    fn a_platform_controls_the_two_decisions() {
+        assert!(Contrarian.wants_onlink_host_route(true));
+        assert!(Contrarian.reverts_parent_config());
     }
 }
