@@ -1,20 +1,34 @@
+//! CLI entry point. Requires the `cli` feature (on by default); a library
+//! consumer builds with `--no-default-features` and links the lib alone.
+
+#[cfg(feature = "cli")]
 mod cli;
 
+#[cfg(feature = "cli")]
 use anyhow::{Result, bail};
+#[cfg(feature = "cli")]
 use clap::Parser;
+#[cfg(feature = "cli")]
 use cli::{Cli, Command};
+#[cfg(feature = "cli")]
 use config::Profile;
+#[cfg(feature = "cli")]
 use net::{RecordingRunner, SystemRunner};
+#[cfg(feature = "cli")]
 use state::State;
+#[cfg(feature = "cli")]
 use std::path::PathBuf;
+#[cfg(feature = "cli")]
 use vlanctl::{commands, config, device, net, state};
 
+#[cfg(feature = "cli")]
 fn profile_path(dir: &std::path::Path, name: &str) -> PathBuf {
     dir.join(format!("{name}.toml"))
 }
 
 /// Print the commands a recording runner captured, omitting read-only probes
 /// (device detection) so a dry run previews only the changes it would make.
+#[cfg(feature = "cli")]
 fn print_planned_commands(runner: &RecordingRunner) {
     for cmd in &runner.commands {
         if is_read_only_probe(cmd) {
@@ -26,6 +40,7 @@ fn print_planned_commands(runner: &RecordingRunner) {
 
 /// A command that only inspects system state (used during device resolution),
 /// as opposed to one that creates/configures/destroys interfaces or routes.
+#[cfg(feature = "cli")]
 fn is_read_only_probe(cmd: &net::Cmd) -> bool {
     match cmd.program.as_str() {
         // `networksetup -listallhardwareports` lists adapters.
@@ -38,6 +53,7 @@ fn is_read_only_probe(cmd: &net::Cmd) -> bool {
 }
 
 /// macOS: root has uid 0. Bail if not elevated.
+#[cfg(feature = "cli")]
 fn require_root() -> Result<()> {
     // SAFETY: getuid is always safe to call and has no preconditions.
     let uid = unsafe { libc::getuid() };
@@ -47,6 +63,13 @@ fn require_root() -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(feature = "cli"))]
+fn main() {
+    eprintln!("vlanctl was built without the `cli` feature");
+    std::process::exit(2);
+}
+
+#[cfg(feature = "cli")]
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let state_path = State::default_path();

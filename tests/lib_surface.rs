@@ -27,3 +27,12 @@ address = "192.168.11.87/24"
     assert_eq!(p.interfaces.len(), 1);
     p.validate().expect("profile validates");
 }
+
+/// The library must not require the CLI feature. Run this test with
+/// `--no-default-features` to prove a consumer needs no argument parser:
+///   cargo test --test lib_surface --no-default-features
+#[test]
+fn library_builds_without_the_cli_feature() {
+    // Compiling this file at all under --no-default-features is the assertion.
+    let _ = vlanctl::net::Cmd::new("true", &[]);
+}
