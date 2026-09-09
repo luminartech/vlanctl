@@ -3,6 +3,14 @@ name = "vlanctl"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "vlanctl"
+path = "src/lib.rs"
+
+[[bin]]
+name = "vlanctl"
+path = "src/main.rs"
+
 [dependencies]
 anyhow = "1.0"
 clap = { version = "4.6", features = ["derive"] }

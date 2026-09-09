@@ -1,10 +1,4 @@
 mod cli;
-mod commands;
-mod config;
-mod device;
-mod net;
-mod plan;
-mod state;
 
 use anyhow::{Result, bail};
 use clap::Parser;
@@ -13,6 +7,7 @@ use config::Profile;
 use net::{RecordingRunner, SystemRunner};
 use state::State;
 use std::path::PathBuf;
+use vlanctl::{commands, config, device, net, state};
 
 fn profile_path(dir: &std::path::Path, name: &str) -> PathBuf {
     dir.join(format!("{name}.toml"))
