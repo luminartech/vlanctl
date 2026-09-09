@@ -25,8 +25,14 @@ pub fn bringup_commands(interface: &Interface, device: &str) -> Vec<Cmd> {
         Some(id) => {
             let id = id.to_string();
             cmds.push(Cmd::new("ifconfig", &[&name, "create"]));
-            cmds.push(Cmd::new("ifconfig", &[&name, "vlan", &id, "vlandev", device]));
-            cmds.push(Cmd::new("ifconfig", &[&name, "inet", &addr, "netmask", &netmask]));
+            cmds.push(Cmd::new(
+                "ifconfig",
+                &[&name, "vlan", &id, "vlandev", device],
+            ));
+            cmds.push(Cmd::new(
+                "ifconfig",
+                &[&name, "inet", &addr, "netmask", &netmask],
+            ));
         }
         // Untagged: add the address as an alias on the parent device. `down`
         // never removes it; apply skips this interface when the address is
@@ -141,7 +147,12 @@ mod tests {
     use std::net::IpAddr;
 
     fn tagged(id: u16, cidr: &str) -> Interface {
-        Interface { vlan: Some(id), address: cidr.parse().unwrap(), mtu: None, routes: vec![] }
+        Interface {
+            vlan: Some(id),
+            address: cidr.parse().unwrap(),
+            mtu: None,
+            routes: vec![],
+        }
     }
 
     #[test]
@@ -160,7 +171,10 @@ mod tests {
             gateway: Some("192.168.10.1".parse::<IpAddr>().unwrap()),
             mac: None,
         });
-        let rendered: Vec<String> = bringup_commands(&v, "en10").iter().map(|c| c.display()).collect();
+        let rendered: Vec<String> = bringup_commands(&v, "en10")
+            .iter()
+            .map(|c| c.display())
+            .collect();
         assert_eq!(
             rendered,
             vec![
@@ -176,10 +190,25 @@ mod tests {
     #[test]
     fn tagged_routes_without_gateway() {
         let mut v = tagged(10, "192.168.10.90/24");
-        v.routes.push(Route { destination: "192.168.10.150/32".to_string(), gateway: None, mac: None });
-        v.routes.push(Route { destination: "10.9.9.9/32".to_string(), gateway: None, mac: None });
-        v.routes.push(Route { destination: "239.255.0.0/24".to_string(), gateway: None, mac: None });
-        let rendered: Vec<String> = bringup_commands(&v, "en10").iter().map(|c| c.display()).collect();
+        v.routes.push(Route {
+            destination: "192.168.10.150/32".to_string(),
+            gateway: None,
+            mac: None,
+        });
+        v.routes.push(Route {
+            destination: "10.9.9.9/32".to_string(),
+            gateway: None,
+            mac: None,
+        });
+        v.routes.push(Route {
+            destination: "239.255.0.0/24".to_string(),
+            gateway: None,
+            mac: None,
+        });
+        let rendered: Vec<String> = bringup_commands(&v, "en10")
+            .iter()
+            .map(|c| c.display())
+            .collect();
         assert!(!rendered.iter().any(|c| c.contains("192.168.10.150"))); // in-subnet -> skipped
         assert!(rendered.contains(&"route add -host 10.9.9.9 -interface vlan10".to_string()));
         assert!(rendered.contains(&"route add -net 239.255.0.0/24 -interface vlan10".to_string()));
@@ -187,9 +216,21 @@ mod tests {
 
     #[test]
     fn untagged_configures_parent_with_alias_and_routes() {
-        let mut u = Interface { vlan: None, address: "192.168.1.100/24".parse().unwrap(), mtu: None, routes: vec![] };
-        u.routes.push(Route { destination: "192.168.10.151/32".to_string(), gateway: None, mac: None });
-        let rendered: Vec<String> = bringup_commands(&u, "en16").iter().map(|c| c.display()).collect();
+        let mut u = Interface {
+            vlan: None,
+            address: "192.168.1.100/24".parse().unwrap(),
+            mtu: None,
+            routes: vec![],
+        };
+        u.routes.push(Route {
+            destination: "192.168.10.151/32".to_string(),
+            gateway: None,
+            mac: None,
+        });
+        let rendered: Vec<String> = bringup_commands(&u, "en16")
+            .iter()
+            .map(|c| c.display())
+            .collect();
         assert_eq!(
             rendered,
             vec![
@@ -201,10 +242,25 @@ mod tests {
 
     #[test]
     fn untagged_skips_in_subnet_gatewayless_route() {
-        let mut u = Interface { vlan: None, address: "192.168.10.1/24".parse().unwrap(), mtu: None, routes: vec![] };
-        u.routes.push(Route { destination: "192.168.10.152/32".to_string(), gateway: None, mac: None });
-        let rendered: Vec<String> = bringup_commands(&u, "en16").iter().map(|c| c.display()).collect();
-        assert_eq!(rendered, vec!["ifconfig en16 inet 192.168.10.1 netmask 255.255.255.0 alias"]);
+        let mut u = Interface {
+            vlan: None,
+            address: "192.168.10.1/24".parse().unwrap(),
+            mtu: None,
+            routes: vec![],
+        };
+        u.routes.push(Route {
+            destination: "192.168.10.152/32".to_string(),
+            gateway: None,
+            mac: None,
+        });
+        let rendered: Vec<String> = bringup_commands(&u, "en16")
+            .iter()
+            .map(|c| c.display())
+            .collect();
+        assert_eq!(
+            rendered,
+            vec!["ifconfig en16 inet 192.168.10.1 netmask 255.255.255.0 alias"]
+        );
     }
 
     #[test]
@@ -236,7 +292,12 @@ mod tests {
 
     #[test]
     fn gatewayless_host_route_with_mac_emits_static_arp() {
-        let mut u = Interface { vlan: None, address: "192.168.1.100/24".parse().unwrap(), mtu: None, routes: vec![] };
+        let mut u = Interface {
+            vlan: None,
+            address: "192.168.1.100/24".parse().unwrap(),
+            mtu: None,
+            routes: vec![],
+        };
         u.routes.push(Route {
             destination: "192.168.10.151/32".to_string(),
             gateway: None,
