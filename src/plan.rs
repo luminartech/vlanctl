@@ -1,4 +1,4 @@
-use crate::config::{Interface, Profile};
+use crate::config::{Interface, Profile, Route};
 use crate::net::Cmd;
 use ipnet::IpNet;
 
@@ -21,8 +21,10 @@ pub trait Platform {
     /// the parent device.
     fn iface_name(&self, interface: &Interface, device: &str) -> String;
 
-    /// Ordered commands to bring one interface up, addresses and routes
-    /// included.
+    /// Ordered commands to bring one interface up: interface creation,
+    /// address, and MTU. Route emission is shared logic that lives in
+    /// [`bringup_commands_for`], gated on [`Platform::wants_onlink_host_route`],
+    /// so implementations must not include routes here.
     fn bringup_commands(&self, interface: &Interface, device: &str) -> Vec<Cmd>;
 
     /// Commands to tear one interface down.
@@ -63,7 +65,7 @@ impl Platform for MacOs {
     }
 
     fn bringup_commands(&self, interface: &Interface, device: &str) -> Vec<Cmd> {
-        bringup_commands(interface, device)
+        create_address_mtu_commands(interface, device)
     }
 
     fn teardown_commands(&self, iface: &str) -> Vec<Cmd> {
@@ -116,8 +118,35 @@ pub fn iface_name(interface: &Interface, device: &str) -> String {
     }
 }
 
-/// Build the ordered commands to bring up one interface on `device`.
-pub fn bringup_commands(interface: &Interface, device: &str) -> Vec<Cmd> {
+/// Build the ordered bring-up commands for one interface, taking every
+/// platform-specific decision from `platform`.
+///
+/// `Platform::bringup_commands` owns interface creation, address and MTU;
+/// routes are shared logic gated on one platform decision
+/// ([`Platform::wants_onlink_host_route`]), so this function appends them
+/// once here rather than duplicating the loop in every backend.
+pub fn bringup_commands_for(
+    platform: &dyn Platform,
+    interface: &Interface,
+    device: &str,
+) -> Vec<Cmd> {
+    let name = platform.iface_name(interface, device);
+    let mut cmds = platform.bringup_commands(interface, device);
+    append_route_commands(
+        &mut cmds,
+        &interface.routes,
+        &interface.address,
+        &name,
+        |in_subnet| platform.wants_onlink_host_route(in_subnet),
+    );
+    cmds
+}
+
+/// Interface creation, address assignment, and MTU only — no routes. Shared
+/// by the free [`bringup_commands`] (kept for direct callers) and by
+/// [`MacOs::bringup_commands`], which owns only this part; routes are a
+/// [`bringup_commands_for`] concern.
+fn create_address_mtu_commands(interface: &Interface, device: &str) -> Vec<Cmd> {
     let name = iface_name(interface, device);
     let addr = interface.address.addr().to_string();
     let netmask = ipv4_netmask(interface.address.prefix_len());
@@ -152,7 +181,21 @@ pub fn bringup_commands(interface: &Interface, device: &str) -> Vec<Cmd> {
     if let Some(mtu) = interface.mtu {
         cmds.push(Cmd::new("ifconfig", &[&name, "mtu", &mtu.to_string()]));
     }
-    for route in &interface.routes {
+    cmds
+}
+
+/// Append route (and static-ARP) commands for `routes` to `cmds`. Shared by
+/// the free [`bringup_commands`] (macOS's hardcoded decision) and
+/// [`bringup_commands_for`] (the platform's decision), so the route-building
+/// logic exists exactly once.
+fn append_route_commands(
+    cmds: &mut Vec<Cmd>,
+    routes: &[Route],
+    addr: &IpNet,
+    iface: &str,
+    wants_onlink_host_route: impl Fn(bool) -> bool,
+) {
+    for route in routes {
         match &route.gateway {
             Some(gateway) => {
                 let gateway = gateway.to_string();
@@ -162,9 +205,11 @@ pub fn bringup_commands(interface: &Interface, device: &str) -> Vec<Cmd> {
                 // A gatewayless destination inside this interface's own
                 // connected subnet is reached by the connected route; an
                 // explicit `-host ... -interface` route would install a
-                // self-MAC ARP entry that breaks resolution, so it is skipped.
-                if !destination_in_subnet(&route.destination, &interface.address) {
-                    cmds.push(interface_route_command(&route.destination, &name));
+                // self-MAC ARP entry that breaks resolution, so a platform
+                // that shares that hazard skips it.
+                let in_subnet = destination_in_subnet(&route.destination, addr);
+                if wants_onlink_host_route(in_subnet) {
+                    cmds.push(interface_route_command(&route.destination, iface));
                 }
                 // Static ARP for an on-link host the kernel can't resolve. The
                 // `-host ... -interface` route above leaves an LLINFO entry that
@@ -182,6 +227,23 @@ pub fn bringup_commands(interface: &Interface, device: &str) -> Vec<Cmd> {
             }
         }
     }
+}
+
+/// Build the ordered commands to bring up one interface on `device`.
+///
+/// This is macOS's hardcoded decision (`!in_subnet`), kept for direct
+/// callers such as `show_plan`. [`bringup_commands_for`] is the
+/// platform-aware equivalent used by `commands::apply`/`down`.
+pub fn bringup_commands(interface: &Interface, device: &str) -> Vec<Cmd> {
+    let name = iface_name(interface, device);
+    let mut cmds = create_address_mtu_commands(interface, device);
+    append_route_commands(
+        &mut cmds,
+        &interface.routes,
+        &interface.address,
+        &name,
+        |in_subnet| !in_subnet,
+    );
     cmds
 }
 
@@ -497,9 +559,9 @@ mod tests {
         };
         for i in [&tagged, &untagged] {
             assert_eq!(
-                MacOs.bringup_commands(i, "en7"),
+                bringup_commands_for(&MacOs, i, "en7"),
                 bringup_commands(i, "en7"),
-                "extraction must not change macOS output"
+                "routing bring-up through the platform must not change macOS output"
             );
             assert_eq!(MacOs.iface_name(i, "en7"), iface_name(i, "en7"));
         }
@@ -527,6 +589,15 @@ mod tests {
 
     #[test]
     fn macos_emits_no_route_for_a_gatewayless_in_subnet_destination() {
+        // Retargeted from `MacOs.bringup_commands(...)` (Task 5): routes now
+        // live in `bringup_commands_for`, so exercising `MacOs.bringup_commands`
+        // directly would pass this assertion vacuously — no platform impl
+        // emits routes any more, in-subnet or not. Going through
+        // `bringup_commands_for` still exercises the real hazard this test
+        // guards: `Contrarian::wants_onlink_host_route` proves the same route
+        // WOULD be emitted for a platform that wants on-link host routes, so
+        // this is `wants_onlink_host_route` actually being honoured, not a
+        // route loop that no longer runs.
         let i = Interface {
             vlan: Some(11),
             address: "192.168.11.87/24".parse().unwrap(),
@@ -537,8 +608,7 @@ mod tests {
                 mac: None,
             }],
         };
-        let rendered: Vec<String> = MacOs
-            .bringup_commands(&i, "en7")
+        let rendered: Vec<String> = bringup_commands_for(&MacOs, &i, "en7")
             .iter()
             .map(|c| c.display())
             .collect();
@@ -546,6 +616,19 @@ mod tests {
             !rendered.iter().any(|c| c.starts_with("route ")),
             "an in-subnet gatewayless destination must not get an interface-scoped \
              host route (it self-MACs and black-holes on macOS): {rendered:?}"
+        );
+
+        // Guard against the assertion above becoming vacuous: the same
+        // in-subnet route, through a platform that wants on-link host
+        // routes, must still be emitted.
+        let other: Vec<String> = bringup_commands_for(&Contrarian, &i, "eth0")
+            .iter()
+            .map(|c| c.display())
+            .collect();
+        assert!(
+            other.iter().any(|c| c.starts_with("route ")),
+            "sanity check failed: a platform that wants on-link host routes \
+             must still emit one for the same in-subnet destination: {other:?}"
         );
     }
 
@@ -561,14 +644,42 @@ mod tests {
                 mac: None,
             }],
         };
-        let rendered: Vec<String> = MacOs
-            .bringup_commands(&i, "en7")
+        let rendered: Vec<String> = bringup_commands_for(&MacOs, &i, "en7")
             .iter()
             .map(|c| c.display())
             .collect();
         assert!(
             rendered.contains(&"route add 192.168.20.0/24 192.168.11.1".to_string()),
             "expected a route add for the gatewayed destination: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn the_route_decision_comes_from_the_platform_not_hardcoded() {
+        // A gatewayless destination INSIDE the interface's own subnet.
+        // macOS must skip it; a platform that wants on-link host routes must
+        // emit it. Same profile, different commands.
+        let i = Interface {
+            vlan: Some(11),
+            address: "192.168.11.87/24".parse().unwrap(),
+            mtu: None,
+            routes: vec![Route {
+                destination: "192.168.11.151/32".to_string(),
+                gateway: None,
+                mac: None,
+            }],
+        };
+
+        let mac = bringup_commands_for(&MacOs, &i, "en7");
+        assert!(
+            !mac.iter().any(|c| c.display().contains("-host")),
+            "macOS must not emit an in-subnet host route: {mac:?}"
+        );
+
+        let other = bringup_commands_for(&Contrarian, &i, "eth0");
+        assert!(
+            other.iter().any(|c| c.display().contains("192.168.11.151")),
+            "a platform wanting on-link host routes must emit one: {other:?}"
         );
     }
 }

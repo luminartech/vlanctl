@@ -19,7 +19,7 @@ use state::State;
 #[cfg(feature = "cli")]
 use std::path::PathBuf;
 #[cfg(feature = "cli")]
-use vlanctl::{commands, config, device, net, state};
+use vlanctl::{commands, config, device, net, plan, state};
 
 #[cfg(feature = "cli")]
 fn profile_path(dir: &std::path::Path, name: &str) -> PathBuf {
@@ -96,6 +96,7 @@ fn main() -> Result<()> {
         }
         Command::Apply { profile, dry_run } => {
             let p = Profile::load(&profile_path(&cli.profiles_dir, &profile))?;
+            let platform = plan::host_platform();
             if dry_run {
                 let mut runner = RecordingRunner::default();
                 // Seed ifconfig -l so device auto-detect and interface
@@ -103,24 +104,25 @@ fn main() -> Result<()> {
                 runner
                     .stdout
                     .insert("ifconfig -l".to_string(), "lo0 en0".to_string());
-                commands::apply(&mut runner, &p, &state_path, true)?;
+                commands::apply(&mut runner, &*platform, &p, &state_path, true)?;
                 print_planned_commands(&runner);
             } else {
                 require_root()?;
                 let mut runner = SystemRunner;
-                let created = commands::apply(&mut runner, &p, &state_path, false)?;
+                let created = commands::apply(&mut runner, &*platform, &p, &state_path, false)?;
                 println!("applied '{}': {}", p.name, created.join(", "));
             }
         }
         Command::Down { dry_run } => {
+            let platform = plan::host_platform();
             if dry_run {
                 let mut runner = RecordingRunner::default();
-                commands::down(&mut runner, &state_path, true)?;
+                commands::down(&mut runner, &*platform, &state_path, true)?;
                 print_planned_commands(&runner);
             } else {
                 require_root()?;
                 let mut runner = SystemRunner;
-                commands::down(&mut runner, &state_path, false)?;
+                commands::down(&mut runner, &*platform, &state_path, false)?;
                 println!("torn down");
             }
         }

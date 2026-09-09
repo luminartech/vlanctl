@@ -1,7 +1,7 @@
 use crate::config::Profile;
 use crate::device::resolve_device;
 use crate::net::{Cmd, CommandRunner};
-use crate::plan::{bringup_commands, iface_name, interface_names, teardown_commands};
+use crate::plan::{Platform, bringup_commands, bringup_commands_for, interface_names};
 use crate::state::State;
 use anyhow::{Context, Result, bail};
 use std::path::Path;
@@ -34,6 +34,7 @@ fn device_inet_addresses<R: CommandRunner>(runner: &mut R, device: &str) -> Resu
 /// state file is read (for an accurate preview) but never written.
 pub fn apply<R: CommandRunner>(
     runner: &mut R,
+    platform: &dyn Platform,
     profile: &Profile,
     state_path: &Path,
     dry_run: bool,
@@ -42,7 +43,7 @@ pub fn apply<R: CommandRunner>(
     // wholesale below, so there is no need to reload it after `down`.
     let mut state = State::load(state_path)?;
     if state.active_profile.is_some() {
-        down(runner, state_path, dry_run)?;
+        down(runner, platform, state_path, dry_run)?;
     }
 
     let device = resolve_device(runner, profile.device.as_deref())?;
@@ -65,26 +66,33 @@ pub fn apply<R: CommandRunner>(
         match interface.vlan {
             // Untagged: configure the parent device, idempotently. If the alias
             // address is already present, a previous apply set it up (and its
-            // routes) — skip. Untagged config is never recorded or torn down.
+            // routes) — skip. Whether this ever gets recorded (and so torn
+            // down or rolled back) is the platform's call: macOS leaves
+            // parent config in place by design, but a platform that answers
+            // `true` to `reverts_parent_config` (e.g. a Windows vSwitch
+            // binding) must be able to undo it.
             None => {
                 let addr = interface.address.addr().to_string();
                 if device_inet_addresses(runner, &device)?.contains(&addr) {
                     continue;
                 }
-                for cmd in bringup_commands(interface, &device) {
+                for cmd in bringup_commands_for(platform, interface, &device) {
                     if let Err(e) = runner.run(&cmd) {
-                        rollback(runner, &created);
+                        rollback(runner, platform, &created);
                         return Err(e).with_context(|| {
                             format!("applying profile '{}'; rolled back", profile.name)
                         });
                     }
                 }
+                if platform.reverts_parent_config() {
+                    created.push(platform.iface_name(interface, &device));
+                }
             }
             // Tagged: create the vlan sub-interface, recording it as soon as the
             // `create` succeeds so rollback can destroy it if a later step fails.
             Some(_) => {
-                let iface = iface_name(interface, &device);
-                for cmd in bringup_commands(interface, &device) {
+                let iface = platform.iface_name(interface, &device);
+                for cmd in bringup_commands_for(platform, interface, &device) {
                     let is_create = cmd.args.get(1).map(|a| a == "create").unwrap_or(false);
                     match runner.run(&cmd) {
                         Ok(_) => {
@@ -93,7 +101,7 @@ pub fn apply<R: CommandRunner>(
                             }
                         }
                         Err(e) => {
-                            rollback(runner, &created);
+                            rollback(runner, platform, &created);
                             return Err(e).with_context(|| {
                                 format!("applying profile '{}'; rolled back", profile.name)
                             });
@@ -113,9 +121,9 @@ pub fn apply<R: CommandRunner>(
 }
 
 /// Destroy created interfaces in reverse order, ignoring errors (best effort).
-fn rollback<R: CommandRunner>(runner: &mut R, created: &[String]) {
+fn rollback<R: CommandRunner>(runner: &mut R, platform: &dyn Platform, created: &[String]) {
     for iface in created.iter().rev() {
-        for cmd in teardown_commands(iface) {
+        for cmd in platform.teardown_commands(iface) {
             let _ = runner.run(&cmd);
         }
     }
@@ -123,7 +131,12 @@ fn rollback<R: CommandRunner>(runner: &mut R, created: &[String]) {
 
 /// Tear down the active profile recorded in state and clear it. When `dry_run`
 /// is true, the teardown commands are still produced but state is not cleared.
-pub fn down<R: CommandRunner>(runner: &mut R, state_path: &Path, dry_run: bool) -> Result<()> {
+pub fn down<R: CommandRunner>(
+    runner: &mut R,
+    platform: &dyn Platform,
+    state_path: &Path,
+    dry_run: bool,
+) -> Result<()> {
     let state = State::load(state_path)?;
     // A reboot drops the VLAN interfaces but leaves the state file intact, so
     // recorded interfaces may already be gone. Only tear down ones still live;
@@ -133,7 +146,7 @@ pub fn down<R: CommandRunner>(runner: &mut R, state_path: &Path, dry_run: bool) 
         if !live.contains(iface) {
             continue;
         }
-        for cmd in teardown_commands(iface) {
+        for cmd in platform.teardown_commands(iface) {
             runner.run(&cmd)?;
         }
     }
@@ -198,6 +211,7 @@ pub fn status<R: CommandRunner>(runner: &mut R, state_path: &Path) -> Result<Str
 mod tests {
     use super::*;
     use crate::net::RecordingRunner;
+    use crate::plan::MacOs;
 
     fn profile() -> Profile {
         // Pin `device` so these tests exercise apply/down orchestration without
@@ -232,11 +246,26 @@ mod tests {
     }
 
     #[test]
+    fn apply_uses_the_platform_for_bringup() {
+        let state_path = std::env::temp_dir().join("vlanctl-apply-uses-platform.json");
+        let _ = std::fs::remove_file(&state_path);
+        let mut r = runner_with_device();
+        apply(&mut r, &MacOs, &profile(), &state_path, true).expect("dry-run apply succeeds");
+        assert!(
+            r.commands
+                .iter()
+                .any(|c| c.display().starts_with("ifconfig vlan")),
+            "recorded: {:?}",
+            r.commands
+        );
+    }
+
+    #[test]
     fn apply_creates_all_vlans_and_records_state() {
         let state_path = std::env::temp_dir().join("vlanctl-apply-ok.json");
         let _ = std::fs::remove_file(&state_path);
         let mut r = runner_with_device();
-        let created = apply(&mut r, &profile(), &state_path, false).unwrap();
+        let created = apply(&mut r, &MacOs, &profile(), &state_path, false).unwrap();
         // Interface name = vlan<id>, so ids 100/200 -> vlan100/vlan200.
         assert_eq!(created, vec!["vlan100", "vlan200"]);
 
@@ -264,7 +293,7 @@ mod tests {
         // vlan100 is fully configured; vlan200's create fails, so rollback must
         // destroy vlan100 only.
         r.fail_at = Some(4);
-        let err = apply(&mut r, &profile(), &state_path, false).unwrap_err();
+        let err = apply(&mut r, &MacOs, &profile(), &state_path, false).unwrap_err();
         assert!(err.to_string().contains("rolled back"));
 
         // vlan100 was created then destroyed during rollback; vlan200 never was.
@@ -287,7 +316,7 @@ mod tests {
         let mut r = RecordingRunner::default();
         r.stdout
             .insert("ifconfig -l".to_string(), "lo0 en0 vlan0 vlan1".to_string());
-        down(&mut r, &state_path, false).unwrap();
+        down(&mut r, &MacOs, &state_path, false).unwrap();
         // Drop the `ifconfig -l` probe; assert on the teardown commands only.
         let rendered: Vec<String> = r
             .commands
@@ -320,7 +349,7 @@ mod tests {
         // destroyed; the missing vlan11 is silently skipped.
         r.stdout
             .insert("ifconfig -l".to_string(), "lo0 en0 vlan10".to_string());
-        down(&mut r, &state_path, false).unwrap();
+        down(&mut r, &MacOs, &state_path, false).unwrap();
         let rendered: Vec<String> = r.commands.iter().map(|c| c.display()).collect();
         assert!(rendered.contains(&"ifconfig vlan10 destroy".to_string()));
         assert!(!rendered.contains(&"ifconfig vlan11 destroy".to_string()));
@@ -343,7 +372,7 @@ mod tests {
         // vlan100 (the interface for VLAN id 100) is already live.
         r.stdout
             .insert("ifconfig -l".to_string(), "lo0 en0 vlan100".to_string());
-        let err = apply(&mut r, &profile(), &state_path, false).unwrap_err();
+        let err = apply(&mut r, &MacOs, &profile(), &state_path, false).unwrap_err();
         assert!(err.to_string().contains("already exists"));
         // Nothing was created and no state was written.
         let rendered: Vec<String> = r.commands.iter().map(|c| c.display()).collect();
@@ -357,10 +386,14 @@ mod tests {
         let state_path = std::env::temp_dir().join("vlanctl-apply-untagged.json");
         let _ = std::fs::remove_file(&state_path);
         let mut r = runner_with_device(); // "ifconfig -l" -> "lo0 en0"; "ifconfig en0" -> empty
-        let created = apply(&mut r, &untagged_profile(), &state_path, false).unwrap();
+        let created = apply(&mut r, &MacOs, &untagged_profile(), &state_path, false).unwrap();
         assert_eq!(created, vec!["vlan12"]); // only the tagged interface is recorded
         let rendered: Vec<String> = r.commands.iter().map(|c| c.display()).collect();
-        assert!(rendered.contains(&"ifconfig en0 inet 192.168.1.100 netmask 255.255.255.0 alias".to_string()));
+        assert!(
+            rendered.contains(
+                &"ifconfig en0 inet 192.168.1.100 netmask 255.255.255.0 alias".to_string()
+            )
+        );
         assert!(rendered.contains(&"route add -host 192.168.10.151 -interface en0".to_string()));
         assert!(rendered.contains(&"ifconfig vlan12 create".to_string()));
     }
@@ -374,10 +407,14 @@ mod tests {
             "ifconfig en0".to_string(),
             "\tinet 192.168.1.100 netmask 0xffffff00 broadcast 192.168.1.255".to_string(),
         );
-        apply(&mut r, &untagged_profile(), &state_path, false).unwrap();
+        apply(&mut r, &MacOs, &untagged_profile(), &state_path, false).unwrap();
         let rendered: Vec<String> = r.commands.iter().map(|c| c.display()).collect();
         assert!(!rendered.iter().any(|c| c.contains("alias")));
-        assert!(!rendered.iter().any(|c| c.contains("route add -host 192.168.10.151")));
+        assert!(
+            !rendered
+                .iter()
+                .any(|c| c.contains("route add -host 192.168.10.151"))
+        );
         assert!(rendered.contains(&"ifconfig vlan12 create".to_string())); // tagged still applied
     }
 
@@ -409,7 +446,7 @@ mod tests {
         let state_path = std::env::temp_dir().join("vlanctl-apply-mac.json");
         let _ = std::fs::remove_file(&state_path);
         let mut r = runner_with_device();
-        let created = apply(&mut r, &mac_profile(), &state_path, false).unwrap();
+        let created = apply(&mut r, &MacOs, &mac_profile(), &state_path, false).unwrap();
         assert!(created.is_empty()); // untagged-only profile records nothing
         let rendered: Vec<String> = r.commands.iter().map(|c| c.display()).collect();
         // The route is added, then a single static ARP entry — no `arp -d`,
