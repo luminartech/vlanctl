@@ -1,7 +1,7 @@
 use crate::config::Profile;
 use crate::device::resolve_device;
 use crate::net::{Cmd, CommandRunner};
-use crate::plan::{Platform, bringup_commands, bringup_commands_for, interface_names};
+use crate::plan::{Platform, bringup_commands_for, interface_names};
 use crate::state::State;
 use anyhow::{Context, Result, bail};
 use std::path::Path;
@@ -66,11 +66,19 @@ pub fn apply<R: CommandRunner>(
         match interface.vlan {
             // Untagged: configure the parent device, idempotently. If the alias
             // address is already present, a previous apply set it up (and its
-            // routes) — skip. Whether this ever gets recorded (and so torn
-            // down or rolled back) is the platform's call: macOS leaves
-            // parent config in place by design, but a platform that answers
-            // `true` to `reverts_parent_config` (e.g. a Windows vSwitch
-            // binding) must be able to undo it.
+            // routes) — skip. Never recorded, regardless of the platform:
+            // `platform.reverts_parent_config()` names *whether* reverting
+            // parent config is appropriate, but an untagged entry is an
+            // address alias, and undoing one needs `-alias <addr>` — syntax
+            // the generic `platform.teardown_commands(iface)` used for
+            // tagged sub-interfaces has no way to express (on macOS it would
+            // render as `ifconfig <device> destroy`, which destroys the real
+            // NIC). Recording it here would also bypass the tagged-only
+            // collision guard above and mislabel the parent device as a
+            // managed interface in `status`. A platform that actually wants
+            // to revert parent config (a Windows vSwitch binding, say) needs
+            // its own recording/teardown path built deliberately, not this
+            // one reused by accident.
             None => {
                 let addr = interface.address.addr().to_string();
                 if device_inet_addresses(runner, &device)?.contains(&addr) {
@@ -83,9 +91,6 @@ pub fn apply<R: CommandRunner>(
                             format!("applying profile '{}'; rolled back", profile.name)
                         });
                     }
-                }
-                if platform.reverts_parent_config() {
-                    created.push(platform.iface_name(interface, &device));
                 }
             }
             // Tagged: create the vlan sub-interface, recording it as soon as the
@@ -156,12 +161,14 @@ pub fn down<R: CommandRunner>(
     Ok(())
 }
 
-/// Render the full bring-up plan for a profile as displayable command lines.
-pub fn show_plan(profile: &Profile, device: &str) -> Vec<String> {
+/// Render the full bring-up plan for a profile as displayable command lines,
+/// through the same `platform` that `apply` would use — so the preview never
+/// disagrees with what actually runs.
+pub fn show_plan(platform: &dyn Platform, profile: &Profile, device: &str) -> Vec<String> {
     profile
         .interfaces
         .iter()
-        .flat_map(|interface| bringup_commands(interface, device))
+        .flat_map(|interface| bringup_commands_for(platform, interface, device))
         .map(|cmd| cmd.display())
         .collect()
 }
@@ -359,7 +366,7 @@ mod tests {
 
     #[test]
     fn show_plan_lists_commands() {
-        let lines = show_plan(&profile(), "en0");
+        let lines = show_plan(&MacOs, &profile(), "en0");
         assert_eq!(lines[0], "ifconfig vlan100 create");
         assert_eq!(lines[1], "ifconfig vlan100 vlan 100 vlandev en0");
     }

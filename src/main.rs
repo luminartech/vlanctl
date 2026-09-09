@@ -86,7 +86,8 @@ fn main() -> Result<()> {
             // read-only query, so this has no side effects.
             let mut probe = SystemRunner;
             let device = device::resolve_device(&mut probe, p.device.as_deref())?;
-            for line in commands::show_plan(&p, &device) {
+            let platform = plan::host_platform();
+            for line in commands::show_plan(&*platform, &p, &device) {
                 println!("{line}");
             }
         }
@@ -96,31 +97,40 @@ fn main() -> Result<()> {
         }
         Command::Apply { profile, dry_run } => {
             let p = Profile::load(&profile_path(&cli.profiles_dir, &profile))?;
-            let platform = plan::host_platform();
             if dry_run {
+                // A dry run touches no real system and seeds its own
+                // `ifconfig -l` below, so — like every other command this
+                // crate shipped before the `Platform` seam existed — it must
+                // keep working on any host. `host_platform()` is
+                // `unimplemented!()` off macOS, so it belongs only in the
+                // real-apply arm below, not here.
                 let mut runner = RecordingRunner::default();
                 // Seed ifconfig -l so device auto-detect and interface
                 // allocation work offline. Real apply queries the live system.
                 runner
                     .stdout
                     .insert("ifconfig -l".to_string(), "lo0 en0".to_string());
-                commands::apply(&mut runner, &*platform, &p, &state_path, true)?;
+                commands::apply(&mut runner, &plan::MacOs, &p, &state_path, true)?;
                 print_planned_commands(&runner);
             } else {
                 require_root()?;
+                let platform = plan::host_platform();
                 let mut runner = SystemRunner;
                 let created = commands::apply(&mut runner, &*platform, &p, &state_path, false)?;
                 println!("applied '{}': {}", p.name, created.join(", "));
             }
         }
         Command::Down { dry_run } => {
-            let platform = plan::host_platform();
             if dry_run {
+                // See the matching comment in `Command::Apply`: dry runs must
+                // keep working on any host, so they never call
+                // `host_platform()`.
                 let mut runner = RecordingRunner::default();
-                commands::down(&mut runner, &*platform, &state_path, true)?;
+                commands::down(&mut runner, &plan::MacOs, &state_path, true)?;
                 print_planned_commands(&runner);
             } else {
                 require_root()?;
+                let platform = plan::host_platform();
                 let mut runner = SystemRunner;
                 commands::down(&mut runner, &*platform, &state_path, false)?;
                 println!("torn down");

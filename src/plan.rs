@@ -143,9 +143,9 @@ pub fn bringup_commands_for(
 }
 
 /// Interface creation, address assignment, and MTU only — no routes. Shared
-/// by the free [`bringup_commands`] (kept for direct callers) and by
-/// [`MacOs::bringup_commands`], which owns only this part; routes are a
-/// [`bringup_commands_for`] concern.
+/// by the free [`bringup_commands`] (kept as macOS's fixed-decision baseline
+/// for the equivalence test) and by [`MacOs::bringup_commands`], which owns
+/// only this part; routes are a [`bringup_commands_for`] concern.
 fn create_address_mtu_commands(interface: &Interface, device: &str) -> Vec<Cmd> {
     let name = iface_name(interface, device);
     let addr = interface.address.addr().to_string();
@@ -231,9 +231,10 @@ fn append_route_commands(
 
 /// Build the ordered commands to bring up one interface on `device`.
 ///
-/// This is macOS's hardcoded decision (`!in_subnet`), kept for direct
-/// callers such as `show_plan`. [`bringup_commands_for`] is the
-/// platform-aware equivalent used by `commands::apply`/`down`.
+/// This is macOS's hardcoded decision (`!in_subnet`), kept as the baseline
+/// the equivalence test compares `bringup_commands_for(&MacOs, ...)`
+/// against. [`bringup_commands_for`] is the platform-aware equivalent used
+/// by every production call site (`commands::apply`/`down`/`show_plan`).
 pub fn bringup_commands(interface: &Interface, device: &str) -> Vec<Cmd> {
     let name = iface_name(interface, device);
     let mut cmds = create_address_mtu_commands(interface, device);
@@ -541,11 +542,22 @@ mod tests {
             vlan: Some(11),
             address: "192.168.11.87/24".parse().unwrap(),
             mtu: Some(1500),
-            routes: vec![Route {
-                destination: "239.255.0.255/32".to_string(),
-                gateway: None,
-                mac: None,
-            }],
+            routes: vec![
+                Route {
+                    destination: "239.255.0.255/32".to_string(),
+                    gateway: None,
+                    mac: None,
+                },
+                // In-subnet gatewayless: `wants_onlink_host_route` must
+                // answer the same on both sides, or this fixture would not
+                // actually be exercising that decision (all other routes
+                // here are out-of-subnet).
+                Route {
+                    destination: "192.168.11.151/32".to_string(),
+                    gateway: None,
+                    mac: None,
+                },
+            ],
         };
         let untagged = Interface {
             vlan: None,
@@ -589,14 +601,14 @@ mod tests {
 
     #[test]
     fn macos_emits_no_route_for_a_gatewayless_in_subnet_destination() {
-        // Retargeted from `MacOs.bringup_commands(...)` (Task 5): routes now
-        // live in `bringup_commands_for`, so exercising `MacOs.bringup_commands`
+        // Retargeted from `MacOs.bringup_commands(...)`: routes now live in
+        // `bringup_commands_for`, so exercising `MacOs.bringup_commands`
         // directly would pass this assertion vacuously — no platform impl
         // emits routes any more, in-subnet or not. Going through
         // `bringup_commands_for` still exercises the real hazard this test
         // guards: `Contrarian::wants_onlink_host_route` proves the same route
         // WOULD be emitted for a platform that wants on-link host routes, so
-        // this is `wants_onlink_host_route` actually being honoured, not a
+        // this is `wants_onlink_host_route` actually being honored, not a
         // route loop that no longer runs.
         let i = Interface {
             vlan: Some(11),
