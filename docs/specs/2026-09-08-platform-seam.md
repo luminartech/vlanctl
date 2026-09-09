@@ -134,14 +134,45 @@ caller.
 
 This work adds the seam, not the additional backends. A Linux `Platform`
 implementation and a Windows `Platform` implementation are the anticipated
-next pieces of work. Before either can be correct, that work also has to
-close the two gaps this document flags above: giving `Platform` a
-per-platform route-emission hook (route/ARP syntax is still shared and
-BSD-shaped), and wiring `apply`/`down`/`status`/`resolve_device` over to the
-four host-state methods (they are declared but not yet consumed). Once
-those exist, each backend supplies its own interface/route command syntax,
-its own answers to `wants_onlink_host_route` and `reverts_parent_config`,
-and its own host-state parsing, exactly as `MacOs` does today.
+next pieces of work.
+
+**The seam is not yet complete, and two of the remaining gaps fail
+silently.** Anyone writing a backend should read this list first; an earlier
+draft of this document claimed there were only two gaps, which was wrong.
+
+1. **Route and ARP syntax is still shared and BSD-shaped.** `Platform`
+   delegates the *decision* (`wants_onlink_host_route`) but not the syntax:
+   `append_route_commands` and `interface_route_command` emit
+   `route add -host/-net … -interface` and `arp -s` for every platform.
+   `Platform` needs a per-platform route-emission hook. Pinned by
+   `route_syntax_is_currently_shared_and_bsd_shaped_a_known_limitation`,
+   which is expected to fail — and must be rewritten — when that hook lands.
+2. **The four host-state methods are declared but unconsumed.**
+   `apply`/`down`/`status`/`resolve_device` still call the macOS parsers
+   directly.
+3. **SILENT: `apply` decides what to record by matching `ifconfig`
+   argument shape.** In `commands.rs`, a created interface is recorded only
+   when the emitted command's second argument is literally `create`. Under a
+   Linux-shaped `ip link add link eth0 name eth0.11 type vlan id 11`, that
+   argument is `link`, so **nothing is recorded: rollback destroys nothing,
+   the state file stays empty, and `down` becomes a no-op.** A backend that
+   does not emit `ifconfig … create` must change this test, or it silently
+   loses teardown and rollback entirely.
+4. **SILENT: the pre-apply collision guard hardcodes the macOS interface
+   name.** `interface_names()` builds `format!("vlan{id}")` independently of
+   `Platform::iface_name`. With a backend naming interfaces `eth0.11`, the
+   guard looks for `vlan11`, never matches, and **never fires** — so `apply`
+   will not refuse to touch a pre-existing interface it did not create.
+5. **Device candidate selection is macOS-shaped.** `resolve_device` filters
+   candidates by an `en`-prefixed name, which is not a parser and so is not
+   covered by the host-state methods above.
+6. Minor: the CLI's read-only-probe classification and its dry-run
+   `ifconfig -l` seed are macOS-specific and sit outside `Platform`.
+
+Once (1)-(4) at least are closed, each backend supplies its own
+interface/route command syntax, its own answers to
+`wants_onlink_host_route` and `reverts_parent_config`, and its own
+host-state parsing, exactly as `MacOs` does today.
 
 `host_platform()` (`src/plan.rs`) is the single place a binary selects a
 `Platform` for a **real, mutating** operation (`apply`/`down`); it currently
