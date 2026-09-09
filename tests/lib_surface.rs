@@ -36,3 +36,31 @@ fn library_builds_without_the_cli_feature() {
     // Compiling this file at all under --no-default-features is the assertion.
     let _ = vlanctl::net::Cmd::new("true", &[]);
 }
+
+/// Compile-tests the README's "Library use" snippet: a consumer supplies a
+/// `CommandRunner` and a `Platform` and drives `commands::apply` directly,
+/// without shelling out to the `vlanctl` binary. `lum.toml` pins `device`,
+/// so this needs no `ifconfig -l` seeding to resolve one.
+#[test]
+fn readme_library_use_snippet_applies_a_profile_through_a_recording_runner() {
+    use vlanctl::plan::MacOs;
+    use vlanctl::{commands, net::RecordingRunner};
+
+    let profile =
+        Profile::load("profiles/lum.toml".as_ref()).expect("the README's own example profile");
+    let state_path = std::env::temp_dir().join("vlanctl-readme-library-snippet-state.json");
+    let _ = std::fs::remove_file(&state_path);
+
+    let mut runner = RecordingRunner::default(); // or SystemRunner to execute
+    commands::apply(&mut runner, &MacOs, &profile, &state_path, true)
+        .expect("dry-run apply of the README's own example profile");
+    assert!(
+        !runner.commands.is_empty(),
+        "the README snippet's apply call should have recorded some commands"
+    );
+    for cmd in &runner.commands {
+        println!("{}", cmd.display());
+    }
+
+    let _ = std::fs::remove_file(&state_path);
+}

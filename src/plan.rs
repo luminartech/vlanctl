@@ -1,6 +1,6 @@
 use crate::config::{Interface, Profile, Route};
 use crate::net::{Cmd, CommandRunner};
-use anyhow::Result;
+use anyhow::{Result, bail};
 use ipnet::IpNet;
 
 /// Per-operating-system command generation and host-state reading.
@@ -14,7 +14,26 @@ use ipnet::IpNet;
 /// `link_is_active`) exist for the same reason: they parse the output of
 /// OS-specific tools, and a wrong parser silently mis-detects hardware rather
 /// than erroring, so each platform must supply its own rather than inherit
-/// one that happens to compile.
+/// one that happens to compile. That said, none of the four has a production
+/// caller yet: `apply`, `down`, `status`, and `resolve_device` all still call
+/// the macOS parsers in `commands`/`device` directly. These methods are
+/// declared now for the Linux and Windows backends to implement; wiring the
+/// real call sites over to them is host-detection work with its own review
+/// surface (a wrong parser there silently picks the wrong NIC), not a
+/// byproduct of declaring the trait.
+///
+/// Route and static-ARP command **syntax** is a separate limitation this
+/// trait does not yet cover: `append_route_commands` and
+/// `interface_route_command` below build `route add ...`/`arp -s ...`
+/// commands directly, in shared code, for every `Platform`. Only the
+/// *decision* of whether to emit a host route is delegated
+/// ([`Platform::wants_onlink_host_route`]); the syntax itself is BSD/macOS
+/// shaped and not overridable per platform. A non-BSD backend (Linux's `ip
+/// route`, for instance) will need a per-platform route-emission hook added
+/// to this trait before it can render correct commands — see
+/// `route_syntax_is_currently_shared_and_bsd_shaped_a_known_limitation` in
+/// this module's tests, which pins the current behavior so a future change
+/// here is a deliberate test edit rather than silent drift.
 pub trait Platform {
     /// Short identifier for logs and error messages, e.g. `"macos"`.
     fn name(&self) -> &'static str;
@@ -51,20 +70,44 @@ pub trait Platform {
     /// physical device and that persists by design. Windows must answer
     /// `true`, because its untagged equivalent is a vSwitch binding that
     /// re-plumbs the NIC and cannot be left behind.
+    ///
+    /// No code reads this answer today: an untagged entry is an address
+    /// alias, and undoing one needs `-alias <addr>` syntax that the generic
+    /// [`Platform::teardown_commands`] has no way to express (see the
+    /// comment in `commands::apply` for the full reasoning). A platform that
+    /// must actually revert parent configuration needs its own recording and
+    /// teardown path built for that purpose — implementing this method as
+    /// `true` alone gets a backend nothing.
     fn reverts_parent_config(&self) -> bool;
 
     /// Names of every network device currently on the host, from `ifconfig -l`.
+    ///
+    /// Declared for the forthcoming Linux and Windows backends; not yet
+    /// consumed anywhere. `apply`/`down`/`status`/`resolve_device` still call
+    /// `commands::live_interfaces` (the macOS parser) directly.
     fn list_devices(&self, runner: &mut dyn CommandRunner) -> Result<Vec<String>>;
 
     /// IPv4 addresses currently configured on `device`, from the `inet` lines
     /// of `ifconfig <device>`.
+    ///
+    /// Declared for the forthcoming Linux and Windows backends; not yet
+    /// consumed anywhere. `apply`/`down`/`status`/`resolve_device` still call
+    /// `commands::device_inet_addresses` (the macOS parser) directly.
     fn addresses_on(&self, runner: &mut dyn CommandRunner, device: &str) -> Result<Vec<IpNet>>;
 
     /// Whether `device`'s hardware port is Wi-Fi, from
     /// `networksetup -listallhardwareports`.
+    ///
+    /// Declared for the forthcoming Linux and Windows backends; not yet
+    /// consumed anywhere. `resolve_device` still calls `device::wifi_devices`
+    /// (the macOS parser) directly.
     fn is_wireless(&self, runner: &mut dyn CommandRunner, device: &str) -> Result<bool>;
 
     /// Whether `ifconfig <device>` reports `status: active`.
+    ///
+    /// Declared for the forthcoming Linux and Windows backends; not yet
+    /// consumed anywhere. `resolve_device` still calls
+    /// `device::interface_is_active` (the macOS parser) directly.
     fn link_is_active(&self, runner: &mut dyn CommandRunner, device: &str) -> Result<bool>;
 }
 
@@ -122,31 +165,58 @@ impl Platform for MacOs {
     }
 }
 
-/// The platform this build targets.
+/// The platform this build targets, for a **real (mutating)** operation —
+/// `apply` or `down` without `--dry-run`.
 ///
-/// Returns [`MacOs`] on macOS. Other platforms are unimplemented until 1b
-/// (Linux) and 3 (Windows) — a caller on those platforms must construct a
-/// `Platform` explicitly rather than relying on this.
-#[must_use]
-pub fn host_platform() -> Box<dyn Platform> {
+/// Returns [`MacOs`] on macOS. Every other platform returns an `Err`: Linux
+/// and Windows backends are not implemented yet, and returning a
+/// silently-wrong platform to run mutating commands against a real network
+/// stack would be far worse than refusing. A caller that already has a
+/// `Platform` for this OS (for example, an embedder with its own backend)
+/// should construct it explicitly rather than calling this function.
+///
+/// This is deliberately not used to render a **preview** (`show`, `apply
+/// --dry-run`, `down --dry-run`): a preview touches no real system and must
+/// keep working on every host, so it renders through [`preview_platform`]
+/// instead. See that function's doc for why the two must not be conflated.
+pub fn host_platform() -> Result<Box<dyn Platform>> {
     #[cfg(target_os = "macos")]
     {
-        Box::new(MacOs)
+        Ok(Box::new(MacOs))
     }
     #[cfg(not(target_os = "macos"))]
     {
-        // Deliberate: 1a adds the seam, not the backends. Returning a
-        // silently-wrong platform would be far worse than refusing.
-        unimplemented!(
-            "no Platform implementation for this OS yet; \
-             construct one explicitly (Linux lands in 1b, Windows in 3)"
+        bail!(
+            "no Platform implementation for {} yet; only '{}' is implemented \
+             today. Linux and Windows backends are not implemented yet — \
+             construct a Platform explicitly if you have one for this OS.",
+            std::env::consts::OS,
+            MacOs.name(),
         )
     }
 }
 
+/// The fixed reference platform used to render a **preview** — `show`,
+/// `apply --dry-run`, `down --dry-run` — none of which touch a real system.
+///
+/// Unlike [`host_platform`], this never fails: a preview must keep working
+/// on any host regardless of whether this build has a real backend for it,
+/// exactly as it did before the `Platform` seam existed. It intentionally
+/// renders macOS/BSD command syntax on every host until a real Linux or
+/// Windows `Platform` exists to preview instead.
+#[must_use]
+pub fn preview_platform() -> &'static dyn Platform {
+    &MacOs
+}
+
 /// Interface name this entry configures: `vlan<id>` for a tagged interface,
 /// or the parent `device` itself for an untagged one.
-pub fn iface_name(interface: &Interface, device: &str) -> String {
+///
+/// `pub(crate)`: this is macOS's fixed-decision naming, kept only for the
+/// free-function equivalence tests; a real caller goes through
+/// [`Platform::iface_name`] instead so the naming convention isn't
+/// hardcoded on the library's public surface.
+pub(crate) fn iface_name(interface: &Interface, device: &str) -> String {
     match interface.vlan {
         Some(id) => format!("vlan{id}"),
         None => device.to_string(),
@@ -270,7 +340,12 @@ fn append_route_commands(
 /// the equivalence test compares `bringup_commands_for(&MacOs, ...)`
 /// against. [`bringup_commands_for`] is the platform-aware equivalent used
 /// by every production call site (`commands::apply`/`down`/`show_plan`).
-pub fn bringup_commands(interface: &Interface, device: &str) -> Vec<Cmd> {
+///
+/// `pub(crate)` and `#[cfg(test)]`: macOS's fixed-decision baseline, kept
+/// only for that equivalence test; no production caller uses this directly
+/// any more.
+#[cfg(test)]
+pub(crate) fn bringup_commands(interface: &Interface, device: &str) -> Vec<Cmd> {
     let name = iface_name(interface, device);
     let mut cmds = create_address_mtu_commands(interface, device);
     append_route_commands(
@@ -323,7 +398,11 @@ fn interface_route_command(destination: &str, iface: &str) -> Cmd {
 
 /// Commands to tear down a single interface. Destroying the vlan interface
 /// also drops its addresses and routes.
-pub fn teardown_commands(iface: &str) -> Vec<Cmd> {
+///
+/// `pub(crate)`: macOS's fixed-decision teardown, kept for the free-function
+/// equivalence tests; a real caller goes through
+/// [`Platform::teardown_commands`] instead.
+pub(crate) fn teardown_commands(iface: &str) -> Vec<Cmd> {
     vec![Cmd::new("ifconfig", &[iface, "destroy"])]
 }
 
@@ -348,6 +427,34 @@ mod tests {
     use super::*;
     use crate::config::{Interface, Route};
     use std::net::IpAddr;
+
+    /// `host_platform()` must refuse cleanly (`Err`, never a panic) on an OS
+    /// with no `Platform` implementation, and its message must name the one
+    /// platform that does exist rather than leak internal phase labels.
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn host_platform_refuses_cleanly_off_macos() {
+        let err = match host_platform() {
+            Ok(_) => panic!("no Platform implementation exists for this OS yet"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("macos"),
+            "expected the error to name the one supported platform: {msg}"
+        );
+        assert!(
+            !msg.contains("1a") && !msg.contains("1b"),
+            "error text must not leak internal plan-phase labels: {msg}"
+        );
+    }
+
+    /// The preview platform must always succeed, unlike `host_platform()` —
+    /// a preview must keep working on any host.
+    #[test]
+    fn preview_platform_is_always_available() {
+        assert_eq!(preview_platform().name(), "macos");
+    }
 
     fn tagged(id: u16, cidr: &str) -> Interface {
         Interface {
@@ -589,6 +696,45 @@ mod tests {
     #[test]
     fn a_platform_controls_reverting_parent_config() {
         assert!(Contrarian.reverts_parent_config());
+    }
+
+    /// Pins a KNOWN GAP (issue I1 / Ruling R10), not an endorsement: route
+    /// and static-ARP command syntax is not behind the `Platform` seam.
+    /// `append_route_commands`/`interface_route_command` build `route add
+    /// ...` in shared code for every platform, so even `Contrarian` — whose
+    /// `bringup_commands` emits no BSD syntax at all, and whose
+    /// `wants_onlink_host_route` is the mirror image of macOS's — still gets
+    /// a BSD-shaped `route add -host ... -interface ...` line. A non-BSD
+    /// backend (Linux's `ip route`, say) will need a per-platform
+    /// route-emission hook added to `Platform` before it can render correct
+    /// commands. If this test starts failing, that hook has been added:
+    /// update or delete this pin deliberately, it is not a regression.
+    #[test]
+    fn route_syntax_is_currently_shared_and_bsd_shaped_a_known_limitation() {
+        let i = Interface {
+            vlan: Some(11),
+            address: "192.168.11.87/24".parse().unwrap(),
+            mtu: None,
+            routes: vec![Route {
+                // In-subnet: `Contrarian.wants_onlink_host_route` answers
+                // `true` here (the opposite of macOS), so this is the case
+                // that actually reaches route emission through Contrarian.
+                destination: "192.168.11.200/32".to_string(),
+                gateway: None,
+                mac: None,
+            }],
+        };
+        let rendered: Vec<String> = bringup_commands_for(&Contrarian, &i, "eth0")
+            .iter()
+            .map(|c| c.display())
+            .collect();
+        assert!(
+            rendered
+                .iter()
+                .any(|c| c.contains("route add -host") && c.contains("-interface")),
+            "expected the shared BSD route syntax even through a non-BSD \
+             Platform (known limitation, see the Platform trait doc): {rendered:?}"
+        );
     }
 
     #[test]

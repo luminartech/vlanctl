@@ -43,10 +43,22 @@ pub(crate) fn device_inet_addresses<R: CommandRunner + ?Sized>(
 }
 
 /// Parse an `ifconfig` hex netmask (e.g. `0xffffff00`) into a prefix length.
+/// Returns `None` if `hex` is malformed, OR if the mask's one-bits are not a
+/// contiguous run from the most-significant bit (e.g. `0xff00ff00`) — such a
+/// mask has no single prefix length, and counting bits alone (as a naive
+/// `count_ones()` would) silently invents one. The caller's `unwrap_or(32)`
+/// governs what happens for a `None` here, same as for a dotted-quad or
+/// absent netmask.
 fn prefix_from_hex_netmask(hex: &str) -> Option<u8> {
     let hex = hex.strip_prefix("0x")?;
     let mask = u32::from_str_radix(hex, 16).ok()?;
-    Some(mask.count_ones() as u8)
+    let prefix = mask.count_ones() as u8;
+    let contiguous = if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - u32::from(prefix))
+    };
+    (mask == contiguous).then_some(prefix)
 }
 
 /// Bring up `profile`. Tears down any active profile first, then creates each
@@ -273,6 +285,27 @@ mod tests {
         r.stdout
             .insert("ifconfig -l".to_string(), "lo0 en0".to_string());
         r
+    }
+
+    #[test]
+    fn hex_netmask_prefix_for_contiguous_masks() {
+        assert_eq!(prefix_from_hex_netmask("0xffffff00"), Some(24));
+        assert_eq!(prefix_from_hex_netmask("0xffff0000"), Some(16));
+        assert_eq!(prefix_from_hex_netmask("0x00000000"), Some(0));
+        assert_eq!(prefix_from_hex_netmask("0xffffffff"), Some(32));
+    }
+
+    #[test]
+    fn hex_netmask_prefix_is_none_for_a_non_contiguous_mask() {
+        // A non-contiguous mask has no single prefix length; counting set
+        // bits alone would invent a wrong one (/16 here).
+        assert_eq!(prefix_from_hex_netmask("0xff00ff00"), None);
+    }
+
+    #[test]
+    fn hex_netmask_prefix_is_none_for_malformed_input() {
+        assert_eq!(prefix_from_hex_netmask("255.255.255.0"), None);
+        assert_eq!(prefix_from_hex_netmask(""), None);
     }
 
     #[test]

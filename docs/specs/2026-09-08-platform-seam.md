@@ -18,19 +18,33 @@ library consumer can pull in `vlanctl` with `default-features = false` and
 get no argument parser at all. Nothing about the library's public API
 depends on `clap` or on any CLI type.
 
-## `Platform` owns syntax and two decisions
+## `Platform` owns interface syntax and two decisions — not route syntax yet
 
-Every command the library used to hardcode as `ifconfig`/`route` syntax now
-comes from a `Platform` trait (`src/plan.rs`). A `Platform` implementation
-supplies the interface-naming convention, the ordered commands to bring an
-interface up or tear it down, and the tools used to read back host state —
-this is the part that varies "in size," so to speak: it's still command
-syntax, one dialect per operating system.
+A `Platform` trait (`src/plan.rs`) now owns the interface-naming convention
+and the ordered commands to bring an interface up or tear it down. Each
+implementation supplies its own syntax for those: `MacOs` renders `ifconfig
+vlan10 create` / `vlan 10 vlandev en7`; a future Linux backend would render
+its own `ip link add ...` instead.
 
-But two of the trait's methods are not syntax at all. They are decisions,
-and they are decisions because the straight-line logic they replace looked
-like a universal networking rule but was actually encoding one operating
-system's semantics:
+Route and static-ARP command syntax is **not** behind this seam, and should
+not be assumed to be. `append_route_commands` and `interface_route_command`
+in `src/plan.rs` build every `route add ...` and `arp -s ...` command in
+shared code, for every platform, and that syntax is BSD/macOS-shaped. Only
+the *decision* of whether to emit a host route is delegated
+(`wants_onlink_host_route`, below) — the syntax that decision controls is
+not. A non-BSD backend (Linux's `ip route`, for instance) will need a
+per-platform route-emission hook added to `Platform` before it can render
+correct route commands. `src/plan.rs`'s
+`route_syntax_is_currently_shared_and_bsd_shaped_a_known_limitation` test
+pins today's shared-BSD behavior so that closing this gap later is a
+deliberate test edit rather than silent drift; treat that hook as the first
+piece of the Linux/Windows backend work described below, not something
+already in place.
+
+Two of the trait's methods that do exist today are not syntax at all. They
+are decisions, and they are decisions because the straight-line logic they
+replace looked like a universal networking rule but was actually encoding
+one operating system's semantics:
 
 - **`wants_onlink_host_route(in_subnet: bool) -> bool`** — whether a
   gatewayless route to a destination inside the interface's own subnet
@@ -53,30 +67,35 @@ system's semantics:
   device; macOS deliberately answers `false` here and leaves that alias in
   place on teardown, because the device may be carrying configuration
   `vlanctl` did not create and has no business removing. A Windows backend
-  cannot inherit that answer: Windows has no equivalent of an address alias
-  on a physical adapter. Its untagged equivalent is a virtual-switch binding
-  that re-plumbs the physical NIC itself, so leaving it in place on teardown
-  would leave the network stack in a different state than before `vlanctl`
-  touched it. A Windows `Platform` must answer `true` and actually revert
-  it.
+  cannot inherit that answer: even though `netsh` can bind more than one
+  IPv4 address to a single physical adapter, `vlanctl`'s untagged equivalent
+  on Windows is a virtual-switch binding that re-plumbs the physical NIC
+  itself, not an address alias, so leaving it in place on teardown would
+  leave the network stack in a different state than before `vlanctl` touched
+  it. A Windows `Platform` must answer `true` and actually revert it.
 
 Both methods are answered per platform for the same underlying reason:
 the operation that looks identical in shape (add a host route; leave/undo
 parent config) has a materially different effect on the underlying network
 stack, and only the platform backend knows which effect is correct.
 
-## `Platform` also owns host-state parsing
+## `Platform` also declares host-state parsing — not yet wired up
 
-The trait does not stop at command emission. `list_devices`, `addresses_on`,
-`is_wireless`, and `link_is_active` all read back host network state, and on
-macOS they do it by parsing the output of `ifconfig` and
-`networksetup -listallhardwareports`. Those are macOS-specific tools with
-macOS-specific output formats; a Linux or Windows backend has no `ifconfig`
-or `networksetup` to shell out to; it has its own state-reading conventions
-entirely. Routing state-reading through `Platform` means a new backend must
-supply its own parser rather than silently inheriting macOS's and either
-failing to compile against tools that do not exist on that OS, or worse,
-compiling against them and producing wrong answers at runtime.
+The trait also declares four host-state readers: `list_devices`,
+`addresses_on`, `is_wireless`, and `link_is_active`. On macOS they parse the
+output of `ifconfig` and `networksetup -listallhardwareports`, tools with no
+Linux or Windows equivalent, so each backend will need its own parser rather
+than a name that happens to compile against another OS's tools.
+
+None of the four has a production caller yet, though. `apply`, `down`,
+`status`, and `resolve_device` still call the macOS parsers in `commands`
+(`live_interfaces`, `device_inet_addresses`) and `device` (`wifi_devices`,
+`interface_is_active`) directly — exactly as they did before this trait
+existed. Routing those call sites through `Platform` is host-detection work
+in its own right: a wrong parser there silently picks the wrong NIC rather
+than erroring, so it is deliberately left as the first task for whichever
+change adds the first non-macOS backend, not folded into declaring the
+trait's shape.
 
 This is also why no method on `Platform` has a default implementation. That
 omission is deliberate, not an oversight: a default body is itself an
@@ -115,13 +134,24 @@ caller.
 
 This work adds the seam, not the additional backends. A Linux `Platform`
 implementation and a Windows `Platform` implementation are the anticipated
-next pieces of work; each will supply its own command syntax, its own
-answers to `wants_onlink_host_route` and `reverts_parent_config`, and its
-own host-state parsing, exactly as `MacOs` does today. `host_platform()`
-(`src/plan.rs`) is the single place a binary selects a `Platform` for the
-host it is running on; it currently returns `MacOs` on macOS and refuses
-(rather than guessing) everywhere else, which is what a new backend needs
-to change to bring that platform online.
+next pieces of work. Before either can be correct, that work also has to
+close the two gaps this document flags above: giving `Platform` a
+per-platform route-emission hook (route/ARP syntax is still shared and
+BSD-shaped), and wiring `apply`/`down`/`status`/`resolve_device` over to the
+four host-state methods (they are declared but not yet consumed). Once
+those exist, each backend supplies its own interface/route command syntax,
+its own answers to `wants_onlink_host_route` and `reverts_parent_config`,
+and its own host-state parsing, exactly as `MacOs` does today.
+
+`host_platform()` (`src/plan.rs`) is the single place a binary selects a
+`Platform` for a **real, mutating** operation (`apply`/`down`); it currently
+returns `MacOs` on macOS and returns an `Err` — never a panic — everywhere
+else, which is what a new backend needs to change to bring that platform
+online. Rendering a **preview** (`show`, `apply --dry-run`, `down
+--dry-run`) goes through the separate `preview_platform()` instead, which
+always succeeds: a preview touches no real system and must keep working on
+any host even before a real backend exists for it, so it is not gated on
+host detection the way a mutating operation is.
 
 ## Cross-reference
 
