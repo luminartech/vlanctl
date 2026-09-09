@@ -524,4 +524,51 @@ mod tests {
             "untagged parent config persists by design on macOS"
         );
     }
+
+    #[test]
+    fn macos_emits_no_route_for_a_gatewayless_in_subnet_destination() {
+        let i = Interface {
+            vlan: Some(11),
+            address: "192.168.11.87/24".parse().unwrap(),
+            mtu: None,
+            routes: vec![Route {
+                destination: "192.168.11.151/32".to_string(),
+                gateway: None,
+                mac: None,
+            }],
+        };
+        let rendered: Vec<String> = MacOs
+            .bringup_commands(&i, "en7")
+            .iter()
+            .map(|c| c.display())
+            .collect();
+        assert!(
+            !rendered.iter().any(|c| c.starts_with("route ")),
+            "an in-subnet gatewayless destination must not get an interface-scoped \
+             host route (it self-MACs and black-holes on macOS): {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn macos_emits_a_route_add_for_a_gatewayed_destination() {
+        let i = Interface {
+            vlan: Some(11),
+            address: "192.168.11.87/24".parse().unwrap(),
+            mtu: None,
+            routes: vec![Route {
+                destination: "192.168.20.0/24".to_string(),
+                gateway: Some("192.168.11.1".parse().unwrap()),
+                mac: None,
+            }],
+        };
+        let rendered: Vec<String> = MacOs
+            .bringup_commands(&i, "en7")
+            .iter()
+            .map(|c| c.display())
+            .collect();
+        assert!(
+            rendered.contains(&"route add 192.168.20.0/24 192.168.11.1".to_string()),
+            "expected a route add for the gatewayed destination: {rendered:?}"
+        );
+    }
 }
