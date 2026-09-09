@@ -363,7 +363,7 @@ mod tests {
     }
 
     /// A platform whose answers are the opposite of macOS on both decisions,
-    /// proving the trait actually drives behaviour rather than documenting it.
+    /// proving the trait actually drives behavior rather than documenting it.
     struct Contrarian;
 
     impl Platform for Contrarian {
@@ -382,8 +382,11 @@ mod tests {
         fn teardown_commands(&self, iface: &str) -> Vec<Cmd> {
             vec![Cmd::new("false", &[iface])]
         }
-        fn wants_onlink_host_route(&self, _in_subnet: bool) -> bool {
-            true
+        // Opposite of macOS's `!in_subnet`: derived from the flag, not a
+        // constant, so a test can tell whether the parameter is actually
+        // plumbed through.
+        fn wants_onlink_host_route(&self, in_subnet: bool) -> bool {
+            in_subnet
         }
         fn reverts_parent_config(&self) -> bool {
             true
@@ -402,8 +405,13 @@ mod tests {
     }
 
     #[test]
-    fn a_platform_controls_the_two_decisions() {
+    fn a_platform_derives_the_onlink_decision_from_in_subnet() {
         assert!(Contrarian.wants_onlink_host_route(true));
+        assert!(!Contrarian.wants_onlink_host_route(false));
+    }
+
+    #[test]
+    fn a_platform_controls_reverting_parent_config() {
         assert!(Contrarian.reverts_parent_config());
     }
 }
