@@ -256,9 +256,16 @@ pub trait Platform {
     fn teardown_commands(&self, iface: &str) -> Vec<Cmd>;
     fn list_devices(&self, runner: &mut dyn CommandRunner) -> Result<Vec<String>>;
     fn addresses_on(&self, runner: &mut dyn CommandRunner, device: &str) -> Result<Vec<IpNet>>;
-    /// Whether a gatewayless in-subnet `/32` should emit an interface-scoped
-    /// route. **This is a decision, not syntax** — see below.
-    fn wants_onlink_host_route(&self, in_subnet: bool) -> bool;
+    /// One route and its static-ARP entry: both the decision of what to
+    /// emit and the syntax to emit it in. **The decision is the interesting
+    /// part** — see below.
+    ///
+    /// SHIPPED (1b) as `route_commands`, not as the decision-only
+    /// `wants_onlink_host_route` this section originally sketched. A
+    /// decision-only hook could say *whether* to route but not *how*, so
+    /// shared code still emitted BSD `route`/`arp -s` for every platform
+    /// and a Linux backend rendered unusable commands.
+    fn route_commands(&self, route: &Route, in_subnet: bool, iface: &str) -> Vec<Cmd>;
 }
 ```
 
@@ -293,7 +300,7 @@ teardown, the pre-apply collision guard, state recording — reads
 `Platform::iface_name`, so they agree automatically; nothing may re-derive a
 name independently.
 
-**Why `wants_onlink_host_route` is a platform decision and not shared logic.**
+**Why the in-subnet host route is a platform decision and not shared logic.**
 vlanctl currently skips a gatewayless in-subnet `/32` because on macOS an
 interface-scoped host route installs a **self-MAC** LLINFO entry and
 black-holes the traffic (§8). On **Linux there is no such problem** — `ip route
@@ -536,8 +543,10 @@ Cheapest platform, and the one whose routing model actually suits the problem.
   build — the spike host had no installed `envision` to run `getcap` against.
 - **`ip route add X/32 dev Y` works as intended** — the destination becomes
   genuinely on-link and the kernel ARPs. This is the answer to §2.1's
-  shared-subnet problem, and it is why `Platform::wants_onlink_host_route`
-  returns `true` here and `false` on macOS.
+  shared-subnet problem, and it is why `Platform::route_commands` emits the
+  route here and skips it on macOS. **Measured on the bench (2026-09-10),
+  not merely reasoned:** with two interfaces in one `/24` and no `/32`, an
+  unbound connection timed out and adding the `/32` fixed it. See §12.
 - **Static ARP** where a sensor will not answer: `ip neigh add <ip> lladdr
   <mac> dev <iface>` — the analogue of macOS's `arp -s`, without the
   `arp -d` trap.
@@ -632,7 +641,7 @@ untestable part is thin.
 | Phase | Repo | Content |
 |---|---|---|
 | **1a** | vlanctl | Add a **lib target**; extract today's macOS behaviour behind `Platform` (§4.3.1) with **no behaviour change**. Existing tests must pass untouched. |
-| **1b** | vlanctl | **Linux `Platform` impl** — `ip link add … type vlan`, `ip addr`, `ip route add X/32 dev Y`, `ip neigh add`, and `wants_onlink_host_route == true`. |
+| **1b** | vlanctl | **Linux `Platform` impl** — `ip link add … type vlan`, `ip addr`, `ip route add X/32 dev Y`, `ip neigh add`, and `route_commands` emitting the on-link `/32` unconditionally. |
 | **1c** | dft | `WireProfile` observation (§4.2), `derive_profile` (§4.3), fix the two Connection-section bugs (§9.1, §9.2), and a **dry-run preview UI** driven by `RecordingRunner`. Applies nothing. |
 | **2** | dft | Linux **apply** via `SystemRunner` — no prompt (we hold `CAP_NET_ADMIN`), idempotent re-apply at startup. |
 | **3** | vlanctl + dft | **Windows `Platform` impl** — Hyper-V vSwitch, access vNICs, trunk vNIC + port mirroring, `netsh` addressing, dock-attach reconcile — plus the consent screen. The bulk of the remaining work. |
@@ -680,9 +689,30 @@ early is cheap insurance against building the expensive version.
   through to it, and it binds that address and sets `IP_MULTICAST_IF`. So
   **SOME/IP already binds; only DoIP (`simple_doip`) and telnet are
   unbound.** A negative result from a search whose scope excludes the answer
-  is not a verification. If our SOME/IP, DoIP and datapath
-  clients bound per-interface, §2.1's shared-subnet problem largely evaporates
-  and Windows' topology has less to achieve. Costs a spike, not a commitment.
+  is not a verification.
+  **RESOLVED BY BENCH SPIKE (2026-09-10) — and the reassurance above is
+  wrong.** The spike measured the shared-subnet case directly: two
+  interfaces in one `/24`, no `/32` routes, kernel preferring the interface
+  that cannot reach the target.
+    - `SO_BINDTODEVICE` **does** fix it, and needs **no capabilities** (the
+      "needs CAP_NET_RAW" claim is false on kernel 7.0.0-30/-31).
+    - **Source-address binding does NOT fix it.** It is the *portable*
+      mechanism, and the one `simple-someip` actually uses. Binding the
+      right local address still routed out the wrong interface and timed
+      out: a bound source constrains the source IP, not the egress device,
+      because the FIB lookup is keyed on destination.
+  So "SOME/IP already binds" is **not** the protection this bullet took it
+  for, §2.1's shared-subnet problem does **not** evaporate, and the `/32`
+  host routes are load-bearing **today** for `lum_legacy`, whose VLAN 10 and
+  VLAN 11 both sit on `192.168.10.0/24`. The claim that binding is "the most
+  robust cross-platform way … sidestepping routing-table ambiguity entirely"
+  holds only for the Linux-only option, not the cross-platform one.
+  **Still open:** macOS `IP_BOUND_IF` and Windows `IP_UNICAST_IF` are the
+  analogous per-interface egress binds. If they behave like
+  `SO_BINDTODEVICE`, a real cross-platform bind-to-device exists and the
+  route layer could still shrink — but that is a different socket option on
+  each of three platforms, none of it what the code does today, and it could
+  not be tested from the Linux bench host.
 - **The untagged-ARP question for `192.168.11.87`** (Windows strong host
   model). Still needs a factory-config sensor. Note vlanctl shows this class of
   problem is real and solved-by-static-ARP on macOS, so the fix shape is known
