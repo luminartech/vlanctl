@@ -64,10 +64,10 @@ early in the spike.
 
 | Path | Transport | Tagging | Sensor address | Host / client address |
 |---|---|---|---|---|
-| Point cloud / datapath | UDP 4370/4371 | **ALWAYS UNTAGGED** | sourced from the SOME/IP address | destination defaults to **`192.168.11.87`** (or a group) |
+| Point cloud / datapath | UDP 4370/4371 | **VLAN 11** (measured 2026-09-10, §2.0; this row previously read "ALWAYS UNTAGGED") | sourced from the SOME/IP address | destination defaults to **`192.168.11.87`** (or a group) |
 | Diagnostics (DoIP/UDS) | UDP+TCP 13400 | **VLAN 10** | `192.168.10.150` | **`192.168.10.90`** |
 | SOME/IP (SD + control) | UDP 30490 + service ports | **VLAN 11** | `192.168.11.151` | `192.168.11.87` |
-| Telnet | TCP | **VLAN 12** on Iris; **untagged** on Halo | `192.168.12.152` | `192.168.10.1/24` |
+| Telnet | TCP 23 | **VLAN 11** on a default-config Iris (measured 2026-09-10 — see below); **untagged** on Halo | `192.168.11.151` on Iris (NOT `192.168.12.152`) | `192.168.11.87` |
 
 Addresses above are the **Iris** layout, taken from vlanctl's `lum.toml`
 (revision 1 wrongly had the VLAN 10 host at `.10.1`). **Layouts differ by
@@ -707,8 +707,20 @@ early is cheap insurance against building the expensive version.
    `NativeVlanId 0` is NOT load-bearing. Kept struck through rather than deleted:
    it was a stated user requirement and drove the Windows topology, so a reader of
    §6.3 needs to know it was retired by measurement.
-3. **Telnet is VLAN 12 on Iris, untagged on Halo.** Platform-dependent, so the
-   platform→VLAN mapping is data, not branches.
+3. ~~**Telnet is VLAN 12 on Iris**~~, untagged on Halo. **The Iris half is
+   WITHDRAWN 2026-09-10 — measured VLAN 11.** `tcp 23` is OPEN at
+   `192.168.11.151` (the datapath/SOME/IP address, VLAN 11) and CLOSED at
+   `192.168.10.150` (VLAN 10). Independently confirmed by the user on the same
+   bench. And it is not merely unobserved but **unrepresentable**: `iris_config`
+   defines `EthIf1_*` and `EthIf2_*` and nothing else — two `VlanId` fields, no
+   third interface, and no `192.168.12.x` anywhere in the crate — so a
+   default-config Iris cannot carry a VLAN 12 address at all.
+   The mapping being **data rather than branches still holds**, and is now
+   load-bearing for a different reason: the VLAN 12 story is real for
+   `halo.toml` but not for this Iris schema, so it is per-product data.
+   Caveat: measured on a default-config Iris. A legacy firmware or a different
+   config schema could still put telnet on VLAN 12 — which is precisely why the
+   mapping should stay data.
 4. **Windows Home is out of scope.** Pro or better is a documented requirement.
 5. **Multi-sensor is expected but not first.** Sensors share subnets, so
    profiles key on the segment, never the sensor.
