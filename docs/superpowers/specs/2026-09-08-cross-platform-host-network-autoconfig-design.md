@@ -249,7 +249,8 @@ derived, edit it, and feed it back.
 ```rust
 pub trait Platform {
     /// Interface name for a tagged entry: `vlan11` (macOS), `eth0.11`
-    /// (Linux), `vEthernet (IrisVlan11)` (Windows).
+    /// (Linux, subject to the IFNAMSIZ rule below),
+    /// `vEthernet (IrisVlan11)` (Windows).
     fn iface_name(&self, interface: &Interface, device: &str) -> String;
     fn bringup_commands(&self, interface: &Interface, device: &str) -> Vec<Cmd>;
     fn teardown_commands(&self, iface: &str) -> Vec<Cmd>;
@@ -260,6 +261,37 @@ pub trait Platform {
     fn wants_onlink_host_route(&self, in_subnet: bool) -> bool;
 }
 ```
+
+**Linux naming is not simply `<parent>.<id>` — IFNAMSIZ forces a fallback.**
+The kernel caps an interface name at `IFNAMSIZ - 1` = 15 bytes, and a
+predictable USB NIC name (`enx` + 12 MAC hex digits) is *already* 15, so any
+suffix on it makes `ip link add` fail. The rule is therefore:
+
+> Decide from the **parent alone**: a parent of 10 bytes or fewer yields
+> `<parent>.<id>`; anything longer yields `vlan<id>`.
+
+Ten is derived, not chosen: 15 less the dot less the widest valid id (`4094`,
+4 digits). Two properties are load-bearing, and both were arrived at by
+rejecting the obvious alternative:
+
+- **Fall back, do not truncate.** In an `enx` name the trailing hex digits are
+  the device-unique half of the MAC and the leading ones are the vendor OUI,
+  so right-truncating collides two same-vendor NICs on one name — a silent
+  failure, in a seam whose whole theme is eliminating those. `vlan<id>` cannot
+  collide within a profile (validation rejects duplicate ids, and a profile
+  has exactly one parent device), it is the name both the proven `ip`-based
+  recipe and macOS already use, and `vlan4094` is 8 bytes, so it always fits.
+- **Decide per parent, not per interface.** Measuring the *rendered* name
+  would let one profile mix schemes on one NIC, because the suffix width
+  varies with the id: an 11-byte parent fits `<parent>.999` (15 bytes) but
+  overflows at `<parent>.4094` (16), so the same device would show a dotted
+  name for one VLAN and a fallback name for another.
+
+The cost, accepted deliberately: naming is host-dependent, so the same profile
+yields `eth0.11` on one box and `vlan11` on another. Every consumer — bring-up,
+teardown, the pre-apply collision guard, state recording — reads
+`Platform::iface_name`, so they agree automatically; nothing may re-derive a
+name independently.
 
 **Why `wants_onlink_host_route` is a platform decision and not shared logic.**
 vlanctl currently skips a gatewayless in-subnet `/32` because on macOS an
