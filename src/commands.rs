@@ -206,8 +206,18 @@ pub fn down<R: CommandRunner>(
 }
 
 /// Render the full bring-up plan for a profile as displayable command lines,
-/// through the same `platform` that `apply` would use — so the preview never
-/// disagrees with what actually runs.
+/// through whatever `platform` the caller passes.
+///
+/// It renders faithfully for the platform it is GIVEN — but the caller is the
+/// one that decides, and on a Linux host the two callers disagree today:
+/// previews come from `preview_platform()` (fixed at `MacOs`) while `apply`
+/// resolves `host_platform()` (`Linux`). So `apply --dry-run` prints
+/// `ifconfig vlan10 create …` where the real apply would run
+/// `ip link add … type vlan`. This doc previously claimed the preview "never
+/// disagrees with what actually runs", which stopped being true the moment a
+/// second backend existed. Tracked as gap (7) in
+/// `docs/specs/2026-09-08-platform-seam.md`; the repoint is deferred because
+/// the two functions return different shapes.
 pub fn show_plan(platform: &dyn Platform, profile: &Profile, device: &str) -> Vec<String> {
     profile
         .interfaces

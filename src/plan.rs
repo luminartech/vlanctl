@@ -287,14 +287,20 @@ impl Platform for Linux {
         let name = self.iface_name(interface, device);
         let addr = interface.address.to_string();
         let mut cmds = Vec::new();
+        // Raise the parent before adding anything on it, as the recipe does,
+        // on BOTH paths. A NIC left admin-down after boot would otherwise
+        // leave every sub-interface LOWERLAYERDOWN while every command
+        // succeeds. `ip link set ... up` is idempotent, so repeating it per
+        // entry is harmless.
+        //
+        // This is deliberately OUTSIDE the tagged branch: an untagged entry
+        // configures the parent directly, and `ip addr add` succeeds on a
+        // down link, so its own routes would then be emitted against a down
+        // device and rejected with ENETDOWN. An untagged-only profile has no
+        // later tagged entry to raise the parent at all.
+        cmds.push(Cmd::new("ip", &["link", "set", device, "up"]));
         if let Some(id) = interface.vlan {
             let id = id.to_string();
-            // Raise the parent before adding anything on it, as the recipe
-            // does. A NIC left admin-down after boot would otherwise leave
-            // every sub-interface LOWERLAYERDOWN while every command
-            // succeeds. `ip link set ... up` is idempotent, so repeating it
-            // per tagged entry is harmless.
-            cmds.push(Cmd::new("ip", &["link", "set", device, "up"]));
             cmds.push(Cmd::new(
                 "ip",
                 &[
@@ -346,8 +352,16 @@ impl Platform for Linux {
                     "ip",
                     &["route", "add", &route.destination, "dev", iface],
                 ));
-                // `ip neigh add` is the Linux equivalent of `arp -s`. No
-                // self-MAC hazard here, so no ordering constraint against
+                // `ip neigh REPLACE` is the Linux equivalent of `arp -s`,
+                // which overwrites an existing entry. `ip neigh add` is not:
+                // it fails with "File exists" when one is already present,
+                // which the parent device can easily be — it persists across
+                // applies and may already hold a learned or stale entry for
+                // the sensor, aborting the apply and rolling it back. (A
+                // freshly created tagged device has an empty table, so `add`
+                // only ever looked correct there by accident.)
+                //
+                // No self-MAC hazard here, so no ordering constraint against
                 // the route above — but it is kept in the same order as
                 // macOS so the two backends read alike.
                 if let Some(mac) = &route.mac
@@ -356,7 +370,7 @@ impl Platform for Linux {
                     let host = net.addr().to_string();
                     cmds.push(Cmd::new(
                         "ip",
-                        &["neigh", "add", &host, "lladdr", mac, "dev", iface],
+                        &["neigh", "replace", &host, "lladdr", mac, "dev", iface],
                     ));
                 }
             }
@@ -1057,7 +1071,7 @@ mod tests {
             rendered,
             vec![
                 "ip route add 192.168.11.151/32 dev eth0.11",
-                "ip neigh add 192.168.11.151 lladdr 3a:42:f7:79:32:2e dev eth0.11",
+                "ip neigh replace 192.168.11.151 lladdr 3a:42:f7:79:32:2e dev eth0.11",
             ],
             "got {rendered:?}"
         );
@@ -1493,7 +1507,7 @@ mod tests {
     }
 
     #[test]
-    fn linux_untagged_addresses_the_parent_and_creates_nothing() {
+    fn linux_untagged_raises_the_parent_and_creates_nothing() {
         let i = Interface {
             vlan: None,
             address: "192.168.1.100/24".parse().unwrap(),
@@ -1509,7 +1523,21 @@ mod tests {
             !rendered.iter().any(|c| c.contains("link add")),
             "got {rendered:?}"
         );
-        assert_eq!(rendered, vec!["ip addr add 192.168.1.100/24 dev eth0"]);
+        // The parent must be raised here too, not only on the tagged path. An
+        // untagged entry configures the parent device directly, and
+        // `ip addr add` SUCCEEDS on an admin-down link — then the entry's own
+        // routes are emitted against a down device and the kernel rejects them
+        // with ENETDOWN, aborting the apply. An untagged-only profile
+        // (profiles/halo.toml's datapath entry is exactly this, and it is
+        // applied FIRST) has no later tagged entry to raise the parent at all.
+        assert_eq!(
+            rendered,
+            vec![
+                "ip link set eth0 up",
+                "ip addr add 192.168.1.100/24 dev eth0",
+            ],
+            "got {rendered:?}"
+        );
     }
 
     #[test]
