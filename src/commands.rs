@@ -116,6 +116,25 @@ pub fn apply<R: CommandRunner>(
         }
     }
 
+    // A name is not the only thing that can collide. On Linux the kernel
+    // keys VLANs on (parent, vlan id), so an existing `vlan10` on this
+    // parent makes `eth0.10` impossible to create even though the names
+    // differ — `ip link add` would fail with "8021q: VLAN device already
+    // exists" after the apply had already started. Refuse here instead,
+    // where the message can say which device holds the id. A platform with
+    // no such constraint returns an empty list and this is a no-op.
+    let taken = platform.existing_vlans(runner, &device)?;
+    for interface in profile.interfaces.iter().filter(|i| i.vlan.is_some()) {
+        let Some(id) = interface.vlan else { continue };
+        if let Some((_, holder)) = taken.iter().find(|(taken_id, _)| *taken_id == id) {
+            bail!(
+                "vlan id {id} is already in use on {device} by interface {holder}, \
+                 which vlanctl did not create; refusing to touch it (the kernel \
+                 allows one VLAN per id per parent, whatever it is named)"
+            );
+        }
+    }
+
     let mut created: Vec<String> = Vec::new();
     for interface in &profile.interfaces {
         match interface.vlan {
@@ -351,6 +370,12 @@ mod tests {
                 .join(",")
         );
         r.stdout.insert("ip -json link show".to_string(), json);
+        // The vlan-id guard's probe. A real host always emits a JSON array,
+        // so an empty default here would be an unrealistic fixture — and the
+        // parse is deliberately strict, treating unreadable output as a
+        // failure to ask. Tests that need an id collision override this.
+        r.stdout
+            .insert("ip -d -json link show".to_string(), "[]".to_string());
         r
     }
 
@@ -433,6 +458,47 @@ mod tests {
             "{rendered:?}"
         );
         assert_eq!(State::load(&state_path).unwrap(), State::default());
+        let _ = std::fs::remove_file(&state_path);
+    }
+
+    #[test]
+    fn apply_refuses_a_vlan_id_already_taken_under_another_name() {
+        // The kernel's uniqueness constraint is (parent, vlan id), NOT the
+        // name: an existing `vlan10` on eth0 makes `eth0.10` impossible to
+        // create, so `ip link add` fails with "VLAN device already exists"
+        // part-way through an apply. The name guard cannot see it —
+        // "vlan10" != "eth0.10" — so it must be refused on the id.
+        let state_path = std::env::temp_dir().join("vlanctl-vlan-id-collision.json");
+        let _ = std::fs::remove_file(&state_path);
+
+        // `linux_profile()` wants vlan 100; a foreign `vlan100` already
+        // holds that id on eth0 under a name the guard cannot match.
+        let mut r = linux_runner("lo eth0 vlan100");
+        r.stdout.insert(
+            "ip -d -json link show".to_string(),
+            r#"[{"ifname":"vlan100","link":"eth0",
+                 "linkinfo":{"info_kind":"vlan","info_data":{"id":100}}}]"#
+                .to_string(),
+        );
+        let err = apply(
+            &mut r,
+            &Linux,
+            &linux_profile(),
+            Some("eth0"),
+            &state_path,
+            false,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("vlan id 100") && msg.contains("vlan100") && msg.contains("eth0"),
+            "the refusal must name the id, the device holding it, and the parent: {msg}"
+        );
+        let rendered: Vec<String> = r.commands.iter().map(|c| c.display()).collect();
+        assert!(
+            !rendered.iter().any(|c| c.contains("link add")),
+            "it must refuse BEFORE creating anything: {rendered:?}"
+        );
         let _ = std::fs::remove_file(&state_path);
     }
 

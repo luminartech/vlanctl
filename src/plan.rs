@@ -72,6 +72,25 @@ pub trait Platform {
     /// `route`/`arp` against Linux `ip route`/`ip neigh`.
     fn route_commands(&self, route: &Route, in_subnet: bool, iface: &str) -> Vec<Cmd>;
 
+    /// VLAN ids already in use on `parent`, each with the device name
+    /// holding it.
+    ///
+    /// Exists because a platform's uniqueness constraint is not always the
+    /// interface *name*. On Linux the kernel keys VLANs on **(parent, vlan
+    /// id)**, so a pre-existing `vlan10` on `eth0` makes `eth0.10`
+    /// impossible to create even though the names differ — `ip link add`
+    /// fails with `8021q: VLAN device already exists` part-way through an
+    /// apply. The name-based collision guard cannot see that, so `apply`
+    /// consults this as well and refuses up front.
+    ///
+    /// A platform with no such constraint returns an empty list, and should
+    /// issue no probe to do so.
+    fn existing_vlans(
+        &self,
+        runner: &mut dyn CommandRunner,
+        parent: &str,
+    ) -> Result<Vec<(u16, String)>>;
+
     /// Whether `name` could be a VLAN **parent** — i.e. a real wired device
     /// this platform might trunk onto, as opposed to loopback, a virtual
     /// device, or a VLAN sub-interface we or someone else created.
@@ -194,6 +213,21 @@ impl Platform for MacOs {
             }
         }
         cmds
+    }
+
+    fn existing_vlans(
+        &self,
+        _runner: &mut dyn CommandRunner,
+        _parent: &str,
+    ) -> Result<Vec<(u16, String)>> {
+        // Deliberately empty, and deliberately issues no probe: macOS
+        // addresses a VLAN by its interface name, which the name-based guard
+        // already covers. Whether BSD also rejects a duplicate (parent, vlan
+        // id) under a different name has NOT been verified on hardware, and
+        // inventing a constraint we have not tested would risk refusing an
+        // apply that works today. If it is ever confirmed, this is where it
+        // goes.
+        Ok(Vec::new())
     }
 
     fn is_candidate_device(&self, name: &str) -> bool {
@@ -395,6 +429,42 @@ impl Platform for Linux {
             }
         }
         cmds
+    }
+
+    fn existing_vlans(
+        &self,
+        runner: &mut dyn CommandRunner,
+        parent: &str,
+    ) -> Result<Vec<(u16, String)>> {
+        // `-d` is what carries `linkinfo`; without it the vlan id is absent
+        // from the JSON entirely.
+        let out = runner.run(&Cmd::new("ip", &["-d", "-json", "link", "show"]))?;
+        // `?` on a parse failure, matching the neighbouring host-state
+        // readers: unreadable output is a genuine failure to ask, not "no
+        // VLANs present" — answering the latter would let apply proceed into
+        // the kernel rejection this method exists to prevent.
+        let entries: Vec<serde_json::Value> = serde_json::from_str(&out)?;
+        let mut found = Vec::new();
+        for entry in &entries {
+            // Only VLANs stacked on THIS parent constrain us; the same id on
+            // another device is unrelated.
+            if entry.get("link").and_then(|l| l.as_str()) != Some(parent) {
+                continue;
+            }
+            let info = entry.get("linkinfo");
+            let Some(id) = info
+                .and_then(|i| i.get("info_data"))
+                .and_then(|d| d.get("id"))
+                .and_then(|i| i.as_u64())
+            else {
+                continue;
+            };
+            let Some(name) = entry.get("ifname").and_then(|n| n.as_str()) else {
+                continue;
+            };
+            found.push((id as u16, name.to_string()));
+        }
+        Ok(found)
     }
 
     fn is_candidate_device(&self, name: &str) -> bool {
@@ -1047,6 +1117,13 @@ mod tests {
                 "contrarian-route",
                 &["add", &route.destination, "dev", iface],
             )]
+        }
+        fn existing_vlans(
+            &self,
+            _runner: &mut dyn CommandRunner,
+            _parent: &str,
+        ) -> Result<Vec<(u16, String)>> {
+            Ok(Vec::new())
         }
         fn is_candidate_device(&self, name: &str) -> bool {
             // Opposite of every real platform: only names starting `x` are
@@ -1810,6 +1887,47 @@ mod tests {
         assert!(
             !MacOs.is_candidate_device("en0.100"),
             "a vlan sub-interface is not a parent candidate"
+        );
+    }
+
+    #[test]
+    fn linux_existing_vlans_reports_ids_with_the_names_holding_them() {
+        // Fixture is real `ip -d -json link show` output from the bench.
+        let mut r = RecordingRunner::default();
+        r.stdout.insert(
+            "ip -d -json link show".to_string(),
+            r#"[
+              {"ifname":"lo"},
+              {"ifname":"eth0"},
+              {"ifname":"vlan11","link":"eth0",
+               "linkinfo":{"info_kind":"vlan","info_data":{"protocol":"802.1Q","id":11}}},
+              {"ifname":"vlan10","link":"eth0",
+               "linkinfo":{"info_kind":"vlan","info_data":{"protocol":"802.1Q","id":10}}},
+              {"ifname":"other.7","link":"eth9",
+               "linkinfo":{"info_kind":"vlan","info_data":{"protocol":"802.1Q","id":7}}}
+            ]"#
+            .to_string(),
+        );
+        let mut got = Linux.existing_vlans(&mut r, "eth0").unwrap();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![(10, "vlan10".to_string()), (11, "vlan11".to_string())],
+            "only VLANs on the named parent count; eth9's id 7 must not appear"
+        );
+    }
+
+    #[test]
+    fn macos_reports_no_vlan_id_constraint() {
+        // Documented as "no constraint we know of beyond names": macOS
+        // addresses VLANs by name and the name guard already covers that.
+        // Returning empty keeps macOS behaviour and its baselines untouched
+        // rather than inventing a constraint we have not verified on BSD.
+        let mut r = RecordingRunner::default();
+        assert!(MacOs.existing_vlans(&mut r, "en7").unwrap().is_empty());
+        assert!(
+            r.commands.is_empty(),
+            "macOS must not issue a probe for a constraint it does not enforce"
         );
     }
 
