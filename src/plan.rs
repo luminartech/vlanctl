@@ -1,4 +1,6 @@
-use crate::config::{Interface, Profile, Route};
+#[cfg(test)]
+use crate::config::Profile;
+use crate::config::{Interface, Route};
 use crate::net::{Cmd, CommandRunner};
 use anyhow::Result;
 use ipnet::IpNet;
@@ -553,10 +555,21 @@ pub(crate) fn bringup_commands(interface: &Interface, device: &str) -> Vec<Cmd> 
     cmds
 }
 
-/// Names of the VLAN sub-interfaces this profile creates (`vlan<id>`), in order.
-/// Untagged interfaces configure the parent device and are not named here, so
-/// they are never recorded in state or torn down.
-pub fn interface_names(profile: &Profile) -> Vec<String> {
+/// **macOS's** names for a profile's tagged entries (`vlan<id>`), in order.
+/// Untagged entries configure the parent device and are not named here.
+///
+/// This is not what the profile creates on every platform: Linux names a
+/// sub-interface `<parent>.<id>` when that fits, and Windows differently
+/// again. It must not be used to build the collision guard or anything else
+/// that has to agree with what bring-up actually creates — a guard built on
+/// it would never match a live `eth0.11` and would silently never fire. The
+/// only correct source for such names is [`Platform::iface_name`] on the
+/// resolved device, as `commands::apply` does.
+///
+/// `#[cfg(test)]` and private: kept for the naming test below alone; no
+/// production code has any business calling it.
+#[cfg(test)]
+fn interface_names(profile: &Profile) -> Vec<String> {
     profile
         .interfaces
         .iter()
