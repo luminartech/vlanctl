@@ -1,6 +1,6 @@
 use crate::config::{Interface, Profile, Route};
 use crate::net::{Cmd, CommandRunner};
-use anyhow::{Result, bail};
+use anyhow::Result;
 use ipnet::IpNet;
 
 /// Per-operating-system command generation and host-state reading.
@@ -82,7 +82,7 @@ pub trait Platform {
 
     /// Names of every network device currently on the host, from `ifconfig -l`.
     ///
-    /// Declared for the forthcoming Linux and Windows backends; not yet
+    /// Declared for the Linux and Windows backends; not yet
     /// consumed anywhere. `apply`/`down`/`status`/`resolve_device` still call
     /// `commands::live_interfaces` (the macOS parser) directly.
     fn list_devices(&self, runner: &mut dyn CommandRunner) -> Result<Vec<String>>;
@@ -90,7 +90,7 @@ pub trait Platform {
     /// IPv4 addresses currently configured on `device`, from the `inet` lines
     /// of `ifconfig <device>`.
     ///
-    /// Declared for the forthcoming Linux and Windows backends; not yet
+    /// Declared for the Linux and Windows backends; not yet
     /// consumed anywhere. `apply`/`down`/`status`/`resolve_device` still call
     /// `commands::device_inet_addresses` (the macOS parser) directly.
     fn addresses_on(&self, runner: &mut dyn CommandRunner, device: &str) -> Result<Vec<IpNet>>;
@@ -98,14 +98,14 @@ pub trait Platform {
     /// Whether `device`'s hardware port is Wi-Fi, from
     /// `networksetup -listallhardwareports`.
     ///
-    /// Declared for the forthcoming Linux and Windows backends; not yet
+    /// Declared for the Linux and Windows backends; not yet
     /// consumed anywhere. `resolve_device` still calls `device::wifi_devices`
     /// (the macOS parser) directly.
     fn is_wireless(&self, runner: &mut dyn CommandRunner, device: &str) -> Result<bool>;
 
     /// Whether `ifconfig <device>` reports `status: active`.
     ///
-    /// Declared for the forthcoming Linux and Windows backends; not yet
+    /// Declared for the Linux and Windows backends; not yet
     /// consumed anywhere. `resolve_device` still calls
     /// `device::interface_is_active` (the macOS parser) directly.
     fn link_is_active(&self, runner: &mut dyn CommandRunner, device: &str) -> Result<bool>;
@@ -188,12 +188,141 @@ impl Platform for MacOs {
     }
 }
 
+/// Linux. Commands mirror the recipe already proven on this hardware by the
+/// `ip`-based bring-up script this crate's shell-out approach replaces.
+pub struct Linux;
+
+impl Platform for Linux {
+    fn name(&self) -> &'static str {
+        "linux"
+    }
+
+    fn iface_name(&self, interface: &Interface, device: &str) -> String {
+        match interface.vlan {
+            // 8021q convention: `<parent>.<id>`.
+            Some(id) => format!("{device}.{id}"),
+            None => device.to_string(),
+        }
+    }
+
+    fn bringup_commands(&self, interface: &Interface, device: &str) -> Vec<Cmd> {
+        let name = self.iface_name(interface, device);
+        let addr = interface.address.to_string();
+        let mut cmds = Vec::new();
+        if let Some(id) = interface.vlan {
+            let id = id.to_string();
+            cmds.push(Cmd::new(
+                "ip",
+                &[
+                    "link", "add", "link", device, "name", &name, "type", "vlan", "id", &id,
+                ],
+            ));
+            cmds.push(Cmd::new("ip", &["link", "set", &name, "up"]));
+        }
+        // `ip addr add` takes CIDR directly — no netmask conversion needed.
+        cmds.push(Cmd::new("ip", &["addr", "add", &addr, "dev", &name]));
+        if let Some(mtu) = interface.mtu {
+            cmds.push(Cmd::new(
+                "ip",
+                &["link", "set", &name, "mtu", &mtu.to_string()],
+            ));
+        }
+        cmds
+    }
+
+    fn teardown_commands(&self, iface: &str) -> Vec<Cmd> {
+        // Deleting the link drops its addresses and routes with it.
+        vec![Cmd::new("ip", &["link", "del", iface])]
+    }
+
+    fn wants_onlink_host_route(&self, _in_subnet: bool) -> bool {
+        // Unlike macOS, `ip route add X/32 dev Y` makes X genuinely on-link
+        // and the kernel ARPs for it. This is the only way to reach several
+        // hosts that share one subnet across different VLANs.
+        true
+    }
+
+    fn reverts_parent_config(&self) -> bool {
+        // `ip addr del <cidr> dev <parent>` removes exactly what was added.
+        true
+    }
+
+    fn list_devices(&self, runner: &mut dyn CommandRunner) -> Result<Vec<String>> {
+        let out = runner.run(&Cmd::new("ip", &["-json", "link", "show"]))?;
+        let entries: Vec<serde_json::Value> = serde_json::from_str(&out)?;
+        Ok(entries
+            .iter()
+            .filter_map(|e| e.get("ifname")?.as_str().map(str::to_owned))
+            .collect())
+    }
+
+    fn addresses_on(&self, runner: &mut dyn CommandRunner, device: &str) -> Result<Vec<IpNet>> {
+        let out = runner.run(&Cmd::new("ip", &["-json", "addr", "show", "dev", device]))?;
+        let entries: Vec<serde_json::Value> = serde_json::from_str(&out)?;
+        let mut nets = Vec::new();
+        for e in &entries {
+            for a in e
+                .get("addr_info")
+                .and_then(|v| v.as_array())
+                .into_iter()
+                .flatten()
+            {
+                if a.get("family").and_then(|f| f.as_str()) != Some("inet") {
+                    continue;
+                }
+                let (Some(local), Some(len)) = (
+                    a.get("local").and_then(|l| l.as_str()),
+                    a.get("prefixlen").and_then(|p| p.as_u64()),
+                ) else {
+                    continue;
+                };
+                if let Ok(net) = format!("{local}/{len}").parse::<IpNet>() {
+                    nets.push(net);
+                }
+            }
+        }
+        Ok(nets)
+    }
+
+    fn is_wireless(&self, runner: &mut dyn CommandRunner, device: &str) -> Result<bool> {
+        // `/sys/class/net/<dev>/wireless` exists only for wireless devices.
+        let out = runner.run(&Cmd::new(
+            "test",
+            &["-d", &format!("/sys/class/net/{device}/wireless")],
+        ));
+        Ok(out.is_ok())
+    }
+
+    fn link_is_active(&self, runner: &mut dyn CommandRunner, device: &str) -> Result<bool> {
+        let out = runner.run(&Cmd::new(
+            "cat",
+            &[&format!("/sys/class/net/{device}/carrier")],
+        ))?;
+        Ok(out.trim() == "1")
+    }
+
+    fn records_created_interface(&self, cmd: &Cmd) -> bool {
+        cmd.program == "ip"
+            && cmd.args.first().map(|a| a == "link").unwrap_or(false)
+            && cmd.args.get(1).map(|a| a == "add").unwrap_or(false)
+    }
+
+    fn managed_interface_names(&self, profile: &Profile) -> Vec<String> {
+        let device = profile.device.as_deref().unwrap_or_default();
+        profile
+            .interfaces
+            .iter()
+            .filter_map(|i| i.vlan.map(|id| format!("{device}.{id}")))
+            .collect()
+    }
+}
+
 /// The platform this build targets, for a **real (mutating)** operation —
 /// `apply` or `down` without `--dry-run`.
 ///
-/// Returns [`MacOs`] on macOS. Every other platform returns an `Err`: Linux
-/// and Windows backends are not implemented yet, and returning a
-/// silently-wrong platform to run mutating commands against a real network
+/// Returns [`MacOs`] on macOS and [`Linux`] on Linux. Every other platform
+/// returns an `Err`: a Windows backend is not implemented yet, and returning
+/// a silently-wrong platform to run mutating commands against a real network
 /// stack would be far worse than refusing. A caller that already has a
 /// `Platform` for this OS (for example, an embedder with its own backend)
 /// should construct it explicitly rather than calling this function.
@@ -207,14 +336,20 @@ pub fn host_platform() -> Result<Box<dyn Platform>> {
     {
         Ok(Box::new(MacOs))
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     {
+        Ok(Box::new(Linux))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        use anyhow::bail;
         bail!(
-            "no Platform implementation for {} yet; only '{}' is implemented \
-             today. Linux and Windows backends are not implemented yet — \
+            "no Platform implementation for {} yet; only '{}' and '{}' are \
+             implemented today. A Windows backend is not implemented yet — \
              construct a Platform explicitly if you have one for this OS.",
             std::env::consts::OS,
             MacOs.name(),
+            Linux.name(),
         )
     }
 }
@@ -449,27 +584,43 @@ fn ipv4_netmask(prefix: u8) -> String {
 mod tests {
     use super::*;
     use crate::config::{Interface, Route};
+    use crate::net::RecordingRunner;
     use std::net::IpAddr;
 
-    /// `host_platform()` must refuse cleanly (`Err`, never a panic) on an OS
-    /// with no `Platform` implementation, and its message must name the one
-    /// platform that does exist rather than leak internal phase labels.
+    /// `host_platform()` must refuse cleanly (`Err`, never a panic) on a host
+    /// with no `Platform` implementation at all (e.g. Windows), and its
+    /// message must name a supported platform rather than leak internal
+    /// phase labels.
+    ///
+    /// Linux now has a real backend (see
+    /// `host_platform_resolves_to_linux_on_linux` below), so this can no
+    /// longer be asserted on every non-macOS host — only on one with neither
+    /// backend.
     #[test]
-    #[cfg(not(target_os = "macos"))]
-    fn host_platform_refuses_cleanly_off_macos() {
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    fn host_platform_refuses_cleanly_with_no_backend() {
         let err = match host_platform() {
             Ok(_) => panic!("no Platform implementation exists for this OS yet"),
             Err(e) => e,
         };
         let msg = err.to_string();
         assert!(
-            msg.contains("macos"),
-            "expected the error to name the one supported platform: {msg}"
+            msg.contains("macos") || msg.contains("linux"),
+            "expected the error to name a supported platform: {msg}"
         );
         assert!(
             !msg.contains("1a") && !msg.contains("1b"),
             "error text must not leak internal plan-phase labels: {msg}"
         );
+    }
+
+    /// On Linux, `host_platform()` now resolves to the Linux backend instead
+    /// of refusing — the complement of the refuse-cleanly case above.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn host_platform_resolves_to_linux_on_linux() {
+        let platform = host_platform().expect("Linux backend must be available on Linux");
+        assert_eq!(platform.name(), "linux");
     }
 
     /// The preview platform must always succeed, unlike `host_platform()` —
@@ -979,5 +1130,124 @@ mod tests {
             other.iter().any(|c| c.display().contains("192.168.11.151")),
             "a platform wanting on-link host routes must emit one: {other:?}"
         );
+    }
+
+    #[test]
+    fn linux_names_vlan_interfaces_after_the_parent() {
+        let i = Interface {
+            vlan: Some(11),
+            address: "192.168.11.87/24".parse().unwrap(),
+            mtu: None,
+            routes: vec![],
+        };
+        assert_eq!(Linux.iface_name(&i, "eth0"), "eth0.11");
+        let untagged = Interface {
+            vlan: None,
+            address: "192.168.11.87/24".parse().unwrap(),
+            mtu: None,
+            routes: vec![],
+        };
+        assert_eq!(Linux.iface_name(&untagged, "eth0"), "eth0");
+    }
+
+    #[test]
+    fn linux_tagged_bringup_is_add_then_up_then_address() {
+        let i = Interface {
+            vlan: Some(11),
+            address: "192.168.11.87/24".parse().unwrap(),
+            mtu: Some(9000),
+            routes: vec![],
+        };
+        let rendered: Vec<String> = Linux
+            .bringup_commands(&i, "eth0")
+            .iter()
+            .map(|c| c.display())
+            .collect();
+        assert_eq!(
+            rendered,
+            vec![
+                "ip link add link eth0 name eth0.11 type vlan id 11",
+                "ip link set eth0.11 up",
+                "ip addr add 192.168.11.87/24 dev eth0.11",
+                "ip link set eth0.11 mtu 9000",
+            ]
+        );
+    }
+
+    #[test]
+    fn linux_untagged_addresses_the_parent_and_creates_nothing() {
+        let i = Interface {
+            vlan: None,
+            address: "192.168.1.100/24".parse().unwrap(),
+            mtu: None,
+            routes: vec![],
+        };
+        let rendered: Vec<String> = Linux
+            .bringup_commands(&i, "eth0")
+            .iter()
+            .map(|c| c.display())
+            .collect();
+        assert!(
+            !rendered.iter().any(|c| c.contains("link add")),
+            "got {rendered:?}"
+        );
+        assert_eq!(rendered, vec!["ip addr add 192.168.1.100/24 dev eth0"]);
+    }
+
+    #[test]
+    fn linux_teardown_deletes_the_link() {
+        assert_eq!(
+            Linux
+                .teardown_commands("eth0.11")
+                .iter()
+                .map(|c| c.display())
+                .collect::<Vec<_>>(),
+            vec!["ip link del eth0.11"]
+        );
+    }
+
+    #[test]
+    fn linux_wants_the_onlink_host_route_that_macos_refuses() {
+        // The platform split that justifies the seam: on Linux
+        // `ip route add X/32 dev Y` makes X genuinely on-link and the kernel
+        // ARPs for it, which is how several hosts sharing one subnet across
+        // different VLANs are reached at all. macOS answers the opposite
+        // because an interface-scoped host route there installs a self-MAC
+        // entry and black-holes the traffic.
+        assert!(Linux.wants_onlink_host_route(true));
+        assert!(Linux.wants_onlink_host_route(false));
+        assert!(!MacOs.wants_onlink_host_route(true));
+    }
+
+    #[test]
+    fn linux_reverts_parent_config_because_it_can_delete_one_address() {
+        // `ip addr del <cidr> dev <parent>` removes exactly the address we
+        // added, unlike macOS where an alias teardown needs `-alias` the
+        // generic path cannot express.
+        assert!(Linux.reverts_parent_config());
+    }
+
+    #[test]
+    fn linux_recognizes_its_own_creation_command() {
+        assert!(Linux.records_created_interface(&Cmd::new(
+            "ip",
+            &[
+                "link", "add", "link", "eth0", "name", "eth0.11", "type", "vlan", "id", "11"
+            ]
+        )));
+        assert!(!Linux.records_created_interface(&Cmd::new(
+            "ip",
+            &["addr", "add", "192.168.11.87/24", "dev", "eth0.11"]
+        )));
+    }
+
+    #[test]
+    fn linux_host_state_reads_use_ip_json_not_ifconfig() {
+        let mut r = RecordingRunner::default();
+        r.stdout.insert(
+            "ip -json link show".to_string(),
+            r#"[{"ifname":"lo"},{"ifname":"eth0"}]"#.to_string(),
+        );
+        assert_eq!(Linux.list_devices(&mut r).unwrap(), vec!["lo", "eth0"]);
     }
 }
