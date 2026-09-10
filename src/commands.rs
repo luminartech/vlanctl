@@ -393,6 +393,58 @@ mod tests {
     }
 
     #[test]
+    fn apply_with_linux_guards_the_auto_detected_device_not_the_profile_field() {
+        // Pins that the collision guard is built from the *resolved* device.
+        // With `device` left unset, `profile.device` is `None`, and a guard
+        // that reads it directly derives `".100"` — a name that is never
+        // live — so it silently never fires. Every other `apply` test pins
+        // `device`, which is why that regression passed them all.
+        let p: Profile = toml::from_str(
+            "name=\"t\"\n\
+             [[interface]]\nvlan=100\naddress=\"192.168.10.2/24\"\n",
+        )
+        .unwrap();
+        p.validate().unwrap();
+        assert!(p.device.is_none(), "this test exercises auto-detect");
+
+        let state_path = std::env::temp_dir().join("vlanctl-linux-apply-autodetect-guard.json");
+        let _ = std::fs::remove_file(&state_path);
+
+        // `resolve_device` still runs the macOS probes on every platform:
+        // hardware ports (en0 is a wired port, not Wi-Fi), the interface
+        // listing, and a link-status query per wired candidate. `en0.100`
+        // also matches the `en*` candidate filter, but its unstubbed status
+        // reads as inactive, so en0 is the single active device and wins.
+        let mut r = RecordingRunner::default();
+        r.stdout.insert(
+            "networksetup -listallhardwareports".to_string(),
+            "Hardware Port: USB 10/100/1000 LAN\nDevice: en0\n".to_string(),
+        );
+        r.stdout
+            .insert("ifconfig -l".to_string(), "lo0 en0 en0.100".to_string());
+        r.stdout
+            .insert("ifconfig en0".to_string(), "\tstatus: active\n".to_string());
+
+        let err = apply(&mut r, &Linux, &p, &state_path, false).unwrap_err();
+        assert!(
+            err.to_string().contains("en0.100 already exists"),
+            "expected the guard to refuse the resolved device's sub-interface: {err}"
+        );
+        let rendered: Vec<String> = r.commands.iter().map(|c| c.display()).collect();
+        assert!(
+            rendered.contains(&"networksetup -listallhardwareports".to_string())
+                && rendered.contains(&"ifconfig en0".to_string()),
+            "auto-detect must actually have run: {rendered:?}"
+        );
+        assert!(
+            !rendered.iter().any(|c| c.contains("link add")),
+            "nothing may be created past a refused guard: {rendered:?}"
+        );
+        assert_eq!(State::load(&state_path).unwrap(), State::default());
+        let _ = std::fs::remove_file(&state_path);
+    }
+
+    #[test]
     fn hex_netmask_prefix_for_contiguous_masks() {
         assert_eq!(prefix_from_hex_netmask("0xffffff00"), Some(24));
         assert_eq!(prefix_from_hex_netmask("0xffff0000"), Some(16));
