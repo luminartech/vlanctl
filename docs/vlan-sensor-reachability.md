@@ -142,16 +142,21 @@ safe" and it was the bug. `route add` + `arp -s` alone is clean.
 - A gatewayless `/32` route may carry `mac = "…"`, which emits the
   `route add -host` + `arp -s` pair above. Gatewayless in-subnet destinations
   emit no route (connected route handles them).
-- See `docs/superpowers/specs/2026-06-18-untagged-interface-design.md` and
-  `…-static-arp-design.md` for the design rationale.
+- The design rationale for untagged interfaces and static ARP lives in this
+  project's spec documents, which are working notes kept outside version
+  control — ask, or recover an earlier committed revision with
+  `git log --diff-filter=D -- docs/superpowers/specs/`.
 
 ## Porting notes for other platforms
 
 - **Linux:** the self-MAC black-hole (#2) does not occur — `ip route add X/32
-  dev Y src Z` makes X on-link and the kernel ARPs. Static ARP (`ip neigh add`)
-  is the analog of #4 when a device won't ARP. VLANs via `ip link add … type
-  vlan id N`. The shared-subnet routing problem is the same; per-host `/32` dev
-  routes are the usual answer.
+  dev Y src Z` makes X on-link and the kernel ARPs. VLANs via
+  `ip link add … type vlan id N`. Static ARP (`ip neigh replace`) is the analog
+  of #4 when a device won't ARP — note `replace`, not `add`: `arp -s`
+  overwrites an existing entry whereas `ip neigh add` fails with `File exists`,
+  which matters on a parent device that persists across applies and may already
+  hold a learned entry. The shared-subnet routing problem is the same;
+  per-host `/32` dev routes are the usual answer.
 - **Windows:** VLAN tagging is typically a NIC-driver setting, not an OS
   construct; static ARP via `netsh interface ip add neighbors`. The adapter-TX
   issue (#1) is just as real — validate on the actual hardware.
