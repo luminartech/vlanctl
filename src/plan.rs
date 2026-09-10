@@ -39,8 +39,14 @@ pub trait Platform {
     fn name(&self) -> &'static str;
 
     /// Interface name for a profile entry. `vlan11` on macOS, `eth0.11` on
-    /// Linux, `vEthernet (IrisVlan11)` on Windows. Untagged entries return
-    /// the parent device.
+    /// Linux (or `vlan11` when the dotted form would exceed the kernel's
+    /// name limit), `vEthernet (IrisVlan11)` on Windows. Untagged entries
+    /// return the parent device.
+    ///
+    /// This is the single source of every sub-interface name: bring-up,
+    /// teardown, the collision guard in `commands::apply`, and creation
+    /// recording all read it, so a platform's naming rule lives here and
+    /// nowhere else.
     fn iface_name(&self, interface: &Interface, device: &str) -> String;
 
     /// Ordered commands to bring one interface up: interface creation,
@@ -187,6 +193,10 @@ impl Platform for MacOs {
     }
 }
 
+/// Longest interface name the Linux kernel accepts: `IFNAMSIZ` (16) less
+/// the terminating NUL.
+const LINUX_IFNAMSIZ_MAX: usize = 15;
+
 /// Linux. Commands mirror the recipe already proven on this hardware by the
 /// `ip`-based bring-up script this crate's shell-out approach replaces.
 pub struct Linux;
@@ -198,8 +208,28 @@ impl Platform for Linux {
 
     fn iface_name(&self, interface: &Interface, device: &str) -> String {
         match interface.vlan {
-            // 8021q convention: `<parent>.<id>`.
-            Some(id) => format!("{device}.{id}"),
+            Some(id) => {
+                // 8021q convention: `<parent>.<id>` — when it fits. The
+                // kernel caps a name at `IFNAMSIZ - 1` (15) bytes, and a
+                // predictable USB NIC name (`enx` + 12 MAC hex digits) is
+                // already 15, so `ip link add` would reject any suffix on it.
+                //
+                // Overflow falls back to `vlan<id>` rather than truncating
+                // the parent: in an `enx` name the trailing hex digits are
+                // the device-unique half of the MAC, so trimming them would
+                // make two same-vendor NICs collide on one name — a silent
+                // failure. `vlan<id>` cannot collide within a profile
+                // (validation rejects duplicate ids and a profile has one
+                // parent), it is the name the proven `ip`-based recipe and
+                // macOS both use, and `vlan4094` is 8 bytes, so it always
+                // fits.
+                let dotted = format!("{device}.{id}");
+                if dotted.len() <= LINUX_IFNAMSIZ_MAX {
+                    dotted
+                } else {
+                    format!("vlan{id}")
+                }
+            }
             None => device.to_string(),
         }
     }
@@ -1181,6 +1211,89 @@ mod tests {
             routes: vec![],
         };
         assert_eq!(Linux.iface_name(&untagged, "eth0"), "eth0");
+    }
+
+    /// `<parent>.<id>` is kept only while it fits in the kernel's 15-byte
+    /// limit; past that the name falls back to `vlan<id>`. A predictable
+    /// USB NIC name (`enx` + 12 hex digits) is exactly 15 bytes, so every
+    /// suffix on it overflows, whatever the id's width.
+    #[test]
+    fn linux_falls_back_to_vlan_id_when_the_dotted_name_would_overflow_ifnamsiz() {
+        let parent15 = "enx001122334455";
+        assert_eq!(parent15.len(), 15);
+
+        // Fits exactly: 10-byte parent + ".4094" = 15.
+        let parent10 = "enp0s31f6a";
+        assert_eq!(parent10.len(), 10);
+        assert_eq!(
+            Linux.iface_name(&tagged(4094, "10.0.0.1/24"), parent10),
+            "enp0s31f6a.4094"
+        );
+        assert_eq!(
+            Linux.iface_name(&tagged(1, "10.0.0.1/24"), parent10),
+            "enp0s31f6a.1"
+        );
+
+        // One byte over the boundary: 11-byte parent + ".4094" = 16.
+        let parent11 = "enp0s31f6ab";
+        assert_eq!(parent11.len(), 11);
+        assert_eq!(
+            Linux.iface_name(&tagged(4094, "10.0.0.1/24"), parent11),
+            "vlan4094"
+        );
+        // The same parent still fits a shorter id.
+        assert_eq!(
+            Linux.iface_name(&tagged(999, "10.0.0.1/24"), parent11),
+            "enp0s31f6ab.999"
+        );
+
+        // A 15-byte parent overflows at both id-width extremes.
+        assert_eq!(
+            Linux.iface_name(&tagged(1, "10.0.0.1/24"), parent15),
+            "vlan1"
+        );
+        assert_eq!(
+            Linux.iface_name(&tagged(4094, "10.0.0.1/24"), parent15),
+            "vlan4094"
+        );
+
+        // The fallback never overflows itself, and the untagged entry is
+        // still the parent, however long.
+        assert!(
+            Linux
+                .iface_name(&tagged(4094, "10.0.0.1/24"), parent15)
+                .len()
+                <= 15
+        );
+        let untagged = Interface {
+            vlan: None,
+            address: "10.0.0.1/24".parse().unwrap(),
+            mtu: None,
+            routes: vec![],
+        };
+        assert_eq!(Linux.iface_name(&untagged, parent15), parent15);
+    }
+
+    /// The fallback name flows into every command that names the
+    /// sub-interface — creation, up, address — because they all read it
+    /// from `iface_name` rather than re-deriving it.
+    #[test]
+    fn linux_bringup_uses_the_fallback_name_consistently() {
+        let cmds = Linux.bringup_commands(&tagged(11, "192.168.11.87/24"), "enx001122334455");
+        let rendered: Vec<String> = cmds.iter().map(|c| c.display()).collect();
+        assert_eq!(
+            rendered,
+            vec![
+                "ip link set enx001122334455 up",
+                "ip link add link enx001122334455 name vlan11 type vlan id 11",
+                "ip link set vlan11 up",
+                "ip addr add 192.168.11.87/24 dev vlan11",
+            ]
+        );
+        assert!(
+            !rendered.iter().any(|c| c.contains("enx001122334455.11")),
+            "no command may re-derive the dotted name: {rendered:?}"
+        );
     }
 
     #[test]
