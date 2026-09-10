@@ -1250,4 +1250,29 @@ mod tests {
         );
         assert_eq!(Linux.list_devices(&mut r).unwrap(), vec!["lo", "eth0"]);
     }
+
+    #[test]
+    fn linux_addresses_on_keeps_only_complete_inet_entries() {
+        let mut r = RecordingRunner::default();
+        r.stdout.insert(
+            "ip -json addr show dev eth0".to_string(),
+            r#"[{
+                "ifname": "eth0",
+                "addr_info": [
+                    {"family": "inet", "local": "192.168.11.87", "prefixlen": 24},
+                    {"family": "inet6", "local": "fe80::1", "prefixlen": 64},
+                    {"family": "inet", "prefixlen": 24},
+                    {"family": "inet", "local": "192.168.11.88"}
+                ]
+            }]"#
+            .to_string(),
+        );
+        let nets = Linux.addresses_on(&mut r, "eth0").unwrap();
+        assert_eq!(
+            nets,
+            vec!["192.168.11.87/24".parse::<IpNet>().unwrap()],
+            "expected the inet6 entry excluded and both incomplete inet \
+             entries (missing local, missing prefixlen) skipped: {nets:?}"
+        );
+    }
 }
