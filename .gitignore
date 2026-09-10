@@ -1,1 +1,7 @@
 /target
+
+# Implementation plans are working documents: they are consumed during
+# execution, then superseded by the commits they produced. Tracking them
+# creates merge conflicts over files nobody reads again.
+/docs/plans/
+/docs/superpowers/plans/
