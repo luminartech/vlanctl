@@ -73,6 +73,7 @@ pub fn apply<R: CommandRunner>(
     runner: &mut R,
     platform: &dyn Platform,
     profile: &Profile,
+    device_override: Option<&str>,
     state_path: &Path,
     dry_run: bool,
 ) -> Result<Vec<String>> {
@@ -83,7 +84,13 @@ pub fn apply<R: CommandRunner>(
         down(runner, platform, state_path, dry_run)?;
     }
 
-    let device = resolve_device(platform, runner, profile.device.as_deref())?;
+    // The CLI override wins over the profile's own field: a committed
+    // profile cannot know the host's parent device name.
+    let device = resolve_device(
+        platform,
+        runner,
+        device_override.or(profile.device.as_deref()),
+    )?;
     // The names this run will create, derived from the *resolved* device
     // through the platform's own naming, so the guard below cannot disagree
     // with what bring-up actually creates. Tagged entries only: an untagged
@@ -356,7 +363,7 @@ mod tests {
         let state_path = std::env::temp_dir().join("vlanctl-linux-apply-ok.json");
         let _ = std::fs::remove_file(&state_path);
         let mut r = linux_runner("lo eth0");
-        let created = apply(&mut r, &Linux, &linux_profile(), &state_path, false).unwrap();
+        let created = apply(&mut r, &Linux, &linux_profile(), None, &state_path, false).unwrap();
         assert_eq!(created, vec!["eth0.100", "eth0.200"]);
 
         let state = State::load(&state_path).unwrap();
@@ -373,7 +380,15 @@ mod tests {
         // change to the Linux bring-up sequence cannot silently move the
         // simulated failure onto some other command.
         let mut probe = linux_runner("lo eth0");
-        apply(&mut probe, &Linux, &linux_profile(), &state_path, true).unwrap();
+        apply(
+            &mut probe,
+            &Linux,
+            &linux_profile(),
+            None,
+            &state_path,
+            true,
+        )
+        .unwrap();
         let fail_at = probe
             .commands
             .iter()
@@ -385,7 +400,7 @@ mod tests {
 
         let mut r = linux_runner("lo eth0");
         r.fail_at = Some(fail_at);
-        let err = apply(&mut r, &Linux, &linux_profile(), &state_path, false).unwrap_err();
+        let err = apply(&mut r, &Linux, &linux_profile(), None, &state_path, false).unwrap_err();
         assert!(err.to_string().contains("rolled back"), "{err}");
 
         // eth0.100 was fully created and must be deleted; eth0.200 never was.
@@ -407,7 +422,7 @@ mod tests {
         let state_path = std::env::temp_dir().join("vlanctl-linux-apply-collision.json");
         let _ = std::fs::remove_file(&state_path);
         let mut r = linux_runner("lo eth0 eth0.100");
-        let err = apply(&mut r, &Linux, &linux_profile(), &state_path, false).unwrap_err();
+        let err = apply(&mut r, &Linux, &linux_profile(), None, &state_path, false).unwrap_err();
         assert!(
             err.to_string().contains("eth0.100 already exists"),
             "expected the guard to refuse eth0.100: {err}"
@@ -418,6 +433,32 @@ mod tests {
             "{rendered:?}"
         );
         assert_eq!(State::load(&state_path).unwrap(), State::default());
+        let _ = std::fs::remove_file(&state_path);
+    }
+
+    #[test]
+    fn the_cli_device_override_beats_the_profile_field() {
+        // A committed profile cannot know the host's device name, so the
+        // runtime override must win. Profile pins "en7" (a macOS name from
+        // one bench); the override names this host's real parent.
+        let mut p = linux_profile();
+        p.device = Some("en7".to_string());
+        let state_path = std::env::temp_dir().join("vlanctl-device-override.json");
+        let _ = std::fs::remove_file(&state_path);
+
+        let mut r = linux_runner("lo eth0");
+        let created = apply(&mut r, &Linux, &p, Some("eth0"), &state_path, true).unwrap();
+        assert!(
+            created.iter().all(|c| !c.contains("en7")),
+            "the profile's en7 must not appear: {created:?}"
+        );
+        let rendered: Vec<String> = r.commands.iter().map(|c| c.display()).collect();
+        assert!(
+            rendered
+                .iter()
+                .any(|c| c.contains("dev eth0") || c.contains("link eth0")),
+            "expected the override device to be used: {rendered:?}"
+        );
         let _ = std::fs::remove_file(&state_path);
     }
 
@@ -458,7 +499,7 @@ mod tests {
             "1\n".to_string(),
         );
 
-        let err = apply(&mut r, &Linux, &p, &state_path, false).unwrap_err();
+        let err = apply(&mut r, &Linux, &p, None, &state_path, false).unwrap_err();
         assert!(
             err.to_string().contains("eth0.100 already exists"),
             "expected the guard to refuse the resolved device's sub-interface: {err}"
@@ -503,7 +544,7 @@ mod tests {
         let state_path = std::env::temp_dir().join("vlanctl-apply-uses-platform.json");
         let _ = std::fs::remove_file(&state_path);
         let mut r = runner_with_device();
-        apply(&mut r, &MacOs, &profile(), &state_path, true).expect("dry-run apply succeeds");
+        apply(&mut r, &MacOs, &profile(), None, &state_path, true).expect("dry-run apply succeeds");
         assert!(
             r.commands
                 .iter()
@@ -518,7 +559,7 @@ mod tests {
         let state_path = std::env::temp_dir().join("vlanctl-apply-ok.json");
         let _ = std::fs::remove_file(&state_path);
         let mut r = runner_with_device();
-        let created = apply(&mut r, &MacOs, &profile(), &state_path, false).unwrap();
+        let created = apply(&mut r, &MacOs, &profile(), None, &state_path, false).unwrap();
         // Interface name = vlan<id>, so ids 100/200 -> vlan100/vlan200.
         assert_eq!(created, vec!["vlan100", "vlan200"]);
 
@@ -546,7 +587,7 @@ mod tests {
         // vlan100 is fully configured; vlan200's create fails, so rollback must
         // destroy vlan100 only.
         r.fail_at = Some(4);
-        let err = apply(&mut r, &MacOs, &profile(), &state_path, false).unwrap_err();
+        let err = apply(&mut r, &MacOs, &profile(), None, &state_path, false).unwrap_err();
         assert!(err.to_string().contains("rolled back"));
 
         // vlan100 was created then destroyed during rollback; vlan200 never was.
@@ -625,7 +666,7 @@ mod tests {
         // vlan100 (the interface for VLAN id 100) is already live.
         r.stdout
             .insert("ifconfig -l".to_string(), "lo0 en0 vlan100".to_string());
-        let err = apply(&mut r, &MacOs, &profile(), &state_path, false).unwrap_err();
+        let err = apply(&mut r, &MacOs, &profile(), None, &state_path, false).unwrap_err();
         assert!(err.to_string().contains("already exists"));
         // Nothing was created and no state was written.
         let rendered: Vec<String> = r.commands.iter().map(|c| c.display()).collect();
@@ -639,7 +680,15 @@ mod tests {
         let state_path = std::env::temp_dir().join("vlanctl-apply-untagged.json");
         let _ = std::fs::remove_file(&state_path);
         let mut r = runner_with_device(); // "ifconfig -l" -> "lo0 en0"; "ifconfig en0" -> empty
-        let created = apply(&mut r, &MacOs, &untagged_profile(), &state_path, false).unwrap();
+        let created = apply(
+            &mut r,
+            &MacOs,
+            &untagged_profile(),
+            None,
+            &state_path,
+            false,
+        )
+        .unwrap();
         assert_eq!(created, vec!["vlan12"]); // only the tagged interface is recorded
         let rendered: Vec<String> = r.commands.iter().map(|c| c.display()).collect();
         assert!(
@@ -660,7 +709,15 @@ mod tests {
             "ifconfig en0".to_string(),
             "\tinet 192.168.1.100 netmask 0xffffff00 broadcast 192.168.1.255".to_string(),
         );
-        apply(&mut r, &MacOs, &untagged_profile(), &state_path, false).unwrap();
+        apply(
+            &mut r,
+            &MacOs,
+            &untagged_profile(),
+            None,
+            &state_path,
+            false,
+        )
+        .unwrap();
         let rendered: Vec<String> = r.commands.iter().map(|c| c.display()).collect();
         assert!(!rendered.iter().any(|c| c.contains("alias")));
         assert!(
@@ -699,7 +756,7 @@ mod tests {
         let state_path = std::env::temp_dir().join("vlanctl-apply-mac.json");
         let _ = std::fs::remove_file(&state_path);
         let mut r = runner_with_device();
-        let created = apply(&mut r, &MacOs, &mac_profile(), &state_path, false).unwrap();
+        let created = apply(&mut r, &MacOs, &mac_profile(), None, &state_path, false).unwrap();
         assert!(created.is_empty()); // untagged-only profile records nothing
         let rendered: Vec<String> = r.commands.iter().map(|c| c.display()).collect();
         // The route is added, then a single static ARP entry — no `arp -d`,

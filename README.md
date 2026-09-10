@@ -11,12 +11,21 @@ vlanctl show <profile>             # print the commands a profile would run
 vlanctl validate <profile>         # check a profile without applying
 sudo vlanctl apply [profile]       # bring it up (defaults to the `lum` profile)
 vlanctl apply [profile] --dry-run  # print commands without running them
+sudo vlanctl apply lum --device eth0   # pin the parent adapter for this run
 sudo vlanctl down                  # tear down the active profile
 vlanctl status                     # what is currently up
 ```
 
 A global `--profiles-dir <dir>` (default `profiles`) selects where profiles are
 read from.
+
+`apply` and `show` also take `--device <name>`, which picks the parent adapter
+the VLANs attach to and overrides any `device` field in the profile. The parent
+is **host-local** — macOS numbers adapters `enN` per machine, so a USB dongle
+can be `en7` on one Mac and `en12` on another, while Linux uses
+`eth0`/`enp*`/`enx*` — so the shipped profiles deliberately do not pin one.
+Auto-detect takes the single active wired adapter and skips Wi-Fi (which cannot
+carry 802.1Q VLANs); use `--device` when it is ambiguous or picks wrong.
 
 ## Library use
 
@@ -28,7 +37,10 @@ use vlanctl::{commands, config::Profile, net::RecordingRunner, plan::MacOs};
 
 let profile = Profile::load("profiles/lum.toml".as_ref())?;
 let mut runner = RecordingRunner::default();      // or SystemRunner to execute
-commands::apply(&mut runner, &MacOs, &profile, &state_path, true)?;
+// 4th argument overrides the parent device. Profiles do not pin one — it is
+// host-local — so a consumer supplies it, or passes `None` to auto-detect
+// against the live system.
+commands::apply(&mut runner, &MacOs, &profile, Some("en7"), &state_path, true)?;
 for cmd in &runner.commands {
     println!("{}", cmd.display());
 }
@@ -49,7 +61,9 @@ one or more VLANs with their IP address and routes:
 name = "example"
 description = "Sample two-VLAN sensor profile"
 
-# device = "en10"   # optional: pin the physical adapter; omit to auto-detect
+# device = "en10"   # optional and discouraged: the parent adapter is
+                    # host-local, so prefer `--device` on the command line.
+                    # Omit to auto-detect.
 
 [[vlan]]
 id = 100

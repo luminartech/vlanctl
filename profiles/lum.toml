@@ -1,9 +1,12 @@
 name = "lum"
 description = "Luminar sensors: VLAN 10 on 192.168.10.0/24, VLAN 11 on 192.168.11.0/24"
 
-# Physical adapter the VLANs trunk onto (USB 10/100/1000 LAN). Pinned because
-# auto-detect would otherwise grab en0 (Wi-Fi), which can't carry 802.1Q VLANs.
-device = "en7"
+# No `device` here on purpose: the parent adapter is host-local. macOS numbers
+# adapters `enN` per machine (a USB dongle can be en7 on one Mac and en12 on
+# another) and Linux uses `eth0`/`enp*`/`enx*` entirely, so any committed value
+# is wrong for everyone but the machine it was written on. Auto-detect picks the
+# single active wired adapter and skips Wi-Fi, which cannot carry 802.1Q VLANs;
+# pass `--device <name>` when auto-detect is ambiguous or picks wrong.
 
 # VLAN 10 — DoIP. Host .90, sensor .150.
 [[interface]]

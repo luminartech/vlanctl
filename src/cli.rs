@@ -5,7 +5,10 @@ use std::path::PathBuf;
 const DEFAULT_APPLY_PROFILE: &str = "lum";
 
 #[derive(Parser)]
-#[command(name = "vlanctl", about = "Apply named VLAN profiles on macOS")]
+#[command(
+    name = "vlanctl",
+    about = "Apply named VLAN profiles (macOS and Linux)"
+)]
 pub struct Cli {
     /// Directory containing profile .toml files.
     #[arg(long, default_value = "profiles", global = true)]
@@ -20,7 +23,15 @@ pub enum Command {
     /// List available profiles.
     List,
     /// Print the commands a profile would run.
-    Show { profile: String },
+    Show {
+        profile: String,
+        /// Parent device to attach VLANs to, overriding the profile's
+        /// `device` field. The parent is host-local — macOS numbers adapters
+        /// `enN` per machine and Linux uses `eth0`/`enp*`/`enx*` — so it
+        /// belongs on the command line, not in a committed profile.
+        #[arg(long)]
+        device: Option<String>,
+    },
     /// Validate a profile without applying it.
     Validate { profile: String },
     /// Bring up a profile (requires root). Defaults to the `lum` profile.
@@ -31,6 +42,10 @@ pub enum Command {
         /// Print commands without executing them.
         #[arg(long)]
         dry_run: bool,
+        /// Parent device to attach VLANs to, overriding the profile's
+        /// `device` field. See `show --device`.
+        #[arg(long)]
+        device: Option<String>,
     },
     /// Tear down the active profile (requires root).
     Down {
@@ -50,7 +65,9 @@ mod tests {
     fn apply_without_profile_defaults_to_lum() {
         let cli = Cli::try_parse_from(["vlanctl", "apply"]).unwrap();
         match cli.command {
-            Command::Apply { profile, dry_run } => {
+            Command::Apply {
+                profile, dry_run, ..
+            } => {
                 assert_eq!(profile, "lum");
                 assert!(!dry_run);
             }
@@ -59,10 +76,39 @@ mod tests {
     }
 
     #[test]
+    fn apply_accepts_a_device_override_and_defaults_to_none() {
+        // The parent device is host-local: macOS `enN` numbering is per
+        // machine and Linux uses `eth0`/`enp*` entirely, so it cannot live
+        // in a committed profile. `--device` makes it a runtime argument.
+        let cli = Cli::try_parse_from(["vlanctl", "apply", "lum", "--device", "eth0"]).unwrap();
+        match cli.command {
+            Command::Apply { device, .. } => assert_eq!(device.as_deref(), Some("eth0")),
+            _ => panic!("expected Apply"),
+        }
+        let cli = Cli::try_parse_from(["vlanctl", "apply"]).unwrap();
+        match cli.command {
+            Command::Apply { device, .. } => assert_eq!(device, None),
+            _ => panic!("expected Apply"),
+        }
+    }
+
+    #[test]
+    fn show_accepts_a_device_override() {
+        let cli =
+            Cli::try_parse_from(["vlanctl", "show", "halo", "--device", "enp0s31f6"]).unwrap();
+        match cli.command {
+            Command::Show { device, .. } => assert_eq!(device.as_deref(), Some("enp0s31f6")),
+            _ => panic!("expected Show"),
+        }
+    }
+
+    #[test]
     fn apply_with_profile_overrides_default() {
         let cli = Cli::try_parse_from(["vlanctl", "apply", "lum_legacy", "--dry-run"]).unwrap();
         match cli.command {
-            Command::Apply { profile, dry_run } => {
+            Command::Apply {
+                profile, dry_run, ..
+            } => {
                 assert_eq!(profile, "lum_legacy");
                 assert!(dry_run);
             }

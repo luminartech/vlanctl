@@ -23,8 +23,10 @@ What it already has, and we therefore do not build:
   `fail_at` hook for exercising rollback.
 - `plan.rs`, which turns a profile into an ordered `Vec<Cmd>`; `state.rs`
   tracking the active profile; `device.rs` / `commands.rs` reading host state.
-- Working profiles for real hardware: `lum` (Iris), `lum_legacy`, `halo`,
-  `setup`.
+- Working profiles for real hardware: `lum` (Iris), `lum_legacy`, `halo`.
+  (A fourth, `setup`, was deleted 2026-09-10: it was an unfinished copy of
+  `lum_legacy` whose `name` field still said `lum_legacy`, so applying it
+  recorded state under the wrong profile.)
 - **`docs/vlan-sensor-reachability.md`** — the best account of this problem
   anywhere, and the source of most of §2.1 and §8 below.
 

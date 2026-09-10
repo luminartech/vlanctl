@@ -80,15 +80,18 @@ fn main() -> Result<()> {
                 println!("{name}");
             }
         }
-        Command::Show { profile } => {
+        Command::Show { profile, device } => {
             let p = Profile::load(&profile_path(&cli.profiles_dir, &profile))?;
             // Resolve the device against the live system; `ifconfig -l` is a
             // read-only query, so this has no side effects.
             let mut probe = SystemRunner;
             // Resolved through the SAME reference platform the preview renders
             // with, so the device it picks and the commands it prints agree.
-            let device =
-                device::resolve_device(plan::preview_platform(), &mut probe, p.device.as_deref())?;
+            let device = device::resolve_device(
+                plan::preview_platform(),
+                &mut probe,
+                device.as_deref().or(p.device.as_deref()),
+            )?;
             // A preview renders through the fixed reference platform, not
             // `host_platform()`: like `apply --dry-run`/`down --dry-run`
             // below, it touches no real system and must keep working on any
@@ -102,7 +105,11 @@ fn main() -> Result<()> {
             Profile::load(&profile_path(&cli.profiles_dir, &profile))?;
             println!("{profile}: ok");
         }
-        Command::Apply { profile, dry_run } => {
+        Command::Apply {
+            profile,
+            dry_run,
+            device,
+        } => {
             let p = Profile::load(&profile_path(&cli.profiles_dir, &profile))?;
             if dry_run {
                 // A dry run touches no real system and seeds its own
@@ -118,13 +125,27 @@ fn main() -> Result<()> {
                 runner
                     .stdout
                     .insert("ifconfig -l".to_string(), "lo0 en0".to_string());
-                commands::apply(&mut runner, plan::preview_platform(), &p, &state_path, true)?;
+                commands::apply(
+                    &mut runner,
+                    plan::preview_platform(),
+                    &p,
+                    device.as_deref(),
+                    &state_path,
+                    true,
+                )?;
                 print_planned_commands(&runner);
             } else {
                 require_root()?;
                 let platform = plan::host_platform()?;
                 let mut runner = SystemRunner;
-                let created = commands::apply(&mut runner, &*platform, &p, &state_path, false)?;
+                let created = commands::apply(
+                    &mut runner,
+                    &*platform,
+                    &p,
+                    device.as_deref(),
+                    &state_path,
+                    false,
+                )?;
                 println!("applied '{}': {}", p.name, created.join(", "));
             }
         }

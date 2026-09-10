@@ -1388,7 +1388,7 @@ mod tests {
         let mut r = RecordingRunner::default();
         r.stdout
             .insert("contrarian-list".to_owned(), "lo0 eth0 eth0.11".to_owned());
-        let err = crate::commands::apply(&mut r, &Contrarian, &p, &state_path, true)
+        let err = crate::commands::apply(&mut r, &Contrarian, &p, None, &state_path, true)
             .expect_err("the platform's own interface name must be refused");
         assert!(
             err.to_string().contains("eth0.11 already exists"),
@@ -1400,7 +1400,7 @@ mod tests {
         let mut r = RecordingRunner::default();
         r.stdout
             .insert("contrarian-list".to_owned(), "lo0 eth0 vlan11".to_owned());
-        crate::commands::apply(&mut r, &Contrarian, &p, &state_path, true)
+        crate::commands::apply(&mut r, &Contrarian, &p, None, &state_path, true)
             .expect("a foreign naming scheme's interface is not a collision");
     }
 

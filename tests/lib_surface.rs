@@ -52,8 +52,17 @@ fn readme_library_use_snippet_applies_a_profile_through_a_recording_runner() {
     let _ = std::fs::remove_file(&state_path);
 
     let mut runner = RecordingRunner::default(); // or SystemRunner to execute
-    commands::apply(&mut runner, &MacOs, &profile, &state_path, true)
-        .expect("dry-run apply of the README's own example profile");
+    // A device override, exactly as the README shows: profiles no longer pin
+    // one, and a `RecordingRunner` has no live system to auto-detect against.
+    commands::apply(
+        &mut runner,
+        &MacOs,
+        &profile,
+        Some("en7"),
+        &state_path,
+        true,
+    )
+    .expect("dry-run apply of the README's own example profile");
     assert!(
         !runner.commands.is_empty(),
         "the README snippet's apply call should have recorded some commands"

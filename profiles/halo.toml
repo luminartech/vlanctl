@@ -9,6 +9,12 @@ address = "192.168.1.100/24"
 
   # Data sensor — out of the host's /24, reached via an on-link route + static
   # ARP (the sensor doesn't answer ARP; macOS would otherwise self-MAC it).
+  #
+  # BENCH-SPECIFIC VALUE: the `mac` below is one particular Halo unit's
+  # address. A static ARP entry has to name a real MAC, so there is no sensible
+  # default — replace it with your own sensor's. (EnVision's derived-profile
+  # path reads the real MAC off the wire, so this only matters for
+  # hand-authored profiles.)
   [[interface.route]]
   destination = "192.168.10.151/32"
   mac = "3a:42:f7:79:32:2e"
