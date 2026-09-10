@@ -515,10 +515,25 @@ Cheapest platform, and the one whose routing model actually suits the problem.
   capabilities (`prctl(PR_CAP_AMBIENT_RAISE)`). This matters because
   vlanctl's entire model is shelling out through `Cmd`/`SystemRunner`. So the
   Linux backend must either use **rtnetlink in-process** or raise ambient caps
-  before spawning; the design must pick one, and picking `ip` without ambient
-  caps means a prompt after all. Note also the capability exists only on
-  `.deb`-installed builds or after the first-run `pkexec setcap` flow — a
-  `cargo run` build has none.
+  before spawning. Note also the capability exists only on `.deb`-installed
+  builds or after the first-run `pkexec setcap` flow — a `cargo run` build has
+  none.
+- **RESOLVED (2026-09-10, measured): shell out, with an ambient-cap raise
+  before spawn.** rtnetlink is not needed, so vlanctl's `Vec<Cmd>` contract
+  stands and dry-run/`show` keep working for Linux. What the measurement
+  added, and it is the part that is easy to get wrong: `PR_CAP_AMBIENT_RAISE`
+  needs the capability in the process's **permitted and inheritable** sets,
+  and `setcap cap_net_admin=eip` only sets the *file's* inheritable bit, which
+  on exec feeds the permitted set alone. The process's own inheritable set is
+  whatever the parent shell had — empty. So the raise fails outright unless
+  `capset` adds `CAP_NET_ADMIN` to pI first (allowed without `CAP_SETPCAP`,
+  since pI' may be any subset of `pI | pP` and pP already holds it). Measured
+  pI `0x0` → `0x1000`, after which `ip link add … type vlan` succeeds
+  unprivileged. The sequence is **capset(pI) → PR_CAP_AMBIENT_RAISE → spawn**,
+  and it belongs to the *consuming process* (EnVision's own startup), not to
+  the `Platform` impl, which only emits commands.
+  Still unconfirmed: the capabilities actually present on a shipped `.deb`
+  build — the spike host had no installed `envision` to run `getcap` against.
 - **`ip route add X/32 dev Y` works as intended** — the destination becomes
   genuinely on-link and the kernel ARPs. This is the answer to §2.1's
   shared-subnet problem, and it is why `Platform::wants_onlink_host_route`
