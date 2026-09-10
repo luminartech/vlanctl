@@ -23,8 +23,8 @@ depends on `clap` or on any CLI type.
 A `Platform` trait (`src/plan.rs`) now owns the interface-naming convention
 and the ordered commands to bring an interface up or tear it down. Each
 implementation supplies its own syntax for those: `MacOs` renders `ifconfig
-vlan10 create` / `vlan 10 vlandev en7`; a future Linux backend would render
-its own `ip link add ...` instead.
+vlan10 create` / `vlan 10 vlandev en7`; `Linux` renders its own
+`ip link add ...` instead.
 
 Route and static-ARP command syntax **is** behind this seam, as of
 `Platform::route_commands`. It was not originally: `append_route_commands`
@@ -65,8 +65,9 @@ stack, and only the platform backend knows which effect is correct.
 The trait also declares four host-state readers: `list_devices`,
 `addresses_on`, `is_wireless`, and `link_is_active`. On macOS they parse the
 output of `ifconfig` and `networksetup -listallhardwareports`, tools with no
-Linux or Windows equivalent, so each backend will need its own parser rather
-than a name that happens to compile against another OS's tools.
+Linux or Windows equivalent, so each backend needs its own parser rather
+than a name that happens to compile against another OS's tools. `Linux`
+supplies all four (`ip -json`, `/sys/class/net`); Windows does not yet.
 
 None of the four has a production caller yet, though. `apply`, `down`,
 `status`, and `resolve_device` still call the macOS parsers in `commands`
@@ -111,11 +112,11 @@ ensure the process has whatever privilege the underlying OS calls demand,
 and the CLI's `require_root` is simply the check appropriate to *that*
 caller.
 
-## Linux and Windows backends are the expected next steps
+## Windows is the remaining backend
 
-This work adds the seam, not the additional backends. A Linux `Platform`
-implementation and a Windows `Platform` implementation are the anticipated
-next pieces of work.
+The work that added this seam did not add the backends. A `Linux`
+implementation has since landed on `feat/1b-linux-backend`; a Windows
+`Platform` implementation is the remaining piece.
 
 **The seam is not yet complete.** Anyone writing a backend should read this
 list first; an earlier draft of this document claimed there were only two
