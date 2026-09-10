@@ -75,7 +75,35 @@ product** — vlanctl's `halo.toml` puts the untagged data path on host
 `192.168.1.100/24` with the sensor *out of subnet* at `192.168.10.151`. Confirm
 addresses from the device, never from this table.
 
-### 2.0 UNRESOLVED CONTRADICTION: is the datapath actually untagged?
+### 2.0 RESOLVED (2026-09-10): the datapath is TAGGED VLAN 11
+
+**Measured, not reasoned.** 20s of `tcpdump -e` on the parent NIC with **no VLAN
+sub-interfaces present** and **rx-vlan offload confirmed off**: 222,116 datapath
+frames (udp 4370/4371), **every one of them tagged `vlan 11`, zero untagged.**
+SOME/IP-SD (30490) likewise: 60 frames, all `vlan 11`. The frame:
+
+    02:00:00:00:00:02 > cc:96:e5:bb:51:1f, ethertype 802.1Q (0x8100):
+      vlan 11, p 0, IPv4, 192.168.11.151.4371 > 192.168.11.87.4370: UDP, length 1360
+
+So **`iris_config` was right and this document's prose was wrong.** The offload
+state was verified before and after (`on` -> `off`, restored afterwards) because a
+zero-untagged reading proves nothing if the NIC is stripping tags — which is
+exactly how the question became confused in the first place. Both `vlan 11` and an
+unrelated corporate `vlan 540` were visible in the same capture, so the path
+demonstrably preserved tags.
+
+Sensor provenance, stated precisely: a **freshly flashed default-config** Iris, not
+a factory-sealed one. Materially better than the reprovisioned `.102` that could
+not answer this, and sufficient — but if a factory-sealed unit ever disagrees, this
+is the measurement to re-take. Full detail:
+`.superpowers/sdd/2026-09-09-vlanctl-1b-binding-spike-and-linux-backend/task-2-report.md`.
+
+**Consequence: §6.3's `NativeVlanId 0` is no longer load-bearing.** See §6.3.
+
+Telnet is still unmeasured — zero frames on tcp 23 during the capture, and the Halo
+untagged-vs-VLAN-12 discrepancy below is untouched.
+
+#### The contradiction as originally recorded
 
 Flagged 2026-09-09 by adversarial review and verified against the code.
 `iris_config` says one VLAN id governs **both** paths on EthIf1:
@@ -127,7 +155,8 @@ is an easy and consequential mistake.
 
 Confirmed by the user 2026-09-08: **these are the shipping defaults** —
 SOME/IP on VLAN 11, DoIP on VLAN 10, Telnet on VLAN 12 for Iris (untagged for
-Halo), and the **point cloud is always untagged**. So the tagged case is the
+Halo), and the point cloud was believed to be **always untagged** — which §2.0
+disproves: it is tagged VLAN 11. So the tagged case is the
 normal case, and the tagging of a path is *platform*-dependent as well as
 config-dependent.
 
@@ -392,12 +421,21 @@ knowingly.
 
 ### 6.3 Topology, and why the trunk vNIC matters
 
-Naive access-only topology has a hole: the datapath is **untagged** (§2), and
-an external vSwitch with only access-mode vNICs has no port to deliver untagged
-frames to, so **the point cloud would be dropped.**
+**REVISED 2026-09-10 — the premise of this section was measured false.** It was
+written on the belief that the datapath is untagged, so an access-only vSwitch
+would have no port to deliver untagged frames to and the point cloud would be
+dropped. §2.0 measured the datapath as **tagged VLAN 11**, which the
+`IrisVlan11` access vNIC already receives. **The hole this section exists to
+close does not exist**, and `NativeVlanId 0` specifically is unnecessary.
 
-Resolved by a trunk vNIC with `NativeVlanId 0`, which receives untagged traffic
-*and* all allowed tagged VLANs:
+What is NOT settled by that: whether a trunk vNIC is still wanted as a single
+**capture** port, so EnVision can see the datapath, SOME/IP and DoIP together
+rather than reading three access vNICs. That is a convenience-versus-complexity
+choice, not the forced consequence the untagged premise made it, and it should be
+decided deliberately before Phase 3. If the trunk survives for capture, it no
+longer needs a native VLAN.
+
+The original topology, kept for that decision:
 
 | vNIC | Mode | Purpose |
 |---|---|---|
@@ -664,8 +702,11 @@ early is cheap insurance against building the expensive version.
 
 1. **Sensors ship tagged** — SOME/IP VLAN 11, DoIP VLAN 10. The tagged case is
    the normal case; the Windows work is required, not optional.
-2. **The point cloud is always untagged.** Makes the trunk vNIC's
-   `NativeVlanId 0` load-bearing on Windows.
+2. ~~**The point cloud is always untagged.**~~ **WITHDRAWN 2026-09-10 — measured
+   false (§2.0).** The point cloud is tagged VLAN 11, so the trunk vNIC's
+   `NativeVlanId 0` is NOT load-bearing. Kept struck through rather than deleted:
+   it was a stated user requirement and drove the Windows topology, so a reader of
+   §6.3 needs to know it was retired by measurement.
 3. **Telnet is VLAN 12 on Iris, untagged on Halo.** Platform-dependent, so the
    platform→VLAN mapping is data, not branches.
 4. **Windows Home is out of scope.** Pro or better is a documented requirement.
