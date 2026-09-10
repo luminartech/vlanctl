@@ -201,6 +201,12 @@ impl Platform for Linux {
         let mut cmds = Vec::new();
         if let Some(id) = interface.vlan {
             let id = id.to_string();
+            // Raise the parent before adding anything on it, as the recipe
+            // does. A NIC left admin-down after boot would otherwise leave
+            // every sub-interface LOWERLAYERDOWN while every command
+            // succeeds. `ip link set ... up` is idempotent, so repeating it
+            // per tagged entry is harmless.
+            cmds.push(Cmd::new("ip", &["link", "set", device, "up"]));
             cmds.push(Cmd::new(
                 "ip",
                 &[
@@ -276,19 +282,28 @@ impl Platform for Linux {
 
     fn is_wireless(&self, runner: &mut dyn CommandRunner, device: &str) -> Result<bool> {
         // `/sys/class/net/<dev>/wireless` exists only for wireless devices.
-        let out = runner.run(&Cmd::new(
-            "test",
-            &["-d", &format!("/sys/class/net/{device}/wireless")],
-        ));
-        Ok(out.is_ok())
+        // Look for it in a directory listing rather than encoding the answer
+        // in an exit status (`test -d`): a runner that answers every command
+        // with empty output — a dry run, an unmapped stub — then reports
+        // wired, the safe default, instead of turning every NIC wireless. A
+        // listing that fails outright (no such device) is still an error.
+        let out = runner.run(&Cmd::new("ls", &[&format!("/sys/class/net/{device}")]))?;
+        Ok(out.split_whitespace().any(|entry| entry == "wireless"))
     }
 
     fn link_is_active(&self, runner: &mut dyn CommandRunner, device: &str) -> Result<bool> {
+        // `carrier` is the recipe's proven signal (`cat carrier 2>/dev/null
+        // || echo 0`). The kernel answers EINVAL for it while the interface
+        // is admin-down, so the read fails; that is the answer "no link",
+        // not a failure to answer. `operstate` would always be readable but
+        // reports `unknown` for drivers that do not maintain it, which
+        // would misfile a live NIC as inactive — so keep carrier and treat
+        // an unreadable one as down.
         let out = runner.run(&Cmd::new(
             "cat",
             &[&format!("/sys/class/net/{device}/carrier")],
-        ))?;
-        Ok(out.trim() == "1")
+        ));
+        Ok(out.is_ok_and(|s| s.trim() == "1"))
     }
 
     fn records_created_interface(&self, cmd: &Cmd) -> bool {
@@ -1147,7 +1162,11 @@ mod tests {
     }
 
     #[test]
-    fn linux_tagged_bringup_is_add_then_up_then_address() {
+    fn linux_tagged_bringup_raises_the_parent_then_adds_ups_and_addresses() {
+        // The parent must come up first, as the proven recipe does: on a
+        // host whose NIC sits admin-down after boot, sub-interfaces created
+        // on it are set up successfully yet stay LOWERLAYERDOWN — every
+        // command succeeds and nothing works.
         let i = Interface {
             vlan: Some(11),
             address: "192.168.11.87/24".parse().unwrap(),
@@ -1162,6 +1181,7 @@ mod tests {
         assert_eq!(
             rendered,
             vec![
+                "ip link set eth0 up",
                 "ip link add link eth0 name eth0.11 type vlan id 11",
                 "ip link set eth0.11 up",
                 "ip addr add 192.168.11.87/24 dev eth0.11",
@@ -1235,6 +1255,72 @@ mod tests {
             "ip",
             &["addr", "add", "192.168.11.87/24", "dev", "eth0.11"]
         )));
+        // Raising the parent creates nothing, so it must not be recorded —
+        // otherwise rollback would `ip link del` the physical NIC.
+        assert!(!Linux.records_created_interface(&Cmd::new("ip", &["link", "set", "eth0", "up"])));
+    }
+
+    #[test]
+    fn linux_link_is_active_reads_carrier() {
+        let mut r = RecordingRunner::default();
+        r.stdout.insert(
+            "cat /sys/class/net/eth0/carrier".to_string(),
+            "1\n".to_string(),
+        );
+        r.stdout.insert(
+            "cat /sys/class/net/eth1/carrier".to_string(),
+            "0\n".to_string(),
+        );
+        assert!(Linux.link_is_active(&mut r, "eth0").unwrap());
+        assert!(!Linux.link_is_active(&mut r, "eth1").unwrap());
+    }
+
+    #[test]
+    fn linux_link_is_active_treats_an_unreadable_carrier_as_down() {
+        // The kernel answers EINVAL for `carrier` on an admin-down
+        // interface, so `cat` exits non-zero and the runner reports an
+        // error. That is the answer "no link", not a failure to answer;
+        // propagating it would abort device detection on any host with an
+        // idle NIC.
+        let mut r = RecordingRunner {
+            fail_at: Some(0),
+            ..Default::default()
+        };
+        assert!(
+            !Linux
+                .link_is_active(&mut r, "eth0")
+                .expect("an unreadable carrier is not an error"),
+        );
+        assert_eq!(
+            r.commands.len(),
+            1,
+            "the failed read must have been attempted"
+        );
+    }
+
+    #[test]
+    fn linux_is_wireless_looks_for_the_wireless_sysfs_entry() {
+        let mut r = RecordingRunner::default();
+        r.stdout.insert(
+            "ls /sys/class/net/wlan0".to_string(),
+            "address\ncarrier\nphy80211\nwireless\n".to_string(),
+        );
+        r.stdout.insert(
+            "ls /sys/class/net/eth0".to_string(),
+            "address\ncarrier\ndevice\n".to_string(),
+        );
+        assert!(Linux.is_wireless(&mut r, "wlan0").unwrap());
+        assert!(!Linux.is_wireless(&mut r, "eth0").unwrap());
+    }
+
+    #[test]
+    fn linux_is_wireless_defaults_to_wired_for_an_unstubbed_device() {
+        // The answer comes from the listing's contents, not from whether the
+        // command succeeded: a runner that answers every command with empty
+        // output (a dry run, an unmapped stub) must not turn every NIC
+        // wireless.
+        let mut r = RecordingRunner::default();
+        assert!(!Linux.is_wireless(&mut r, "eth0").unwrap());
     }
 
     #[test]
