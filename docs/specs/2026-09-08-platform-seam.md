@@ -136,9 +136,13 @@ This work adds the seam, not the additional backends. A Linux `Platform`
 implementation and a Windows `Platform` implementation are the anticipated
 next pieces of work.
 
-**The seam is not yet complete, and two of the remaining gaps fail
-silently.** Anyone writing a backend should read this list first; an earlier
-draft of this document claimed there were only two gaps, which was wrong.
+**The seam is not yet complete.** Anyone writing a backend should read this
+list first; an earlier draft of this document claimed there were only two
+gaps, which was wrong. Gaps are kept numbered as first published — a closed
+one is marked CLOSED rather than removed, both because the reasoning is what
+a Windows backend author needs and because other documents cite these
+numbers. As of the Linux backend (`feat/1b-linux-backend`), the two SILENT
+gaps (3) and (4) are closed and a new one (7) is open.
 
 1. **Route and ARP syntax is still shared and BSD-shaped.** `Platform`
    delegates the *decision* (`wants_onlink_host_route`) but not the syntax:
@@ -150,39 +154,65 @@ draft of this document claimed there were only two gaps, which was wrong.
 2. **The four host-state methods are declared but unconsumed.**
    `apply`/`down`/`status`/`resolve_device` still call the macOS parsers
    directly.
-3. **SILENT: `apply` decides what to record by matching `ifconfig`
-   argument shape.** In `commands.rs`, a created interface is recorded only
-   when the emitted command's second argument is literally `create`. Under a
-   Linux-shaped `ip link add link eth0 name eth0.11 type vlan id 11`, that
-   argument is `link`, so **nothing is recorded: rollback destroys nothing,
-   the state file stays empty, and `down` becomes a no-op.** A backend that
-   does not emit `ifconfig … create` must change this test, or it silently
-   loses teardown and rollback entirely.
-4. **SILENT: the pre-apply collision guard hardcodes the macOS interface
-   name.** `interface_names()` builds `format!("vlan{id}")` independently of
-   `Platform::iface_name`. With a backend naming interfaces `eth0.11`, the
-   guard looks for `vlan11`, never matches, and **never fires** — so `apply`
-   will not refuse to touch a pre-existing interface it did not create.
+3. **CLOSED. Was SILENT: `apply` decided what to record by matching
+   `ifconfig` argument shape.** A created interface was recorded only when
+   the emitted command's second argument was literally `create`. Under a
+   Linux-shaped `ip link add link eth0 name eth0.11 type vlan id 11` that
+   argument is `link`, so nothing was recorded: rollback destroyed nothing,
+   the state file stayed empty, and `down` became a no-op.
+   Now `Platform::records_created_interface(&Cmd) -> bool`, so each backend
+   declares which of its own commands is the creating one.
+4. **CLOSED. Was SILENT: the pre-apply collision guard hardcoded the macOS
+   interface name.** `interface_names()` built `format!("vlan{id}")`
+   independently of `Platform::iface_name`, so with a backend naming
+   interfaces `eth0.11` the guard looked for `vlan11`, never matched, and
+   never fired — `apply` would not refuse to touch a pre-existing interface
+   it did not create.
+   Now `apply` builds the guard list itself, from the tagged entries mapped
+   through `platform.iface_name(i, &device)` on the **resolved** device it
+   already holds. Deliberately *not* a trait method: a second naming entry
+   point is the thing that caused this bug, so guard/bring-up agreement is
+   structural rather than comment-enforced. `plan::interface_names` survives
+   only as `#[cfg(test)]`, documented as macOS's naming and not to be used
+   for a guard.
 5. **Device candidate selection is macOS-shaped.** `resolve_device` filters
    candidates by an `en`-prefixed name, which is not a parser and so is not
    covered by the host-state methods above.
 6. Minor: the CLI's read-only-probe classification and its dry-run
    `ifconfig -l` seed are macOS-specific and sit outside `Platform`.
+7. **NEW, and now user-visible: preview and apply disagree on Linux.**
+   `preview_platform()` is fixed at `MacOs` while `host_platform()` resolves
+   `Linux`, so on a Linux host `vlanctl apply lum --dry-run` prints
+   `ifconfig vlan10 create …` while the real `apply` would run `ip link add
+   …`. Verified on this branch. It was harmless while no non-macOS backend
+   existed; it is not now. The repoint is not a one-liner — the two return
+   different shapes (`&'static dyn Platform` vs `Result<Box<dyn Platform>>`)
+   — which is why it was deferred rather than folded into the backend.
+   Related: (2) leaves `apply`/`down` calling `ifconfig -l` through
+   `commands::live_interfaces`, so a real `apply` on Linux fails loudly on
+   that call before mutating anything.
 
-Once (1)-(4) at least are closed, each backend supplies its own
+Once (1) and (2) are closed, each backend supplies its own
 interface/route command syntax, its own answers to
 `wants_onlink_host_route` and `reverts_parent_config`, and its own
 host-state parsing, exactly as `MacOs` does today.
 
 `host_platform()` (`src/plan.rs`) is the single place a binary selects a
-`Platform` for a **real, mutating** operation (`apply`/`down`); it currently
-returns `MacOs` on macOS and returns an `Err` — never a panic — everywhere
-else, which is what a new backend needs to change to bring that platform
-online. Rendering a **preview** (`show`, `apply --dry-run`, `down
---dry-run`) goes through the separate `preview_platform()` instead, which
-always succeeds: a preview touches no real system and must keep working on
-any host even before a real backend exists for it, so it is not gated on
-host detection the way a mutating operation is.
+`Platform` for a **real, mutating** operation (`apply`/`down`); it returns
+`MacOs` on macOS, `Linux` on Linux, and an `Err` — never a panic —
+everywhere else. Adding an arm there is what brings a new platform online.
+
+Rendering a **preview** (`show`, `apply --dry-run`, `down --dry-run`) goes
+through the separate `preview_platform()` instead, which always succeeds so
+that a preview keeps working on any host even before a real backend exists
+for it. Two caveats, both of which an earlier draft of this document got
+wrong by asserting that a preview touches no real system:
+
+- `show` runs `resolve_device` against a **real** runner, so a preview does
+  read host state even though it mutates nothing.
+- Because `preview_platform()` is still fixed at `MacOs`, a preview no
+  longer agrees with the apply it is previewing on any host with a backend
+  of its own. See gap (7).
 
 ## Cross-reference
 
@@ -191,4 +221,6 @@ adopted as the foundation for cross-platform host network autoconfiguration
 rather than reimplemented, and the fuller rationale behind treating
 `wants_onlink_host_route` as a decision rather than as syntax — lives at
 `docs/superpowers/specs/2026-09-08-cross-platform-host-network-autoconfig-design.md`
-in the `dft` repository, §0 and §4.3.1.
+**in this repository**, §0 and §4.3.1. (It was authored in the `dft` repo,
+where that path is git-ignored; the copy here is the tracked one, and §4.3.1
+is also where the Linux IFNAMSIZ naming rule is recorded.)
