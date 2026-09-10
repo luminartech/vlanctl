@@ -199,6 +199,17 @@ impl Platform for MacOs {
 /// the terminating NUL.
 const LINUX_IFNAMSIZ_MAX: usize = 15;
 
+/// Widest a VLAN id's decimal form can be, per the `1..=4094` range
+/// `Profile::validate` enforces (`src/config.rs`).
+const LINUX_MAX_VLAN_ID_DIGITS: usize = 4;
+
+/// Longest parent device name for which `<parent>.<id>` fits
+/// [`LINUX_IFNAMSIZ_MAX`] for *every* valid VLAN id, not just the one at
+/// hand: the widest suffix is `.` plus [`LINUX_MAX_VLAN_ID_DIGITS`] digits
+/// (`.4094`, 5 bytes), so `15 - 5 = 10`. Naming must be decided from this
+/// worst case — see [`Linux::iface_name`] for why.
+const LINUX_MAX_DOTTED_PARENT_LEN: usize = LINUX_IFNAMSIZ_MAX - 1 - LINUX_MAX_VLAN_ID_DIGITS;
+
 /// Linux. Commands mirror the recipe already proven on this hardware by the
 /// `ip`-based bring-up script this crate's shell-out approach replaces.
 pub struct Linux;
@@ -211,10 +222,22 @@ impl Platform for Linux {
     fn iface_name(&self, interface: &Interface, device: &str) -> String {
         match interface.vlan {
             Some(id) => {
-                // 8021q convention: `<parent>.<id>` — when it fits. The
-                // kernel caps a name at `IFNAMSIZ - 1` (15) bytes, and a
-                // predictable USB NIC name (`enx` + 12 MAC hex digits) is
-                // already 15, so `ip link add` would reject any suffix on it.
+                // 8021q convention: `<parent>.<id>` — when the *parent*
+                // fits, using the widest possible suffix
+                // ([`LINUX_MAX_DOTTED_PARENT_LEN`]) rather than this
+                // interface's own id. The kernel caps a name at
+                // `IFNAMSIZ - 1` (15) bytes, and a predictable USB NIC name
+                // (`enx` + 12 MAC hex digits) is already 15, so `ip link
+                // add` would reject any suffix on it.
+                //
+                // Deciding per-interface (by this id's own width) instead
+                // of per-parent would let one profile mix naming schemes on
+                // one NIC: an 11-byte parent fits `<parent>.999` (15 bytes)
+                // but overflows at `<parent>.4094` (16 bytes), so id 999
+                // would get a dotted name and id 4094 would get the
+                // fallback on the very same device — confusing to read in
+                // `ip link` output. Deciding from the parent alone keeps
+                // naming consistent across every interface in a profile.
                 //
                 // Overflow falls back to `vlan<id>` rather than truncating
                 // the parent: in an `enx` name the trailing hex digits are
@@ -225,9 +248,8 @@ impl Platform for Linux {
                 // parent), it is the name the proven `ip`-based recipe and
                 // macOS both use, and `vlan4094` is 8 bytes, so it always
                 // fits.
-                let dotted = format!("{device}.{id}");
-                if dotted.len() <= LINUX_IFNAMSIZ_MAX {
-                    dotted
+                if device.len() <= LINUX_MAX_DOTTED_PARENT_LEN {
+                    format!("{device}.{id}")
                 } else {
                     format!("vlan{id}")
                 }
@@ -1226,16 +1248,26 @@ mod tests {
         assert_eq!(Linux.iface_name(&untagged, "eth0"), "eth0");
     }
 
-    /// `<parent>.<id>` is kept only while it fits in the kernel's 15-byte
-    /// limit; past that the name falls back to `vlan<id>`. A predictable
-    /// USB NIC name (`enx` + 12 hex digits) is exactly 15 bytes, so every
-    /// suffix on it overflows, whatever the id's width.
+    /// `<parent>.<id>` is kept only while the *parent* fits
+    /// [`LINUX_MAX_DOTTED_PARENT_LEN`] (10 bytes: the kernel's 15-byte
+    /// `IFNAMSIZ` limit less the widest possible suffix, `.4094`); past
+    /// that the name falls back to `vlan<id>`. The decision depends only on
+    /// the parent's length, never on this interface's own id, so every
+    /// VLAN configured on one parent gets the same naming scheme.
     #[test]
     fn linux_falls_back_to_vlan_id_when_the_dotted_name_would_overflow_ifnamsiz() {
-        let parent15 = "enx001122334455";
-        assert_eq!(parent15.len(), 15);
+        // A short parent is always dotted, whatever the id's width.
+        assert_eq!(
+            Linux.iface_name(&tagged(11, "10.0.0.1/24"), "eth0"),
+            "eth0.11"
+        );
+        assert_eq!(
+            Linux.iface_name(&tagged(4094, "10.0.0.1/24"), "eth0"),
+            "eth0.4094"
+        );
 
-        // Fits exactly: 10-byte parent + ".4094" = 15.
+        // Exactly at the boundary: a 10-byte parent + the widest suffix
+        // (".4094") is 15 bytes, which still fits.
         let parent10 = "enp0s31f6a";
         assert_eq!(parent10.len(), 10);
         assert_eq!(
@@ -1247,20 +1279,25 @@ mod tests {
             "enp0s31f6a.1"
         );
 
-        // One byte over the boundary: 11-byte parent + ".4094" = 16.
+        // One byte over the boundary: an 11-byte parent falls back for
+        // *every* id, including a short one that would itself have fit
+        // (`enp0s31f6ab.999` is only 15 bytes). This is the case the old
+        // per-interface rule got wrong, mixing schemes on one parent; the
+        // new rule keeps both ids on the same scheme.
         let parent11 = "enp0s31f6ab";
         assert_eq!(parent11.len(), 11);
-        assert_eq!(
-            Linux.iface_name(&tagged(4094, "10.0.0.1/24"), parent11),
-            "vlan4094"
-        );
-        // The same parent still fits a shorter id.
-        assert_eq!(
-            Linux.iface_name(&tagged(999, "10.0.0.1/24"), parent11),
-            "enp0s31f6ab.999"
-        );
+        let short_id_name = Linux.iface_name(&tagged(999, "10.0.0.1/24"), parent11);
+        let max_id_name = Linux.iface_name(&tagged(4094, "10.0.0.1/24"), parent11);
+        assert_eq!(short_id_name, "vlan999");
+        assert_eq!(max_id_name, "vlan4094");
+        // Same scheme: both fall back, neither is dotted with the parent.
+        assert!(!short_id_name.starts_with(parent11));
+        assert!(!max_id_name.starts_with(parent11));
+        assert!(short_id_name.starts_with("vlan") && max_id_name.starts_with("vlan"));
 
-        // A 15-byte parent overflows at both id-width extremes.
+        // A 15-byte `enx`-style parent overflows at both id-width extremes.
+        let parent15 = "enx001122334455";
+        assert_eq!(parent15.len(), 15);
         assert_eq!(
             Linux.iface_name(&tagged(1, "10.0.0.1/24"), parent15),
             "vlan1"
