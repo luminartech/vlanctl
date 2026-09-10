@@ -24,18 +24,13 @@ use ipnet::IpNet;
 /// surface (a wrong parser there silently picks the wrong NIC), not a
 /// byproduct of declaring the trait.
 ///
-/// Route and static-ARP command **syntax** is a separate limitation this
-/// trait does not yet cover: `append_route_commands` and
-/// `interface_route_command` below build `route add ...`/`arp -s ...`
-/// commands directly, in shared code, for every `Platform`. Only the
-/// *decision* of whether to emit a host route is delegated
-/// ([`Platform::wants_onlink_host_route`]); the syntax itself is BSD/macOS
-/// shaped and not overridable per platform. A non-BSD backend (Linux's `ip
-/// route`, for instance) will need a per-platform route-emission hook added
-/// to this trait before it can render correct commands — see
-/// `route_syntax_is_currently_shared_and_bsd_shaped_a_known_limitation` in
-/// this module's tests, which pins the current behavior so a future change
-/// here is a deliberate test edit rather than silent drift.
+/// Route and static-ARP command **syntax** is behind this seam as of
+/// [`Platform::route_commands`]. It previously was not: shared code built
+/// BSD `route add ...`/`arp -s ...` for every platform and delegated only
+/// the *decision* of whether to emit a host route, so a non-BSD backend
+/// rendered unusable commands. The decision-only hook it replaced
+/// (`wants_onlink_host_route`) could express *whether* to route but not
+/// *how*.
 pub trait Platform {
     /// Short identifier for logs and error messages, e.g. `"macos"`.
     fn name(&self) -> &'static str;
@@ -52,24 +47,30 @@ pub trait Platform {
     fn iface_name(&self, interface: &Interface, device: &str) -> String;
 
     /// Ordered commands to bring one interface up: interface creation,
-    /// address, and MTU. Route emission is shared logic that lives in
-    /// [`bringup_commands_for`], gated on [`Platform::wants_onlink_host_route`],
-    /// so implementations must not include routes here.
+    /// address, and MTU. Routes are a separate concern
+    /// ([`Platform::route_commands`], appended by [`bringup_commands_for`]),
+    /// so implementations must not include them here.
     fn bringup_commands(&self, interface: &Interface, device: &str) -> Vec<Cmd>;
 
     /// Commands to tear one interface down.
     fn teardown_commands(&self, iface: &str) -> Vec<Cmd>;
 
-    /// Whether a **gatewayless** route should emit an interface-scoped host
-    /// route when the destination is `in_subnet`.
+    /// Ordered commands for ONE route on `iface`, including any static-ARP
+    /// entry — both the decision of what to emit and the syntax to emit it
+    /// in. `in_subnet` is true when the destination falls inside `iface`'s
+    /// own connected subnet, which [`bringup_commands_for`] computes.
     ///
-    /// macOS answers `false` for an in-subnet destination: an
-    /// interface-scoped host route there installs a self-MAC LLINFO entry
-    /// and black-holes the traffic, so the connected route must be left to
-    /// resolve it. Linux answers `true` — `ip route add X/32 dev Y` makes the
-    /// destination genuinely on-link, and it is the only way to reach
-    /// several hosts that share one subnet across different VLANs.
-    fn wants_onlink_host_route(&self, in_subnet: bool) -> bool;
+    /// The platforms genuinely disagree here, which is why this is behind
+    /// the seam rather than shared. For a *gatewayless in-subnet*
+    /// destination macOS must emit **no** route: an interface-scoped host
+    /// route there installs a permanent self-MAC LLINFO entry and
+    /// black-holes the traffic, so the connected route has to resolve it.
+    /// Linux emits one regardless — `ip route add X/32 dev Y` makes the
+    /// destination genuinely on-link and the kernel ARPs for it, which is
+    /// the only way to reach several hosts sharing one subnet across
+    /// different VLANs. The command vocabulary differs too: BSD
+    /// `route`/`arp` against Linux `ip route`/`ip neigh`.
+    fn route_commands(&self, route: &Route, in_subnet: bool, iface: &str) -> Vec<Cmd>;
 
     /// Whether teardown may revert configuration applied to the **parent**
     /// device (as opposed to a VLAN sub-interface it created).
@@ -152,11 +153,35 @@ impl Platform for MacOs {
         teardown_commands(iface)
     }
 
-    fn wants_onlink_host_route(&self, in_subnet: bool) -> bool {
-        // An interface-scoped host route to an in-subnet destination installs
-        // a permanent self-MAC LLINFO entry and black-holes the traffic; the
-        // connected route resolves it correctly instead.
-        !in_subnet
+    fn route_commands(&self, route: &Route, in_subnet: bool, iface: &str) -> Vec<Cmd> {
+        let mut cmds = Vec::new();
+        match &route.gateway {
+            Some(gateway) => {
+                let gateway = gateway.to_string();
+                cmds.push(Cmd::new("route", &["add", &route.destination, &gateway]));
+            }
+            None => {
+                // An interface-scoped host route to an in-subnet destination
+                // installs a permanent self-MAC LLINFO entry and black-holes
+                // the traffic; the connected route resolves it correctly.
+                if !in_subnet {
+                    cmds.push(interface_route_command(&route.destination, iface));
+                }
+                // Static ARP for an on-link host the kernel can't resolve.
+                // The `-host ... -interface` route above leaves an LLINFO
+                // entry resolving to our own MAC; `arp -s` overwrites it with
+                // the real one. No preceding `arp -d`: on macOS that deletes
+                // the freshly-added host route. Validation guarantees
+                // mac => gatewayless /32, so the parse always succeeds.
+                if let Some(mac) = &route.mac
+                    && let Ok(net) = route.destination.parse::<IpNet>()
+                {
+                    let host = net.addr().to_string();
+                    cmds.push(Cmd::new("arp", &["-s", &host, mac]));
+                }
+            }
+        }
+        cmds
     }
 
     fn reverts_parent_config(&self) -> bool {
@@ -294,11 +319,49 @@ impl Platform for Linux {
         vec![Cmd::new("ip", &["link", "del", iface])]
     }
 
-    fn wants_onlink_host_route(&self, _in_subnet: bool) -> bool {
-        // Unlike macOS, `ip route add X/32 dev Y` makes X genuinely on-link
-        // and the kernel ARPs for it. This is the only way to reach several
-        // hosts that share one subnet across different VLANs.
-        true
+    fn route_commands(&self, route: &Route, _in_subnet: bool, iface: &str) -> Vec<Cmd> {
+        // `in_subnet` is deliberately ignored: unlike macOS, `ip route add
+        // X/32 dev Y` makes X genuinely on-link and the kernel ARPs for it.
+        // That is the only way to reach several hosts that share one subnet
+        // across different VLANs, which is exactly the in-subnet case.
+        let mut cmds = Vec::new();
+        match &route.gateway {
+            Some(gateway) => {
+                let gateway = gateway.to_string();
+                cmds.push(Cmd::new(
+                    "ip",
+                    &[
+                        "route",
+                        "add",
+                        &route.destination,
+                        "via",
+                        &gateway,
+                        "dev",
+                        iface,
+                    ],
+                ));
+            }
+            None => {
+                cmds.push(Cmd::new(
+                    "ip",
+                    &["route", "add", &route.destination, "dev", iface],
+                ));
+                // `ip neigh add` is the Linux equivalent of `arp -s`. No
+                // self-MAC hazard here, so no ordering constraint against
+                // the route above — but it is kept in the same order as
+                // macOS so the two backends read alike.
+                if let Some(mac) = &route.mac
+                    && let Ok(net) = route.destination.parse::<IpNet>()
+                {
+                    let host = net.addr().to_string();
+                    cmds.push(Cmd::new(
+                        "ip",
+                        &["neigh", "add", &host, "lladdr", mac, "dev", iface],
+                    ));
+                }
+            }
+        }
+        cmds
     }
 
     fn reverts_parent_config(&self) -> bool {
@@ -446,9 +509,10 @@ pub(crate) fn iface_name(interface: &Interface, device: &str) -> String {
 /// platform-specific decision from `platform`.
 ///
 /// `Platform::bringup_commands` owns interface creation, address and MTU;
-/// routes are shared logic gated on one platform decision
-/// ([`Platform::wants_onlink_host_route`]), so this function appends them
-/// once here rather than duplicating the loop in every backend.
+/// [`Platform::route_commands`] owns each route and its static-ARP entry.
+/// This function owns only the order and the one piece of context no
+/// backend can compute for itself: whether a destination is in the
+/// interface's own subnet.
 pub fn bringup_commands_for(
     platform: &dyn Platform,
     interface: &Interface,
@@ -456,13 +520,10 @@ pub fn bringup_commands_for(
 ) -> Vec<Cmd> {
     let name = platform.iface_name(interface, device);
     let mut cmds = platform.bringup_commands(interface, device);
-    append_route_commands(
-        &mut cmds,
-        &interface.routes,
-        &interface.address,
-        &name,
-        |in_subnet| platform.wants_onlink_host_route(in_subnet),
-    );
+    for route in &interface.routes {
+        let in_subnet = destination_in_subnet(&route.destination, &interface.address);
+        cmds.extend(platform.route_commands(route, in_subnet, &name));
+    }
     cmds
 }
 
@@ -508,17 +569,17 @@ fn create_address_mtu_commands(interface: &Interface, device: &str) -> Vec<Cmd> 
     cmds
 }
 
-/// Append route (and static-ARP) commands for `routes` to `cmds`. Shared by
-/// the free [`bringup_commands`] (macOS's hardcoded decision) and
-/// [`bringup_commands_for`] (the platform's decision), so the route-building
-/// logic exists exactly once.
-fn append_route_commands(
-    cmds: &mut Vec<Cmd>,
-    routes: &[Route],
-    addr: &IpNet,
-    iface: &str,
-    wants_onlink_host_route: impl Fn(bool) -> bool,
-) {
+/// Append route (and static-ARP) commands for `routes` to `cmds`, with
+/// macOS's decision (`!in_subnet`) hardcoded.
+///
+/// `#[cfg(test)]`: this is the INDEPENDENT baseline that
+/// `macos_impl_matches_the_free_functions_it_replaces` compares
+/// [`MacOs::route_commands`] against, so it deliberately keeps its own copy
+/// of the emission logic. Delegating to `MacOs::route_commands` would make
+/// that equivalence test compare macOS against itself and pass vacuously.
+/// Production route emission goes through [`Platform::route_commands`].
+#[cfg(test)]
+fn append_route_commands(cmds: &mut Vec<Cmd>, routes: &[Route], addr: &IpNet, iface: &str) {
     for route in routes {
         match &route.gateway {
             Some(gateway) => {
@@ -532,7 +593,7 @@ fn append_route_commands(
                 // self-MAC ARP entry that breaks resolution, so a platform
                 // that shares that hazard skips it.
                 let in_subnet = destination_in_subnet(&route.destination, addr);
-                if wants_onlink_host_route(in_subnet) {
+                if !in_subnet {
                     cmds.push(interface_route_command(&route.destination, iface));
                 }
                 // Static ARP for an on-link host the kernel can't resolve. The
@@ -567,13 +628,7 @@ fn append_route_commands(
 pub(crate) fn bringup_commands(interface: &Interface, device: &str) -> Vec<Cmd> {
     let name = iface_name(interface, device);
     let mut cmds = create_address_mtu_commands(interface, device);
-    append_route_commands(
-        &mut cmds,
-        &interface.routes,
-        &interface.address,
-        &name,
-        |in_subnet| !in_subnet,
-    );
+    append_route_commands(&mut cmds, &interface.routes, &interface.address, &name);
     cmds
 }
 
@@ -902,11 +957,19 @@ mod tests {
         fn teardown_commands(&self, iface: &str) -> Vec<Cmd> {
             vec![Cmd::new("false", &[iface])]
         }
-        // Opposite of macOS's `!in_subnet`: derived from the flag, not a
-        // constant, so a test can tell whether the parameter is actually
-        // plumbed through.
-        fn wants_onlink_host_route(&self, in_subnet: bool) -> bool {
-            in_subnet
+        // Opposite of macOS's `!in_subnet`, and DERIVED from the flag
+        // rather than constant, so a test can tell whether `in_subnet` is
+        // actually plumbed through. The program name is deliberately
+        // neither `route` nor `ip`: this is a test double proving the seam
+        // is honored, not a second Linux backend.
+        fn route_commands(&self, route: &Route, in_subnet: bool, iface: &str) -> Vec<Cmd> {
+            if !in_subnet {
+                return vec![];
+            }
+            vec![Cmd::new(
+                "contrarian-route",
+                &["add", &route.destination, "dev", iface],
+            )]
         }
         fn reverts_parent_config(&self) -> bool {
             true
@@ -951,8 +1014,26 @@ mod tests {
 
     #[test]
     fn a_platform_derives_the_onlink_decision_from_in_subnet() {
-        assert!(Contrarian.wants_onlink_host_route(true));
-        assert!(!Contrarian.wants_onlink_host_route(false));
+        // Same route, both values of `in_subnet`: emission must follow the
+        // flag, which is what proves `bringup_commands_for` plumbs it.
+        let route = Route {
+            destination: "192.168.11.200/32".to_string(),
+            gateway: None,
+            mac: None,
+        };
+        assert_eq!(
+            Contrarian
+                .route_commands(&route, true, "eth0.11")
+                .iter()
+                .map(|c| c.display())
+                .collect::<Vec<_>>(),
+            vec!["contrarian-route add 192.168.11.200/32 dev eth0.11"]
+        );
+        assert!(
+            Contrarian
+                .route_commands(&route, false, "eth0.11")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -960,42 +1041,73 @@ mod tests {
         assert!(Contrarian.reverts_parent_config());
     }
 
-    /// Pins a KNOWN GAP (issue I1 / Ruling R10), not an endorsement: route
-    /// and static-ARP command syntax is not behind the `Platform` seam.
-    /// `append_route_commands`/`interface_route_command` build `route add
-    /// ...` in shared code for every platform, so even `Contrarian` — whose
-    /// `bringup_commands` emits no BSD syntax at all, and whose
-    /// `wants_onlink_host_route` is the mirror image of macOS's — still gets
-    /// a BSD-shaped `route add -host ... -interface ...` line. A non-BSD
-    /// backend (Linux's `ip route`, say) will need a per-platform
-    /// route-emission hook added to `Platform` before it can render correct
-    /// commands. If this test starts failing, that hook has been added:
-    /// update or delete this pin deliberately, it is not a regression.
     #[test]
-    fn route_syntax_is_currently_shared_and_bsd_shaped_a_known_limitation() {
-        let i = Interface {
-            vlan: Some(11),
-            address: "192.168.11.87/24".parse().unwrap(),
-            mtu: None,
-            routes: vec![Route {
-                // In-subnet: `Contrarian.wants_onlink_host_route` answers
-                // `true` here (the opposite of macOS), so this is the case
-                // that actually reaches route emission through Contrarian.
-                destination: "192.168.11.200/32".to_string(),
-                gateway: None,
-                mac: None,
-            }],
+    fn linux_emits_ip_route_and_ip_neigh_not_bsd_route_and_arp() {
+        let route = Route {
+            destination: "192.168.11.151/32".to_string(),
+            gateway: None,
+            mac: Some("3a:42:f7:79:32:2e".to_string()),
         };
-        let rendered: Vec<String> = bringup_commands_for(&Contrarian, &i, "eth0")
+        let rendered: Vec<String> = Linux
+            .route_commands(&route, true, "eth0.11")
+            .iter()
+            .map(|c| c.display())
+            .collect();
+        assert_eq!(
+            rendered,
+            vec![
+                "ip route add 192.168.11.151/32 dev eth0.11",
+                "ip neigh add 192.168.11.151 lladdr 3a:42:f7:79:32:2e dev eth0.11",
+            ],
+            "got {rendered:?}"
+        );
+        assert!(!rendered.iter().any(|c| c.contains("arp -s")));
+    }
+
+    #[test]
+    fn macos_route_emission_is_unchanged_by_the_move() {
+        let route = Route {
+            destination: "192.168.11.151/32".to_string(),
+            gateway: None,
+            mac: Some("3a:42:f7:79:32:2e".to_string()),
+        };
+        // In-subnet on macOS: no route at all (self-MAC black-hole), arp only.
+        let rendered: Vec<String> = MacOs
+            .route_commands(&route, true, "vlan11")
             .iter()
             .map(|c| c.display())
             .collect();
         assert!(
+            !rendered.iter().any(|c| c.starts_with("route ")),
+            "got {rendered:?}"
+        );
+        assert!(
             rendered
                 .iter()
-                .any(|c| c.contains("route add -host") && c.contains("-interface")),
-            "expected the shared BSD route syntax even through a non-BSD \
-             Platform (known limitation, see the Platform trait doc): {rendered:?}"
+                .any(|c| c == "arp -s 192.168.11.151 3a:42:f7:79:32:2e")
+        );
+    }
+
+    #[test]
+    fn macos_out_of_subnet_still_emits_host_route_then_arp_in_that_order() {
+        let route = Route {
+            destination: "192.168.10.151/32".to_string(),
+            gateway: None,
+            mac: Some("3a:42:f7:79:32:2e".to_string()),
+        };
+        let rendered: Vec<String> = MacOs
+            .route_commands(&route, false, "en7")
+            .iter()
+            .map(|c| c.display())
+            .collect();
+        assert_eq!(
+            rendered,
+            vec![
+                "route add -host 192.168.10.151 -interface en7",
+                "arp -s 192.168.10.151 3a:42:f7:79:32:2e",
+            ],
+            "order matters: arp -s overwrites the self-MAC entry the route installs, \
+             and an `arp -d` between them deletes the route"
         );
     }
 
@@ -1011,10 +1123,10 @@ mod tests {
                     gateway: None,
                     mac: None,
                 },
-                // In-subnet gatewayless: `wants_onlink_host_route` must
-                // answer the same on both sides, or this fixture would not
-                // actually be exercising that decision (all other routes
-                // here are out-of-subnet).
+                // In-subnet gatewayless: the in-subnet decision must come
+                // out the same on both sides, or this fixture would not
+                // actually be exercising it (all other routes here are
+                // out-of-subnet).
                 Route {
                     destination: "192.168.11.151/32".to_string(),
                     gateway: None,
@@ -1048,12 +1160,17 @@ mod tests {
 
     #[test]
     fn macos_skips_an_in_subnet_gatewayless_route_and_keeps_parent_config() {
+        let route = Route {
+            destination: "192.168.11.151/32".to_string(),
+            gateway: None,
+            mac: None,
+        };
         assert!(
-            !MacOs.wants_onlink_host_route(true),
+            MacOs.route_commands(&route, true, "en7").is_empty(),
             "an in-subnet interface-scoped host route self-MACs on macOS"
         );
         assert!(
-            MacOs.wants_onlink_host_route(false),
+            !MacOs.route_commands(&route, false, "en7").is_empty(),
             "out-of-subnet still needs the route"
         );
         assert!(
@@ -1069,10 +1186,10 @@ mod tests {
         // directly would pass this assertion vacuously — no platform impl
         // emits routes any more, in-subnet or not. Going through
         // `bringup_commands_for` still exercises the real hazard this test
-        // guards: `Contrarian::wants_onlink_host_route` proves the same route
-        // WOULD be emitted for a platform that wants on-link host routes, so
-        // this is `wants_onlink_host_route` actually being honored, not a
-        // route loop that no longer runs.
+        // guards: `Contrarian::route_commands` proves the same route WOULD
+        // be emitted for a platform that wants on-link host routes, so this
+        // is the in-subnet decision actually being honored, not a route loop
+        // that no longer runs.
         let i = Interface {
             vlan: Some(11),
             address: "192.168.11.87/24".parse().unwrap(),
@@ -1101,7 +1218,7 @@ mod tests {
             .map(|c| c.display())
             .collect();
         assert!(
-            other.iter().any(|c| c.starts_with("route ")),
+            other.iter().any(|c| c.contains("192.168.11.151")),
             "sanity check failed: a platform that wants on-link host routes \
              must still emit one for the same in-subnet destination: {other:?}"
         );
@@ -1415,9 +1532,14 @@ mod tests {
         // different VLANs are reached at all. macOS answers the opposite
         // because an interface-scoped host route there installs a self-MAC
         // entry and black-holes the traffic.
-        assert!(Linux.wants_onlink_host_route(true));
-        assert!(Linux.wants_onlink_host_route(false));
-        assert!(!MacOs.wants_onlink_host_route(true));
+        let route = Route {
+            destination: "192.168.11.151/32".to_string(),
+            gateway: None,
+            mac: None,
+        };
+        assert!(!Linux.route_commands(&route, true, "eth0.11").is_empty());
+        assert!(!Linux.route_commands(&route, false, "eth0.11").is_empty());
+        assert!(MacOs.route_commands(&route, true, "vlan11").is_empty());
     }
 
     #[test]

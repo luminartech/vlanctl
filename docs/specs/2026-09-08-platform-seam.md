@@ -26,39 +26,20 @@ implementation supplies its own syntax for those: `MacOs` renders `ifconfig
 vlan10 create` / `vlan 10 vlandev en7`; a future Linux backend would render
 its own `ip link add ...` instead.
 
-Route and static-ARP command syntax is **not** behind this seam, and should
-not be assumed to be. `append_route_commands` and `interface_route_command`
-in `src/plan.rs` build every `route add ...` and `arp -s ...` command in
-shared code, for every platform, and that syntax is BSD/macOS-shaped. Only
-the *decision* of whether to emit a host route is delegated
-(`wants_onlink_host_route`, below) — the syntax that decision controls is
-not. A non-BSD backend (Linux's `ip route`, for instance) will need a
-per-platform route-emission hook added to `Platform` before it can render
-correct route commands. `src/plan.rs`'s
-`route_syntax_is_currently_shared_and_bsd_shaped_a_known_limitation` test
-pins today's shared-BSD behavior so that closing this gap later is a
-deliberate test edit rather than silent drift; treat that hook as the first
-piece of the Linux/Windows backend work described below, not something
-already in place.
+Route and static-ARP command syntax **is** behind this seam, as of
+`Platform::route_commands`. It was not originally: `append_route_commands`
+and `interface_route_command` built every `route add ...` and `arp -s ...`
+command in shared, BSD/macOS-shaped code for every platform, and only the
+*decision* of whether to emit a host route was delegated. That was gap (1)
+below, now closed. `append_route_commands` still exists but is
+`#[cfg(test)]`, retained as the independent baseline the equivalence test
+compares `MacOs::route_commands` against — production emission goes through
+the trait.
 
-Two of the trait's methods that do exist today are not syntax at all. They
-are decisions, and they are decisions because the straight-line logic they
-replace looked like a universal networking rule but was actually encoding
-one operating system's semantics:
-
-- **`wants_onlink_host_route(in_subnet: bool) -> bool`** — whether a
-  gatewayless route to a destination inside the interface's own subnet
-  should get an explicit interface-scoped host route. On macOS, adding such
-  a route for an in-subnet destination installs a self-MAC ARP (LLINFO)
-  entry and black-holes traffic to that host; macOS relies on the
-  already-connected route to resolve it, so `vlanctl` must *skip* emitting
-  one. On Linux the same operation (`ip route add <host>/32 dev <iface>`) is
-  not just harmless, it is the only way to reach several hosts that share
-  one subnet but sit behind different VLAN interfaces — omitting it there
-  would make those hosts unreachable rather than merely redundant. A single
-  hardcoded answer is wrong on one of the two platforms no matter which way
-  it is hardcoded, which is why this has to be a per-`Platform` question
-  rather than a constant.
+One of the trait's methods is not syntax at all. It is a decision, and it is
+a decision because the straight-line logic it replaced looked like a
+universal networking rule but was actually encoding one operating system's
+semantics:
 
 - **`reverts_parent_config() -> bool`** — whether tearing a profile down may
   undo configuration applied to the *parent* network device, as opposed to
@@ -142,15 +123,21 @@ gaps, which was wrong. Gaps are kept numbered as first published — a closed
 one is marked CLOSED rather than removed, both because the reasoning is what
 a Windows backend author needs and because other documents cite these
 numbers. As of the Linux backend (`feat/1b-linux-backend`), the two SILENT
-gaps (3) and (4) are closed and a new one (7) is open.
+gaps (3) and (4) are closed, gap (1) is closed, and a new one (7) is open.
 
-1. **Route and ARP syntax is still shared and BSD-shaped.** `Platform`
-   delegates the *decision* (`wants_onlink_host_route`) but not the syntax:
-   `append_route_commands` and `interface_route_command` emit
-   `route add -host/-net … -interface` and `arp -s` for every platform.
-   `Platform` needs a per-platform route-emission hook. Pinned by
-   `route_syntax_is_currently_shared_and_bsd_shaped_a_known_limitation`,
-   which is expected to fail — and must be rewritten — when that hook lands.
+1. **CLOSED. Was: route and ARP syntax was shared and BSD-shaped.**
+   `Platform` delegated the *decision* (`wants_onlink_host_route`) but not
+   the syntax: `append_route_commands` and `interface_route_command` emitted
+   `route add -host/-net … -interface` and `arp -s` for every platform, so a
+   non-BSD backend rendered unusable commands.
+   Now `Platform::route_commands(&Route, in_subnet, iface) -> Vec<Cmd>` owns
+   both the decision and the syntax: `MacOs` renders BSD `route`/`arp -s`
+   and skips the in-subnet host route, `Linux` renders `ip route`/`ip neigh`
+   and emits it. `wants_onlink_host_route` is **gone** — it could express
+   whether to route but not how, which is why it could not close this gap on
+   its own. The pin
+   `route_syntax_is_currently_shared_and_bsd_shaped_a_known_limitation` is
+   deleted; it asserted the behavior this change fixes.
 2. **The four host-state methods are declared but unconsumed.**
    `apply`/`down`/`status`/`resolve_device` still call the macOS parsers
    directly.
@@ -192,10 +179,9 @@ gaps (3) and (4) are closed and a new one (7) is open.
    `commands::live_interfaces`, so a real `apply` on Linux fails loudly on
    that call before mutating anything.
 
-Once (1) and (2) are closed, each backend supplies its own
-interface/route command syntax, its own answers to
-`wants_onlink_host_route` and `reverts_parent_config`, and its own
-host-state parsing, exactly as `MacOs` does today.
+Once (2) is closed, each backend supplies its own interface/route command
+syntax, its own answers to `route_commands` and `reverts_parent_config`,
+and its own host-state parsing, exactly as `MacOs` does today.
 
 `host_platform()` (`src/plan.rs`) is the single place a binary selects a
 `Platform` for a **real, mutating** operation (`apply`/`down`); it returns
@@ -218,8 +204,9 @@ wrong by asserting that a preview touches no real system:
 
 The design that motivated this seam — including why `vlanctl` is being
 adopted as the foundation for cross-platform host network autoconfiguration
-rather than reimplemented, and the fuller rationale behind treating
-`wants_onlink_host_route` as a decision rather than as syntax — lives at
+rather than reimplemented, and the fuller rationale behind treating the
+in-subnet host-route question as a decision rather than as syntax (it was
+`wants_onlink_host_route` there, now folded into `route_commands`) — lives at
 `docs/superpowers/specs/2026-09-08-cross-platform-host-network-autoconfig-design.md`
 **in this repository**, §0 and §4.3.1. (It was authored in the `dft` repo,
 where that path is git-ignored; the copy here is the tracked one, and §4.3.1
