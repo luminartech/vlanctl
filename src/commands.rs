@@ -80,7 +80,16 @@ pub fn apply<R: CommandRunner>(
     }
 
     let device = resolve_device(runner, profile.device.as_deref())?;
-    let interfaces = platform.managed_interface_names(profile); // tagged names, for the guard + state
+    // The names this run will create, derived from the *resolved* device
+    // through the platform's own naming, so the guard below cannot disagree
+    // with what bring-up actually creates. Tagged entries only: an untagged
+    // entry configures the parent device, which is never guarded.
+    let interfaces: Vec<String> = profile
+        .interfaces
+        .iter()
+        .filter(|i| i.vlan.is_some())
+        .map(|i| platform.iface_name(i, &device))
+        .collect();
 
     // Refuse to touch a vlan<id> sub-interface that already exists and is not
     // ours. The physical device is never guarded — untagged apply is additive.
@@ -253,7 +262,7 @@ pub fn status<R: CommandRunner>(runner: &mut R, state_path: &Path) -> Result<Str
 mod tests {
     use super::*;
     use crate::net::RecordingRunner;
-    use crate::plan::MacOs;
+    use crate::plan::{Linux, MacOs};
 
     fn profile() -> Profile {
         // Pin `device` so these tests exercise apply/down orchestration without
@@ -285,6 +294,102 @@ mod tests {
         r.stdout
             .insert("ifconfig -l".to_string(), "lo0 en0".to_string());
         r
+    }
+
+    /// The same two VLANs as [`profile`], on a Linux-named parent. Under
+    /// `Linux` these become `eth0.100` and `eth0.200`, so anything in `apply`
+    /// that still assumes `vlan<id>` or `ifconfig` shapes shows up here.
+    fn linux_profile() -> Profile {
+        let p: Profile = toml::from_str(
+            "name=\"t\"\ndevice=\"eth0\"\n\
+             [[interface]]\nvlan=100\naddress=\"192.168.10.2/24\"\n\
+             [[interface]]\nvlan=200\naddress=\"10.0.0.5/24\"\n",
+        )
+        .unwrap();
+        p.validate().unwrap();
+        p
+    }
+
+    /// `apply` still lists live interfaces through the `ifconfig -l` parser
+    /// regardless of platform, so a Linux run needs that probe stubbed too.
+    fn linux_runner(live: &str) -> RecordingRunner {
+        let mut r = RecordingRunner::default();
+        r.stdout.insert("ifconfig -l".to_string(), live.to_string());
+        r
+    }
+
+    #[test]
+    fn apply_with_linux_records_what_ip_link_add_created() {
+        // Guards the recording call site in `apply`: `ip link add link eth0
+        // name eth0.100 ...` has `link` where ifconfig has `create`, so an
+        // ifconfig-shaped test there records nothing — rollback undoes
+        // nothing, the state file stays empty, and `down` becomes a no-op.
+        let state_path = std::env::temp_dir().join("vlanctl-linux-apply-ok.json");
+        let _ = std::fs::remove_file(&state_path);
+        let mut r = linux_runner("lo eth0");
+        let created = apply(&mut r, &Linux, &linux_profile(), &state_path, false).unwrap();
+        assert_eq!(created, vec!["eth0.100", "eth0.200"]);
+
+        let state = State::load(&state_path).unwrap();
+        assert_eq!(state.active_profile.as_deref(), Some("t"));
+        assert_eq!(state.interfaces, vec!["eth0.100", "eth0.200"]);
+        std::fs::remove_file(&state_path).unwrap();
+    }
+
+    #[test]
+    fn apply_with_linux_rolls_back_with_ip_link_del() {
+        let state_path = std::env::temp_dir().join("vlanctl-linux-apply-fail.json");
+        let _ = std::fs::remove_file(&state_path);
+        // Locate eth0.200's creation instead of hardcoding its index, so a
+        // change to the Linux bring-up sequence cannot silently move the
+        // simulated failure onto some other command.
+        let mut probe = linux_runner("lo eth0");
+        apply(&mut probe, &Linux, &linux_profile(), &state_path, true).unwrap();
+        let fail_at = probe
+            .commands
+            .iter()
+            .position(|c| {
+                c.display()
+                    .starts_with("ip link add link eth0 name eth0.200 ")
+            })
+            .expect("the plan creates eth0.200");
+
+        let mut r = linux_runner("lo eth0");
+        r.fail_at = Some(fail_at);
+        let err = apply(&mut r, &Linux, &linux_profile(), &state_path, false).unwrap_err();
+        assert!(err.to_string().contains("rolled back"), "{err}");
+
+        // eth0.100 was fully created and must be deleted; eth0.200 never was.
+        let rendered: Vec<String> = r.commands.iter().map(|c| c.display()).collect();
+        assert!(
+            rendered.contains(&"ip link del eth0.100".to_string()),
+            "rollback must delete the sub-interface it created: {rendered:?}"
+        );
+        assert!(!rendered.contains(&"ip link del eth0.200".to_string()));
+        assert_eq!(State::load(&state_path).unwrap(), State::default());
+        let _ = std::fs::remove_file(&state_path);
+    }
+
+    #[test]
+    fn apply_with_linux_refuses_an_existing_sub_interface() {
+        // Guards the collision-guard call site in `apply`: a guard that looks
+        // for `vlan100` never matches a live `eth0.100`, so it never fires
+        // and `apply` reconfigures an interface it did not create.
+        let state_path = std::env::temp_dir().join("vlanctl-linux-apply-collision.json");
+        let _ = std::fs::remove_file(&state_path);
+        let mut r = linux_runner("lo eth0 eth0.100");
+        let err = apply(&mut r, &Linux, &linux_profile(), &state_path, false).unwrap_err();
+        assert!(
+            err.to_string().contains("eth0.100 already exists"),
+            "expected the guard to refuse eth0.100: {err}"
+        );
+        let rendered: Vec<String> = r.commands.iter().map(|c| c.display()).collect();
+        assert!(
+            !rendered.iter().any(|c| c.contains("link add")),
+            "{rendered:?}"
+        );
+        assert_eq!(State::load(&state_path).unwrap(), State::default());
+        let _ = std::fs::remove_file(&state_path);
     }
 
     #[test]

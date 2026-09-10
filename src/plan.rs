@@ -117,12 +117,6 @@ pub trait Platform {
     /// argument shape directly, which silently recorded nothing on any other
     /// platform — leaving rollback with nothing to undo and `down` a no-op.
     fn records_created_interface(&self, cmd: &Cmd) -> bool;
-
-    /// The interface names this profile will manage on this platform, used by
-    /// the pre-apply collision guard. Must agree with
-    /// [`Platform::iface_name`] — a guard built on a different naming scheme
-    /// never fires.
-    fn managed_interface_names(&self, profile: &Profile) -> Vec<String>;
 }
 
 /// macOS / BSD. The behavior this crate shipped before the `Platform` seam
@@ -181,10 +175,6 @@ impl Platform for MacOs {
     fn records_created_interface(&self, cmd: &Cmd) -> bool {
         // `ifconfig <name> create`
         cmd.program == "ifconfig" && cmd.args.get(1).map(|a| a == "create").unwrap_or(false)
-    }
-
-    fn managed_interface_names(&self, profile: &Profile) -> Vec<String> {
-        interface_names(profile)
     }
 }
 
@@ -305,15 +295,6 @@ impl Platform for Linux {
         cmd.program == "ip"
             && cmd.args.first().map(|a| a == "link").unwrap_or(false)
             && cmd.args.get(1).map(|a| a == "add").unwrap_or(false)
-    }
-
-    fn managed_interface_names(&self, profile: &Profile) -> Vec<String> {
-        let device = profile.device.as_deref().unwrap_or_default();
-        profile
-            .interfaces
-            .iter()
-            .filter_map(|i| i.vlan.map(|id| format!("{device}.{id}")))
-            .collect()
     }
 }
 
@@ -853,14 +834,6 @@ mod tests {
                 && cmd.args.first().map(|a| a == "link").unwrap_or(false)
                 && cmd.args.get(1).map(|a| a == "add").unwrap_or(false)
         }
-        fn managed_interface_names(&self, profile: &Profile) -> Vec<String> {
-            let device = profile.device.as_deref().unwrap_or_default();
-            profile
-                .interfaces
-                .iter()
-                .filter_map(|i| i.vlan.map(|id| format!("{device}.{id}")))
-                .collect()
-        }
     }
 
     #[test]
@@ -1092,15 +1065,38 @@ mod tests {
     #[test]
     fn the_collision_guard_uses_the_platforms_own_interface_names() {
         // The bug: the guard hardcoded vlan<id>, so a platform naming
-        // interfaces eth0.11 was never guarded at all.
+        // interfaces eth0.11 was never guarded at all. Drive the real guard
+        // in `commands::apply` with a platform whose naming is not macOS's,
+        // and check both directions: its own name is refused, and macOS's
+        // name for the same entry is not mistaken for a collision.
         let p = Profile {
             name: "t".to_owned(),
             description: None,
             device: Some("eth0".to_owned()),
             interfaces: vec![tagged(11, "192.168.11.87/24")],
         };
-        assert_eq!(Contrarian.managed_interface_names(&p), vec!["eth0.11"]);
-        assert_eq!(MacOs.managed_interface_names(&p), vec!["vlan11"]);
+        let state_path = std::env::temp_dir().join("vlanctl-plan-guard-naming.json");
+        let _ = std::fs::remove_file(&state_path);
+
+        // `apply` still lists live interfaces through `ifconfig -l`
+        // regardless of platform; stub it with eth0.11 already present.
+        let mut r = RecordingRunner::default();
+        r.stdout
+            .insert("ifconfig -l".to_owned(), "lo0 eth0 eth0.11".to_owned());
+        let err = crate::commands::apply(&mut r, &Contrarian, &p, &state_path, true)
+            .expect_err("the platform's own interface name must be refused");
+        assert!(
+            err.to_string().contains("eth0.11 already exists"),
+            "expected the guard to name eth0.11: {err}"
+        );
+
+        // A live vlan11 is what macOS would call this entry; under a
+        // platform that names it eth0.11 it is somebody else's interface.
+        let mut r = RecordingRunner::default();
+        r.stdout
+            .insert("ifconfig -l".to_owned(), "lo0 eth0 vlan11".to_owned());
+        crate::commands::apply(&mut r, &Contrarian, &p, &state_path, true)
+            .expect("a foreign naming scheme's interface is not a collision");
     }
 
     #[test]
