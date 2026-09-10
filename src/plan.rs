@@ -2,7 +2,7 @@
 use crate::config::Profile;
 use crate::config::{Interface, Route};
 use crate::net::{Cmd, CommandRunner};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use ipnet::IpNet;
 
 /// Per-operating-system command generation and host-state reading.
@@ -379,6 +379,16 @@ impl Platform for Linux {
     }
 
     fn reverts_parent_config(&self) -> bool {
+        // Easy to over-read, so stated plainly: this `true` covers parent
+        // *addressing*, NOT parent *link state*. Bring-up raises the parent
+        // with `ip link set <device> up`, and that is deliberately ONE-WAY —
+        // neither teardown nor rollback ever brings it back down, and prior
+        // link state is not recorded. By teardown time other traffic may
+        // depend on that link, and downing a NIC out from under it is a
+        // worse failure than leaving an idle one up. Consequence an operator
+        // should know: a NIC deliberately held admin-down is left UP after
+        // `vlanctl down`, and after a failed apply that rolled back.
+        //
         // `ip addr del <cidr> dev <parent>` removes exactly what was added.
         true
     }
@@ -439,11 +449,33 @@ impl Platform for Linux {
         // reports `unknown` for drivers that do not maintain it, which
         // would misfile a live NIC as inactive — so keep carrier and treat
         // an unreadable one as down.
-        let out = runner.run(&Cmd::new(
+        let carrier = runner.run(&Cmd::new(
             "cat",
             &[&format!("/sys/class/net/{device}/carrier")],
         ));
-        Ok(out.is_ok_and(|s| s.trim() == "1"))
+        if let Ok(s) = &carrier {
+            return Ok(s.trim() == "1");
+        }
+        // Carrier was unreadable. That is USUALLY the admin-down EINVAL
+        // above, i.e. the answer "no link" — but it is also what a broken
+        // probe looks like (no `/sys`, no `cat`, permission denied), and the
+        // trait contract says only a genuine failure to ask is an `Err`.
+        // `operstate` tells them apart: it stays readable on an admin-down
+        // device. Its VALUE is deliberately ignored — it reports `unknown`
+        // for drivers that do not maintain it, which is exactly why carrier
+        // is the signal — so only its readability is used here.
+        runner
+            .run(&Cmd::new(
+                "cat",
+                &[&format!("/sys/class/net/{device}/operstate")],
+            ))
+            .with_context(|| {
+                format!(
+                    "cannot determine link state for {device}: neither carrier nor \
+                     operstate is readable"
+                )
+            })?;
+        Ok(false)
     }
 
     fn records_created_interface(&self, cmd: &Cmd) -> bool {
@@ -1628,8 +1660,48 @@ mod tests {
         );
         assert_eq!(
             r.commands.len(),
-            1,
-            "the failed read must have been attempted"
+            2,
+            "carrier must be attempted, then operstate consulted to tell \
+             admin-down apart from a device that cannot be asked at all"
+        );
+        assert!(
+            r.commands[1].display().contains("operstate"),
+            "{:?}",
+            r.commands
+        );
+    }
+
+    /// Fails EVERY command, which `RecordingRunner::fail_at` cannot express
+    /// (it fails one index). Needed to prove the difference between "the
+    /// device is down" and "the probe itself is broken".
+    struct AllFailRunner {
+        calls: usize,
+    }
+
+    impl CommandRunner for AllFailRunner {
+        fn run(&mut self, cmd: &Cmd) -> Result<String> {
+            self.calls += 1;
+            anyhow::bail!("simulated total failure running `{}`", cmd.display())
+        }
+    }
+
+    #[test]
+    fn linux_link_is_active_errors_when_the_device_cannot_be_asked_at_all() {
+        // The trait contract: "only a genuine failure to ask is an `Err`".
+        // An admin-down NIC has a readable `operstate`, so if BOTH reads
+        // fail the device is not merely down — /sys is missing, `cat` is
+        // absent, or permission is denied. Swallowing that reports "no
+        // interface is active", which either mis-refuses or auto-picks the
+        // wrong NIC. For something that reconfigures networking, the failure
+        // must be loud.
+        let mut r = AllFailRunner { calls: 0 };
+        let err = Linux
+            .link_is_active(&mut r, "eth0")
+            .expect_err("a wholly unaskable device must be an Err, not `false`");
+        assert_eq!(r.calls, 2, "both carrier and operstate must be attempted");
+        assert!(
+            err.to_string().contains("eth0"),
+            "the error should name the device: {err}"
         );
     }
 

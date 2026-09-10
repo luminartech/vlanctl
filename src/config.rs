@@ -84,6 +84,27 @@ impl Profile {
                         route.destination
                     );
                 }
+                // `ip route add <dest> via <gw> dev <iface>` requires the
+                // gateway to be on-link on that interface — the kernel
+                // rejects anything else with EINVAL ("Nexthop has invalid
+                // gateway") part-way through an apply, forcing a rollback.
+                // macOS's gateway-only `route add <dest> <gw>` resolved it
+                // through the routing table, so this shape was previously
+                // accepted there; reject it here, where the message can
+                // explain itself. Every gateway in the shipped profiles is
+                // on-link, so nothing in-tree is affected.
+                if let Some(gateway) = &route.gateway
+                    && !iface.address.contains(gateway)
+                {
+                    bail!(
+                        "route '{}' has gateway {} outside the interface's own subnet {} \
+                         (the gateway must be on-link on the interface the route is \
+                         pinned to)",
+                        route.destination,
+                        gateway,
+                        iface.address
+                    );
+                }
                 if let Some(mac) = &route.mac {
                     if route.gateway.is_some() {
                         bail!(
@@ -166,6 +187,39 @@ address = "10.0.0.5/24"
     }
 
     #[test]
+    fn rejects_a_gateway_outside_the_interfaces_own_subnet() {
+        // `ip route add <dest> via <gw> dev <iface>` requires the gateway to
+        // be on-link on that interface; the kernel answers EINVAL ("Nexthop
+        // has invalid gateway") otherwise, mid-apply, and the whole apply
+        // rolls back. macOS's `route add <dest> <gw>` resolved the gateway
+        // through the routing table instead, so this shape used to work
+        // there. Reject it at parse time, where the message can say why.
+        let err = profile_with(
+            "[[interface]]\nvlan = 11\naddress = \"192.168.11.87/24\"\n\n  \
+             [[interface.route]]\n  destination = \"192.168.20.0/24\"\n  \
+             gateway = \"10.0.0.1\"\n",
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("gateway") && msg.contains("10.0.0.1"),
+            "the error must name the offending gateway: {msg}"
+        );
+    }
+
+    #[test]
+    fn accepts_a_gateway_inside_the_interfaces_own_subnet() {
+        // Guards the rule above against over-rejection: every gateway in the
+        // shipped profiles is on-link, and they must keep parsing.
+        profile_with(
+            "[[interface]]\nvlan = 100\naddress = \"192.168.10.2/24\"\n\n  \
+             [[interface.route]]\n  destination = \"192.168.20.0/24\"\n  \
+             gateway = \"192.168.10.1\"\n",
+        )
+        .expect("an on-link gateway must be accepted");
+    }
+
+    #[test]
     fn rejects_duplicate_vlan_ids() {
         let err = profile_with(
             "[[interface]]\nvlan = 100\naddress = \"1.1.1.1/24\"\n\
@@ -177,7 +231,8 @@ address = "10.0.0.5/24"
 
     #[test]
     fn rejects_out_of_range_id() {
-        let err = profile_with("[[interface]]\nvlan = 5000\naddress = \"1.1.1.1/24\"\n").unwrap_err();
+        let err =
+            profile_with("[[interface]]\nvlan = 5000\naddress = \"1.1.1.1/24\"\n").unwrap_err();
         assert!(err.to_string().contains("out of range"));
     }
 
@@ -189,7 +244,8 @@ address = "10.0.0.5/24"
 
     #[test]
     fn rejects_ipv6_address() {
-        let err = profile_with("[[interface]]\nvlan = 100\naddress = \"fe80::1/64\"\n").unwrap_err();
+        let err =
+            profile_with("[[interface]]\nvlan = 100\naddress = \"fe80::1/64\"\n").unwrap_err();
         assert!(err.to_string().contains("not IPv4"));
     }
 
@@ -253,7 +309,10 @@ address = "10.0.0.5/24"
              [[interface.route]]\ndestination = \"192.168.10.151/32\"\nmac = \"3a:42:f7:79:32:2e\"\n",
         )
         .unwrap();
-        assert_eq!(p.interfaces[0].routes[0].mac.as_deref(), Some("3a:42:f7:79:32:2e"));
+        assert_eq!(
+            p.interfaces[0].routes[0].mac.as_deref(),
+            Some("3a:42:f7:79:32:2e")
+        );
     }
 
     #[test]
