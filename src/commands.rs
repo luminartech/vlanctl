@@ -248,9 +248,12 @@ pub fn down<R: CommandRunner>(
 /// `ifconfig vlan10 create …` where the real apply would run
 /// `ip link add … type vlan`. This doc previously claimed the preview "never
 /// disagrees with what actually runs", which stopped being true the moment a
-/// second backend existed. Tracked as gap (7) in
-/// `docs/specs/2026-09-08-platform-seam.md`; the repoint is deferred because
-/// the two functions return different shapes.
+/// second backend existed.
+///
+/// The repoint is deferred because the two functions return different shapes
+/// (`&'static dyn Platform` vs `Result<Box<dyn Platform>>`). Stated here
+/// rather than by citing the platform-seam doc, which is no longer tracked in
+/// this repository and so will not exist in a fresh clone.
 pub fn show_plan(platform: &dyn Platform, profile: &Profile, device: &str) -> Vec<String> {
     profile
         .interfaces
