@@ -80,30 +80,34 @@ pub trait Platform {
     /// `true` alone gets a backend nothing.
     fn reverts_parent_config(&self) -> bool;
 
-    /// Names of every network device currently on the host, from `ifconfig -l`.
+    /// Names of every network device currently on the host, physical and
+    /// virtual, in the OS's own naming.
     ///
     /// Declared for the Linux and Windows backends; not yet
     /// consumed anywhere. `apply`/`down`/`status`/`resolve_device` still call
     /// `commands::live_interfaces` (the macOS parser) directly.
     fn list_devices(&self, runner: &mut dyn CommandRunner) -> Result<Vec<String>>;
 
-    /// IPv4 addresses currently configured on `device`, from the `inet` lines
-    /// of `ifconfig <device>`.
+    /// IPv4 addresses currently configured on `device`, each with its prefix
+    /// length. Other address families are excluded.
     ///
     /// Declared for the Linux and Windows backends; not yet
     /// consumed anywhere. `apply`/`down`/`status`/`resolve_device` still call
     /// `commands::device_inet_addresses` (the macOS parser) directly.
     fn addresses_on(&self, runner: &mut dyn CommandRunner, device: &str) -> Result<Vec<IpNet>>;
 
-    /// Whether `device`'s hardware port is Wi-Fi, from
-    /// `networksetup -listallhardwareports`.
+    /// Whether `device` is a wireless (Wi-Fi) adapter, which device
+    /// detection must never pick as the sensor link.
     ///
     /// Declared for the Linux and Windows backends; not yet
     /// consumed anywhere. `resolve_device` still calls `device::wifi_devices`
     /// (the macOS parser) directly.
     fn is_wireless(&self, runner: &mut dyn CommandRunner, device: &str) -> Result<bool>;
 
-    /// Whether `ifconfig <device>` reports `status: active`.
+    /// Whether `device` currently has a live link — carrier from a connected
+    /// peer. An interface that is administratively down, or up with nothing
+    /// plugged in, answers `false`; only a genuine failure to ask is an
+    /// `Err`.
     ///
     /// Declared for the Linux and Windows backends; not yet
     /// consumed anywhere. `resolve_device` still calls
@@ -155,20 +159,25 @@ impl Platform for MacOs {
     }
 
     fn list_devices(&self, runner: &mut dyn CommandRunner) -> Result<Vec<String>> {
+        // `ifconfig -l`: one line of space-separated names.
         crate::commands::live_interfaces(runner)
     }
 
     fn addresses_on(&self, runner: &mut dyn CommandRunner, device: &str) -> Result<Vec<IpNet>> {
+        // The `inet <addr> netmask <hex>` lines of `ifconfig <device>`.
         crate::commands::device_inet_addresses(runner, device)
     }
 
     fn is_wireless(&self, runner: &mut dyn CommandRunner, device: &str) -> Result<bool> {
+        // `networksetup -listallhardwareports`: the device under a Wi-Fi
+        // hardware port.
         Ok(crate::device::wifi_devices(runner)?
             .iter()
             .any(|w| w == device))
     }
 
     fn link_is_active(&self, runner: &mut dyn CommandRunner, device: &str) -> Result<bool> {
+        // `ifconfig <device>` reporting `status: active`.
         crate::device::interface_is_active(runner, device)
     }
 
@@ -328,26 +337,28 @@ impl Platform for Linux {
 /// keep working on every host, so it renders through [`preview_platform`]
 /// instead. See that function's doc for why the two must not be conflated.
 pub fn host_platform() -> Result<Box<dyn Platform>> {
-    #[cfg(target_os = "macos")]
-    {
-        Ok(Box::new(MacOs))
+    // `consts::OS` is fixed at compile time, so this is the `cfg` dispatch it
+    // reads as — written as a match so the refusal below is compiled, and
+    // testable, on every host rather than only on one without a backend.
+    match std::env::consts::OS {
+        "macos" => Ok(Box::new(MacOs)),
+        "linux" => Ok(Box::new(Linux)),
+        os => Err(no_backend_error(os)),
     }
-    #[cfg(target_os = "linux")]
-    {
-        Ok(Box::new(Linux))
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        use anyhow::bail;
-        bail!(
-            "no Platform implementation for {} yet; only '{}' and '{}' are \
-             implemented today. A Windows backend is not implemented yet — \
-             construct a Platform explicitly if you have one for this OS.",
-            std::env::consts::OS,
-            MacOs.name(),
-            Linux.name(),
-        )
-    }
+}
+
+/// The refusal [`host_platform`] returns on a host with no backend. Its
+/// wording is a small contract of its own: it must name the platforms that
+/// are supported and must not leak internal planning labels, and the test
+/// for that runs on every host.
+fn no_backend_error(os: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "no Platform implementation for {os} yet; only '{}' and '{}' are \
+         implemented today. A Windows backend is not implemented yet — \
+         construct a Platform explicitly if you have one for this OS.",
+        MacOs.name(),
+        Linux.name(),
+    )
 }
 
 /// The fixed reference platform used to render a **preview** — `show`,
@@ -584,25 +595,36 @@ mod tests {
     use std::net::IpAddr;
 
     /// `host_platform()` must refuse cleanly (`Err`, never a panic) on a host
-    /// with no `Platform` implementation at all (e.g. Windows), and its
-    /// message must name a supported platform rather than leak internal
-    /// phase labels.
+    /// with no `Platform` implementation at all (e.g. Windows).
     ///
     /// Linux now has a real backend (see
     /// `host_platform_resolves_to_linux_on_linux` below), so this can no
     /// longer be asserted on every non-macOS host — only on one with neither
-    /// backend.
+    /// backend. The wording of the refusal is checked unconditionally in
+    /// `no_backend_error_names_supported_platforms_without_phase_labels`.
     #[test]
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     fn host_platform_refuses_cleanly_with_no_backend() {
-        let err = match host_platform() {
-            Ok(_) => panic!("no Platform implementation exists for this OS yet"),
-            Err(e) => e,
-        };
-        let msg = err.to_string();
+        let err = host_platform()
+            .map(|_| ())
+            .expect_err("no Platform implementation exists for this OS yet");
+        assert_eq!(
+            err.to_string(),
+            no_backend_error(std::env::consts::OS).to_string()
+        );
+    }
+
+    /// The refusal must name a supported platform and the host it refused,
+    /// and must not leak internal planning labels. Tested through the helper
+    /// so this holds on every host, not only on one where `host_platform()`
+    /// actually refuses — that test never runs where this crate is developed.
+    #[test]
+    fn no_backend_error_names_supported_platforms_without_phase_labels() {
+        let msg = no_backend_error("windows").to_string();
+        assert!(msg.contains("windows"), "must name the host OS: {msg}");
         assert!(
-            msg.contains("macos") || msg.contains("linux"),
-            "expected the error to name a supported platform: {msg}"
+            msg.contains("macos") && msg.contains("linux"),
+            "expected the error to name the supported platforms: {msg}"
         );
         assert!(
             !msg.contains("1a") && !msg.contains("1b"),
