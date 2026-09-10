@@ -109,6 +109,20 @@ pub trait Platform {
     /// consumed anywhere. `resolve_device` still calls
     /// `device::interface_is_active` (the macOS parser) directly.
     fn link_is_active(&self, runner: &mut dyn CommandRunner, device: &str) -> Result<bool>;
+
+    /// Whether `cmd` is this platform's *interface creation* command, and so
+    /// the interface it names must be recorded for teardown and rollback.
+    ///
+    /// This exists because the recording test used to match `ifconfig`
+    /// argument shape directly, which silently recorded nothing on any other
+    /// platform — leaving rollback with nothing to undo and `down` a no-op.
+    fn records_created_interface(&self, cmd: &Cmd) -> bool;
+
+    /// The interface names this profile will manage on this platform, used by
+    /// the pre-apply collision guard. Must agree with
+    /// [`Platform::iface_name`] — a guard built on a different naming scheme
+    /// never fires.
+    fn managed_interface_names(&self, profile: &Profile) -> Vec<String>;
 }
 
 /// macOS / BSD. The behavior this crate shipped before the `Platform` seam
@@ -162,6 +176,15 @@ impl Platform for MacOs {
 
     fn link_is_active(&self, runner: &mut dyn CommandRunner, device: &str) -> Result<bool> {
         crate::device::interface_is_active(runner, device)
+    }
+
+    fn records_created_interface(&self, cmd: &Cmd) -> bool {
+        // `ifconfig <name> create`
+        cmd.program == "ifconfig" && cmd.args.get(1).map(|a| a == "create").unwrap_or(false)
+    }
+
+    fn managed_interface_names(&self, profile: &Profile) -> Vec<String> {
+        interface_names(profile)
     }
 }
 
@@ -674,6 +697,19 @@ mod tests {
         fn link_is_active(&self, _runner: &mut dyn CommandRunner, _device: &str) -> Result<bool> {
             Ok(false)
         }
+        fn records_created_interface(&self, cmd: &Cmd) -> bool {
+            cmd.program == "ip"
+                && cmd.args.first().map(|a| a == "link").unwrap_or(false)
+                && cmd.args.get(1).map(|a| a == "add").unwrap_or(false)
+        }
+        fn managed_interface_names(&self, profile: &Profile) -> Vec<String> {
+            let device = profile.device.as_deref().unwrap_or_default();
+            profile
+                .interfaces
+                .iter()
+                .filter_map(|i| i.vlan.map(|id| format!("{device}.{id}")))
+                .collect()
+        }
     }
 
     #[test]
@@ -865,6 +901,55 @@ mod tests {
             rendered.contains(&"route add 192.168.20.0/24 192.168.11.1".to_string()),
             "expected a route add for the gatewayed destination: {rendered:?}"
         );
+    }
+
+    #[test]
+    fn a_non_ifconfig_platform_still_records_what_it_created() {
+        // The bug: recording keyed off `args[1] == "create"`, which is
+        // ifconfig-shaped. A Linux-shaped `ip link add link eth0 name
+        // eth0.11 ...` has `link` there, so nothing was recorded and
+        // rollback/down silently became no-ops.
+        let create = Cmd::new(
+            "ip",
+            &[
+                "link", "add", "link", "eth0", "name", "eth0.11", "type", "vlan", "id", "11",
+            ],
+        );
+        assert!(
+            Contrarian.records_created_interface(&create),
+            "a platform must be able to recognize its own creation command"
+        );
+        let not_create = Cmd::new("ip", &["addr", "add", "192.168.11.87/24", "dev", "eth0.11"]);
+        assert!(!Contrarian.records_created_interface(&not_create));
+    }
+
+    #[test]
+    fn macos_still_recognizes_ifconfig_create_and_nothing_else() {
+        assert!(MacOs.records_created_interface(&Cmd::new("ifconfig", &["vlan11", "create"])));
+        assert!(!MacOs.records_created_interface(&Cmd::new(
+            "ifconfig",
+            &[
+                "vlan11",
+                "inet",
+                "192.168.11.87",
+                "netmask",
+                "255.255.255.0"
+            ]
+        )));
+    }
+
+    #[test]
+    fn the_collision_guard_uses_the_platforms_own_interface_names() {
+        // The bug: the guard hardcoded vlan<id>, so a platform naming
+        // interfaces eth0.11 was never guarded at all.
+        let p = Profile {
+            name: "t".to_owned(),
+            description: None,
+            device: Some("eth0".to_owned()),
+            interfaces: vec![tagged(11, "192.168.11.87/24")],
+        };
+        assert_eq!(Contrarian.managed_interface_names(&p), vec!["eth0.11"]);
+        assert_eq!(MacOs.managed_interface_names(&p), vec!["vlan11"]);
     }
 
     #[test]

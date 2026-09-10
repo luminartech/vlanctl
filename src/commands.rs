@@ -1,7 +1,7 @@
 use crate::config::Profile;
 use crate::device::resolve_device;
 use crate::net::{Cmd, CommandRunner};
-use crate::plan::{Platform, bringup_commands_for, interface_names};
+use crate::plan::{Platform, bringup_commands_for};
 use crate::state::State;
 use anyhow::{Context, Result, bail};
 use ipnet::IpNet;
@@ -80,7 +80,7 @@ pub fn apply<R: CommandRunner>(
     }
 
     let device = resolve_device(runner, profile.device.as_deref())?;
-    let interfaces = interface_names(profile); // tagged names, for the guard + state
+    let interfaces = platform.managed_interface_names(profile); // tagged names, for the guard + state
 
     // Refuse to touch a vlan<id> sub-interface that already exists and is not
     // ours. The physical device is never guarded — untagged apply is additive.
@@ -133,7 +133,7 @@ pub fn apply<R: CommandRunner>(
             Some(_) => {
                 let iface = platform.iface_name(interface, &device);
                 for cmd in bringup_commands_for(platform, interface, &device) {
-                    let is_create = cmd.args.get(1).map(|a| a == "create").unwrap_or(false);
+                    let is_create = platform.records_created_interface(&cmd);
                     match runner.run(&cmd) {
                         Ok(_) => {
                             if is_create {
