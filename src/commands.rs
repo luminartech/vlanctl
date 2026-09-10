@@ -9,17 +9,21 @@ use std::path::Path;
 
 /// List live interface names from `ifconfig -l`.
 ///
-/// `pub(crate)`: also the parser behind [`crate::plan::Platform::list_devices`].
+/// **macOS's implementation only.** Its sole caller is
+/// [`crate::plan::Platform::list_devices`] on `MacOs`; `apply`/`down`/`status`
+/// go through the trait, so a Linux host reads `ip -json link show` instead.
+/// Do not call it directly — `-l` is a BSD flag and net-tools rejects it.
 pub(crate) fn live_interfaces<R: CommandRunner + ?Sized>(runner: &mut R) -> Result<Vec<String>> {
     let out = runner.run(&Cmd::new("ifconfig", &["-l"]))?;
     Ok(out.split_whitespace().map(|s| s.to_string()).collect())
 }
 
 /// IPv4 addresses currently configured on `device`, parsed from the `inet`
-/// lines of `ifconfig <device>` (address plus netmask). Used to make
-/// untagged-interface apply idempotent.
+/// lines of `ifconfig <device>` (address plus netmask). Makes untagged-interface
+/// apply idempotent.
 ///
-/// `pub(crate)`: also the parser behind [`crate::plan::Platform::addresses_on`].
+/// **macOS's implementation only**, reached through
+/// [`crate::plan::Platform::addresses_on`] on `MacOs`; `apply` calls the trait.
 pub(crate) fn device_inet_addresses<R: CommandRunner + ?Sized>(
     runner: &mut R,
     device: &str,
@@ -79,7 +83,7 @@ pub fn apply<R: CommandRunner>(
         down(runner, platform, state_path, dry_run)?;
     }
 
-    let device = resolve_device(runner, profile.device.as_deref())?;
+    let device = resolve_device(platform, runner, profile.device.as_deref())?;
     // The names this run will create, derived from the *resolved* device
     // through the platform's own naming, so the guard below cannot disagree
     // with what bring-up actually creates. Tagged entries only: an untagged
@@ -93,7 +97,9 @@ pub fn apply<R: CommandRunner>(
 
     // Refuse to touch a vlan<id> sub-interface that already exists and is not
     // ours. The physical device is never guarded — untagged apply is additive.
-    let existing = live_interfaces(runner)?;
+    // Through the platform, so a Linux host reads `ip -json link show`
+    // rather than the BSD-only `ifconfig -l` (seam gap 2).
+    let existing = platform.list_devices(runner)?;
     for iface in &interfaces {
         if existing.contains(iface) {
             bail!(
@@ -122,7 +128,8 @@ pub fn apply<R: CommandRunner>(
             // its own recording/teardown path built deliberately, not this
             // one reused by accident.
             None => {
-                let already_configured = device_inet_addresses(runner, &device)?
+                let already_configured = platform
+                    .addresses_on(runner, &device)?
                     .iter()
                     .any(|net| net.addr() == interface.address.addr());
                 if already_configured {
@@ -190,7 +197,7 @@ pub fn down<R: CommandRunner>(
     // A reboot drops the VLAN interfaces but leaves the state file intact, so
     // recorded interfaces may already be gone. Only tear down ones still live;
     // destroying a missing interface would error and is a no-op anyway.
-    let live = live_interfaces(runner)?;
+    let live = platform.list_devices(runner)?;
     for iface in state.interfaces.iter().rev() {
         if !live.contains(iface) {
             continue;
@@ -247,9 +254,13 @@ pub fn list_profiles(dir: &Path) -> Result<Vec<String>> {
 
 /// A human-readable status report: active profile and whether each recorded
 /// interface is still live.
-pub fn status<R: CommandRunner>(runner: &mut R, state_path: &Path) -> Result<String> {
+pub fn status<R: CommandRunner>(
+    runner: &mut R,
+    platform: &dyn Platform,
+    state_path: &Path,
+) -> Result<String> {
     let state = State::load(state_path)?;
-    let live = live_interfaces(runner)?;
+    let live = platform.list_devices(runner)?;
     let mut report = String::new();
     match &state.active_profile {
         None => report.push_str("No active profile.\n"),
@@ -320,11 +331,19 @@ mod tests {
         p
     }
 
-    /// `apply` still lists live interfaces through the `ifconfig -l` parser
-    /// regardless of platform, so a Linux run needs that probe stubbed too.
+    /// `apply` lists live interfaces through `Platform::list_devices`, so a
+    /// Linux run needs `ip -json link show` stubbed — not the BSD
+    /// `ifconfig -l` this helper used to seed.
     fn linux_runner(live: &str) -> RecordingRunner {
         let mut r = RecordingRunner::default();
-        r.stdout.insert("ifconfig -l".to_string(), live.to_string());
+        let json = format!(
+            "[{}]",
+            live.split_whitespace()
+                .map(|n| format!(r#"{{"ifname":"{n}"}}"#))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        r.stdout.insert("ip -json link show".to_string(), json);
         r
     }
 
@@ -420,30 +439,34 @@ mod tests {
         let state_path = std::env::temp_dir().join("vlanctl-linux-apply-autodetect-guard.json");
         let _ = std::fs::remove_file(&state_path);
 
-        // `resolve_device` still runs the macOS probes on every platform:
-        // hardware ports (en0 is a wired port, not Wi-Fi), the interface
-        // listing, and a link-status query per wired candidate. `en0.100`
-        // also matches the `en*` candidate filter, but its unstubbed status
-        // reads as inactive, so en0 is the single active device and wins.
+        // `resolve_device` now runs the PLATFORM's probes, so a Linux run
+        // reads `ip -json link show` + `/sys`, not `ifconfig`/`networksetup`.
+        // eth0.100 is listed but is not a candidate parent (it contains a
+        // `.`), so eth0 is resolved — and the guard must then refuse the
+        // eth0.100 that is already live.
         let mut r = RecordingRunner::default();
         r.stdout.insert(
-            "networksetup -listallhardwareports".to_string(),
-            "Hardware Port: USB 10/100/1000 LAN\nDevice: en0\n".to_string(),
+            "ip -json link show".to_string(),
+            r#"[{"ifname":"lo"},{"ifname":"eth0"},{"ifname":"eth0.100"}]"#.to_string(),
         );
-        r.stdout
-            .insert("ifconfig -l".to_string(), "lo0 en0 en0.100".to_string());
-        r.stdout
-            .insert("ifconfig en0".to_string(), "\tstatus: active\n".to_string());
+        r.stdout.insert(
+            "ls /sys/class/net/eth0".to_string(),
+            "carrier operstate".to_string(),
+        );
+        r.stdout.insert(
+            "cat /sys/class/net/eth0/carrier".to_string(),
+            "1\n".to_string(),
+        );
 
         let err = apply(&mut r, &Linux, &p, &state_path, false).unwrap_err();
         assert!(
-            err.to_string().contains("en0.100 already exists"),
+            err.to_string().contains("eth0.100 already exists"),
             "expected the guard to refuse the resolved device's sub-interface: {err}"
         );
         let rendered: Vec<String> = r.commands.iter().map(|c| c.display()).collect();
         assert!(
-            rendered.contains(&"networksetup -listallhardwareports".to_string())
-                && rendered.contains(&"ifconfig en0".to_string()),
+            rendered.contains(&"ip -json link show".to_string())
+                && rendered.contains(&"cat /sys/class/net/eth0/carrier".to_string()),
             "auto-detect must actually have run: {rendered:?}"
         );
         assert!(
@@ -698,7 +721,7 @@ mod tests {
         let mut r = RecordingRunner::default();
         r.stdout
             .insert("ifconfig -l".to_string(), "lo0 en0 vlan0".to_string());
-        let report = status(&mut r, &state_path).unwrap();
+        let report = status(&mut r, &MacOs, &state_path).unwrap();
         assert!(report.contains("vlan0: up"));
         assert!(report.contains("vlan9: MISSING"));
         std::fs::remove_file(&state_path).unwrap();

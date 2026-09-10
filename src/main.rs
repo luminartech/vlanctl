@@ -85,7 +85,10 @@ fn main() -> Result<()> {
             // Resolve the device against the live system; `ifconfig -l` is a
             // read-only query, so this has no side effects.
             let mut probe = SystemRunner;
-            let device = device::resolve_device(&mut probe, p.device.as_deref())?;
+            // Resolved through the SAME reference platform the preview renders
+            // with, so the device it picks and the commands it prints agree.
+            let device =
+                device::resolve_device(plan::preview_platform(), &mut probe, p.device.as_deref())?;
             // A preview renders through the fixed reference platform, not
             // `host_platform()`: like `apply --dry-run`/`down --dry-run`
             // below, it touches no real system and must keep working on any
@@ -144,7 +147,10 @@ fn main() -> Result<()> {
         }
         Command::Status => {
             let mut runner = SystemRunner;
-            print!("{}", commands::status(&mut runner, &state_path)?);
+            print!(
+                "{}",
+                commands::status(&mut runner, plan::preview_platform(), &state_path)?
+            );
         }
     }
     Ok(())

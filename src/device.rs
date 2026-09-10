@@ -1,39 +1,50 @@
 use crate::net::{Cmd, CommandRunner};
+use crate::plan::Platform;
 use anyhow::{Result, bail};
 
 /// Resolve the physical Ethernet device to attach VLANs to.
 ///
-/// If `override_device` is set, use it verbatim. Otherwise auto-detect: take the
-/// `en*` interfaces and drop Wi-Fi (which cannot carry 802.1Q VLANs). Auto-pick
+/// If `override_device` is set, use it verbatim. Otherwise auto-detect: take
+/// the platform's candidate devices ([`Platform::is_candidate_device`]) and
+/// drop Wi-Fi (which cannot carry 802.1Q VLANs). Auto-pick
 /// only when the choice is unambiguous:
 /// - exactly one active-link wired interface -> use it;
 /// - several active -> error (ask the user to pin `device`);
 /// - none active but exactly one wired interface exists -> use it;
 /// - none active and several wired exist -> error (ask the user to pin `device`).
-pub fn resolve_device<R: CommandRunner>(
-    runner: &mut R,
+pub fn resolve_device(
+    platform: &dyn Platform,
+    runner: &mut dyn CommandRunner,
     override_device: Option<&str>,
 ) -> Result<String> {
     if let Some(dev) = override_device {
         return Ok(dev.to_string());
     }
 
-    let wifi = wifi_devices(runner)?;
-    let listing = runner.run(&Cmd::new("ifconfig", &["-l"]))?;
-    let wired: Vec<String> = listing
-        .split_whitespace()
-        .filter(|name| name.starts_with("en"))
-        .filter(|name| !wifi.iter().any(|w| w == name))
-        .map(|s| s.to_string())
-        .collect();
+    // Every probe below goes through `platform`, so this works on any host
+    // with a backend rather than only on macOS. It previously shelled
+    // `ifconfig -l` + `networksetup` directly and filtered candidates by an
+    // `en` prefix — none of which exists or applies on Linux, where the
+    // parent is typically `eth0`.
+    let devices = platform.list_devices(runner)?;
+    let mut wired = Vec::new();
+    for name in devices {
+        if !platform.is_candidate_device(&name) {
+            continue;
+        }
+        if platform.is_wireless(runner, &name)? {
+            continue;
+        }
+        wired.push(name);
+    }
 
     if wired.is_empty() {
-        bail!("no wired Ethernet (enX) interface found; set `device` in the profile");
+        bail!("no wired Ethernet interface found on this host; set `device` in the profile");
     }
 
     let mut active = Vec::new();
     for name in &wired {
-        if interface_is_active(runner, name)? {
+        if platform.link_is_active(runner, name)? {
             active.push(name.clone());
         }
     }
@@ -119,7 +130,7 @@ mod tests {
     #[test]
     fn override_wins() {
         let mut r = RecordingRunner::default();
-        let dev = resolve_device(&mut r, Some("en42")).unwrap();
+        let dev = resolve_device(&crate::plan::MacOs, &mut r, Some("en42")).unwrap();
         assert_eq!(dev, "en42");
         assert!(
             r.commands.is_empty(),
@@ -143,7 +154,36 @@ mod tests {
             "ifconfig en4".to_string(),
             "\tstatus: inactive\n".to_string(),
         );
-        assert_eq!(resolve_device(&mut r, None).unwrap(), "en7");
+        assert_eq!(
+            resolve_device(&crate::plan::MacOs, &mut r, None).unwrap(),
+            "en7"
+        );
+    }
+
+    /// The whole point of gap (2)+(5): auto-detect must work on a Linux
+    /// host. `eth0` does not match the macOS `en` prefix, and `ifconfig -l`
+    /// / `networksetup` do not exist there, so before this the resolve
+    /// refused on the very hardware the Linux backend targets.
+    #[test]
+    fn resolves_eth0_on_linux_through_the_platform() {
+        let mut r = RecordingRunner::default();
+        r.stdout.insert(
+            "ip -json link show".to_string(),
+            r#"[{"ifname":"lo"},{"ifname":"eth0"},{"ifname":"docker0"},{"ifname":"vlan11"}]"#
+                .to_string(),
+        );
+        r.stdout.insert(
+            "ls /sys/class/net/eth0".to_string(),
+            "carrier operstate".to_string(),
+        );
+        r.stdout.insert(
+            "cat /sys/class/net/eth0/carrier".to_string(),
+            "1\n".to_string(),
+        );
+        assert_eq!(
+            resolve_device(&crate::plan::Linux, &mut r, None).unwrap(),
+            "eth0"
+        );
     }
 
     #[test]
@@ -155,7 +195,9 @@ mod tests {
             .insert("ifconfig en7".to_string(), "\tstatus: active\n".to_string());
         r.stdout
             .insert("ifconfig en4".to_string(), "\tstatus: active\n".to_string());
-        let err = resolve_device(&mut r, None).unwrap_err().to_string();
+        let err = resolve_device(&crate::plan::MacOs, &mut r, None)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("multiple active"));
         assert!(err.contains("en7") && err.contains("en4"));
     }
@@ -166,7 +208,10 @@ mod tests {
         // Only one wired candidate (en7); no status seeded -> inactive.
         r.stdout
             .insert("ifconfig -l".to_string(), "lo0 en0 en7".to_string());
-        assert_eq!(resolve_device(&mut r, None).unwrap(), "en7");
+        assert_eq!(
+            resolve_device(&crate::plan::MacOs, &mut r, None).unwrap(),
+            "en7"
+        );
     }
 
     #[test]
@@ -175,7 +220,9 @@ mod tests {
         // Two wired candidates (en4, en7), neither with an active link.
         r.stdout
             .insert("ifconfig -l".to_string(), "lo0 en0 en4 en7".to_string());
-        let err = resolve_device(&mut r, None).unwrap_err().to_string();
+        let err = resolve_device(&crate::plan::MacOs, &mut r, None)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("none has an active link"));
         assert!(err.contains("en4") && err.contains("en7"));
     }
@@ -185,7 +232,7 @@ mod tests {
         let mut r = runner();
         r.stdout
             .insert("ifconfig -l".to_string(), "lo0 en0".to_string());
-        assert!(resolve_device(&mut r, None).is_err());
+        assert!(resolve_device(&crate::plan::MacOs, &mut r, None).is_err());
     }
 
     #[test]

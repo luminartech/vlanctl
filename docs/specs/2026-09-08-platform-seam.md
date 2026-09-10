@@ -139,9 +139,17 @@ gaps (3) and (4) are closed, gap (1) is closed, and a new one (7) is open.
    its own. The pin
    `route_syntax_is_currently_shared_and_bsd_shaped_a_known_limitation` is
    deleted; it asserted the behavior this change fixes.
-2. **The four host-state methods are declared but unconsumed.**
-   `apply`/`down`/`status`/`resolve_device` still call the macOS parsers
-   directly.
+2. **CLOSED. Was: the four host-state methods were declared but unconsumed.**
+   `apply`/`down`/`status`/`resolve_device` shelled the macOS parsers
+   directly, so a Linux `apply` died on `ifconfig -l` (a BSD flag net-tools
+   rejects) despite `host_platform()` resolving `Linux`.
+   Now every one of them goes through the trait: `apply`/`down`/`status` call
+   `Platform::list_devices`, `apply`'s untagged idempotence check calls
+   `Platform::addresses_on`, and `resolve_device` takes a `&dyn Platform` and
+   uses `list_devices` + `is_candidate_device` + `is_wireless` +
+   `link_is_active`. The four macOS parsers survive as the bodies of `MacOs`'s
+   own implementations and have no other callers.
+   `status` gained a `platform` parameter to make this possible.
 3. **CLOSED. Was SILENT: `apply` decided what to record by matching
    `ifconfig` argument shape.** A created interface was recorded only when
    the emitted command's second argument was literally `create`. Under a
@@ -163,9 +171,16 @@ gaps (3) and (4) are closed, gap (1) is closed, and a new one (7) is open.
    structural rather than comment-enforced. `plan::interface_names` survives
    only as `#[cfg(test)]`, documented as macOS's naming and not to be used
    for a guard.
-5. **Device candidate selection is macOS-shaped.** `resolve_device` filters
-   candidates by an `en`-prefixed name, which is not a parser and so is not
-   covered by the host-state methods above.
+5. **CLOSED. Was: device candidate selection was macOS-shaped.**
+   `resolve_device` filtered candidates by an `en`-prefixed name — which is
+   not a parser, so closing gap (2) alone would not have fixed it. It also
+   excluded the very device the Linux backend targets: `eth0` does not start
+   with `en`, so auto-detect refused on the bench hardware.
+   Now `Platform::is_candidate_device(&str) -> bool` owns it: `MacOs` keeps
+   `en`-prefixed, `Linux` mirrors the proven `iris_vlan_up.sh` predicate
+   (exclude `lo` and the virtual prefixes). Both now also reject any name
+   containing `.`, which closes the pre-existing hole where a VLAN
+   sub-interface such as `en0.100` counted as a parent candidate.
 6. Minor: the CLI's read-only-probe classification and its dry-run
    `ifconfig -l` seed are macOS-specific and sit outside `Platform`.
 7. **NEW, and now user-visible: preview and apply disagree on Linux.**
@@ -180,9 +195,10 @@ gaps (3) and (4) are closed, gap (1) is closed, and a new one (7) is open.
    `commands::live_interfaces`, so a real `apply` on Linux fails loudly on
    that call before mutating anything.
 
-Once (2) is closed, each backend supplies its own interface/route command
-syntax, its own answers to `route_commands` and `reverts_parent_config`,
-and its own host-state parsing, exactly as `MacOs` does today.
+Every backend now supplies its own interface/route command syntax, its own
+answers to `route_commands`, `reverts_parent_config` and
+`is_candidate_device`, and its own host-state parsing, exactly as `MacOs`
+does. What remains is (6) and (7) — both CLI-level, neither in the trait.
 
 `host_platform()` (`src/plan.rs`) is the single place a binary selects a
 `Platform` for a **real, mutating** operation (`apply`/`down`); it returns

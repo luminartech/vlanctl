@@ -72,6 +72,18 @@ pub trait Platform {
     /// `route`/`arp` against Linux `ip route`/`ip neigh`.
     fn route_commands(&self, route: &Route, in_subnet: bool, iface: &str) -> Vec<Cmd>;
 
+    /// Whether `name` could be a VLAN **parent** — i.e. a real wired device
+    /// this platform might trunk onto, as opposed to loopback, a virtual
+    /// device, or a VLAN sub-interface we or someone else created.
+    ///
+    /// Behind the seam because device naming is the most platform-shaped
+    /// thing there is: macOS wired devices are `enN`, while Linux uses
+    /// `eth0`, `enp0s31f6`, `enx<mac>`, `eno1`, `ens5` — so the macOS `en`
+    /// prefix excludes the very device the Linux backend targets. This is a
+    /// *name* predicate only; liveness and wireless-ness are separate
+    /// questions ([`Platform::link_is_active`], [`Platform::is_wireless`]).
+    fn is_candidate_device(&self, name: &str) -> bool;
+
     /// Whether teardown may revert configuration applied to the **parent**
     /// device (as opposed to a VLAN sub-interface it created).
     ///
@@ -182,6 +194,13 @@ impl Platform for MacOs {
             }
         }
         cmds
+    }
+
+    fn is_candidate_device(&self, name: &str) -> bool {
+        // macOS wired Ethernet is `enN`. The `!contains('.')` closes a
+        // pre-existing gap: `en0.100` is a VLAN sub-interface, not a parent,
+        // and a bare prefix test counted it as a candidate.
+        name.starts_with("en") && !name.contains('.')
     }
 
     fn reverts_parent_config(&self) -> bool {
@@ -376,6 +395,18 @@ impl Platform for Linux {
             }
         }
         cmds
+    }
+
+    fn is_candidate_device(&self, name: &str) -> bool {
+        // Mirrors the exclusion list in the proven `iris_vlan_up.sh`, which
+        // is known to pick the right parent on this hardware. Linux wired
+        // names are too varied to allow-list (`eth0`, `enp0s31f6`,
+        // `enx<mac>`, `eno1`, `ens5`), so exclude what is definitely not a
+        // parent instead. A name containing `.` is a VLAN sub-interface.
+        const VIRTUAL: &[&str] = &[
+            "docker", "veth", "br-", "virbr", "vlan", "tun", "tap", "bond", "wl",
+        ];
+        name != "lo" && !name.contains('.') && !VIRTUAL.iter().any(|p| name.starts_with(p))
     }
 
     fn reverts_parent_config(&self) -> bool {
@@ -1017,6 +1048,11 @@ mod tests {
                 &["add", &route.destination, "dev", iface],
             )]
         }
+        fn is_candidate_device(&self, name: &str) -> bool {
+            // Opposite of every real platform: only names starting `x` are
+            // candidates, so a test can tell the decision is plumbed.
+            name.starts_with('x')
+        }
         fn reverts_parent_config(&self) -> bool {
             true
         }
@@ -1024,8 +1060,12 @@ mod tests {
         // prove the emission/decision methods are honored, not to exercise
         // parsing. Fixed answers are enough to keep it implementing the
         // trait.
-        fn list_devices(&self, _runner: &mut dyn CommandRunner) -> Result<Vec<String>> {
-            Ok(vec![])
+        // Reads through the runner with a vocabulary that is neither BSD
+        // nor Linux, so a test can drive the listing without borrowing
+        // another platform's probe.
+        fn list_devices(&self, runner: &mut dyn CommandRunner) -> Result<Vec<String>> {
+            let out = runner.run(&Cmd::new("contrarian-list", &[]))?;
+            Ok(out.split_whitespace().map(|s| s.to_string()).collect())
         }
         fn addresses_on(
             &self,
@@ -1343,11 +1383,11 @@ mod tests {
         let state_path = std::env::temp_dir().join("vlanctl-plan-guard-naming.json");
         let _ = std::fs::remove_file(&state_path);
 
-        // `apply` still lists live interfaces through `ifconfig -l`
-        // regardless of platform; stub it with eth0.11 already present.
+        // `apply` lists live interfaces through `Platform::list_devices`,
+        // so drive Contrarian's own probe with eth0.11 already present.
         let mut r = RecordingRunner::default();
         r.stdout
-            .insert("ifconfig -l".to_owned(), "lo0 eth0 eth0.11".to_owned());
+            .insert("contrarian-list".to_owned(), "lo0 eth0 eth0.11".to_owned());
         let err = crate::commands::apply(&mut r, &Contrarian, &p, &state_path, true)
             .expect_err("the platform's own interface name must be refused");
         assert!(
@@ -1359,7 +1399,7 @@ mod tests {
         // platform that names it eth0.11 it is somebody else's interface.
         let mut r = RecordingRunner::default();
         r.stdout
-            .insert("ifconfig -l".to_owned(), "lo0 eth0 vlan11".to_owned());
+            .insert("contrarian-list".to_owned(), "lo0 eth0 vlan11".to_owned());
         crate::commands::apply(&mut r, &Contrarian, &p, &state_path, true)
             .expect("a foreign naming scheme's interface is not a collision");
     }
@@ -1728,6 +1768,49 @@ mod tests {
         // wireless.
         let mut r = RecordingRunner::default();
         assert!(!Linux.is_wireless(&mut r, "eth0").unwrap());
+    }
+
+    #[test]
+    fn linux_candidate_devices_exclude_loopback_virtual_and_vlan_subinterfaces() {
+        // Mirrors the proven `iris_vlan_up.sh` predicate. `eth0` is the real
+        // parent on this hardware and the macOS `starts_with("en")` filter
+        // would have excluded it outright, which is why candidate selection
+        // has to live behind the seam.
+        for ok in ["eth0", "enp0s31f6", "enx00e04c680001", "eno1", "ens5"] {
+            assert!(Linux.is_candidate_device(ok), "{ok} should be a candidate");
+        }
+        for no in [
+            "lo",
+            "docker0",
+            "veth1a2b",
+            "br-abc123",
+            "virbr0",
+            "vlan11",
+            "tun0",
+            "tap0",
+            "bond0",
+            "wlp0s20f3",
+        ] {
+            assert!(
+                !Linux.is_candidate_device(no),
+                "{no} must not be a candidate"
+            );
+        }
+        // A VLAN sub-interface we created is never a parent candidate.
+        assert!(!Linux.is_candidate_device("eth0.11"));
+    }
+
+    #[test]
+    fn macos_candidates_are_en_prefixed_and_exclude_vlan_subinterfaces() {
+        assert!(MacOs.is_candidate_device("en7"));
+        assert!(!MacOs.is_candidate_device("lo0"));
+        assert!(!MacOs.is_candidate_device("bridge0"));
+        // Pre-existing gap: `en0.100` is a VLAN sub-interface, not a parent,
+        // and the bare `starts_with("en")` filter counted it as a candidate.
+        assert!(
+            !MacOs.is_candidate_device("en0.100"),
+            "a vlan sub-interface is not a parent candidate"
+        );
     }
 
     #[test]
