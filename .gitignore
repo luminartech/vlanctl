@@ -1,1 +1,16 @@
 /target
+
+# Working documents live on disk, not in git.
+#
+# Plans are consumed during execution and superseded by the commits they
+# produce; tracking them creates merge conflicts over files nobody reads
+# again. Specs and the superpowers workspace are the same shape of artifact —
+# they are how the work gets thought through, not the work's output.
+#
+# NOTE: git history still holds every version committed before this rule, so
+# nothing written so far is lost — `git log --diff-filter=D -- <path>` finds
+# it. But from here on these paths exist only on disk, so treat
+# `git clean -fdx` with care.
+/docs/plans/
+/docs/specs/
+/docs/superpowers/
