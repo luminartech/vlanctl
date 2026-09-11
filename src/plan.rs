@@ -625,17 +625,26 @@ fn no_backend_error(os: &str) -> anyhow::Error {
     )
 }
 
-/// The fixed reference platform used to render a **preview** — `show`,
-/// `apply --dry-run`, `down --dry-run` — none of which touch a real system.
+/// The platform used to render a **preview** — `show`, `apply --dry-run`,
+/// `down --dry-run`, `status`.
 ///
-/// Unlike [`host_platform`], this never fails: a preview must keep working
-/// on any host regardless of whether this build has a real backend for it,
-/// exactly as it did before the `Platform` seam existed. It intentionally
-/// renders macOS/BSD command syntax on every host until a real Linux or
-/// Windows `Platform` exists to preview instead.
+/// Resolves the **host's own backend** when this build has one, so a preview
+/// renders what the apply it is previewing would actually run. It previously
+/// returned `MacOs` unconditionally, which meant that on a Linux host
+/// `apply --dry-run` printed `ifconfig vlan10 create …` while the real apply
+/// ran `ip link add …` — a preview that disagreed with the thing it was
+/// previewing.
+///
+/// Unlike [`host_platform`], this never fails: a preview must keep working on
+/// any host regardless of whether this build has a backend for it, exactly as
+/// it did before the `Platform` seam existed. On a host with no backend it
+/// falls back to `MacOs` as a fixed reference, so the output is
+/// *representative* rather than accurate — which is the same bargain the
+/// function has always made, now narrowed to the hosts that genuinely have no
+/// better answer.
 #[must_use]
-pub fn preview_platform() -> &'static dyn Platform {
-    &MacOs
+pub fn preview_platform() -> Box<dyn Platform> {
+    host_platform().unwrap_or_else(|_| Box::new(MacOs))
 }
 
 /// Interface name this entry configures: `vlan<id>` for a tagged interface,
@@ -909,10 +918,100 @@ mod tests {
     }
 
     /// The preview platform must always succeed, unlike `host_platform()` —
-    /// a preview must keep working on any host.
+    /// a preview must keep working on any host, including one with no
+    /// backend of its own.
     #[test]
     fn preview_platform_is_always_available() {
+        // Whatever it resolves to, it resolves to something.
+        assert!(!preview_platform().name().is_empty());
+    }
+
+    /// A preview must render the platform the apply would actually use.
+    /// Previously this was pinned to `MacOs` on every host, so on Linux
+    /// `apply --dry-run` printed `ifconfig vlan10 create …` while the real
+    /// apply ran `ip link add …` — a preview that disagreed with what it was
+    /// previewing (seam gap 7).
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn preview_platform_follows_the_host_backend_on_linux() {
+        assert_eq!(preview_platform().name(), "linux");
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn preview_platform_follows_the_host_backend_on_macos() {
         assert_eq!(preview_platform().name(), "macos");
+    }
+
+    /// The macOS regression net, replacing the four scratch baseline files
+    /// that were captured by running the binary. Those diffed whatever the
+    /// binary rendered on the capturing host, so once the preview follows the
+    /// host backend they would have rendered Linux commands here and stopped
+    /// proving anything. Rendering through `&MacOs` explicitly is
+    /// deterministic on every host, needs no binary, and is immune to
+    /// platform selection.
+    #[test]
+    fn macos_rendering_of_a_tagged_profile_with_routes_is_pinned() {
+        let i = Interface {
+            vlan: Some(11),
+            address: "192.168.11.87/24".parse().unwrap(),
+            mtu: None,
+            routes: vec![
+                Route {
+                    destination: "192.168.11.151/32".to_string(),
+                    gateway: None,
+                    mac: None,
+                },
+                Route {
+                    destination: "239.255.0.255/32".to_string(),
+                    gateway: None,
+                    mac: None,
+                },
+            ],
+        };
+        let rendered: Vec<String> = bringup_commands_for(&MacOs, &i, "en7")
+            .iter()
+            .map(|c| c.display())
+            .collect();
+        assert_eq!(
+            rendered,
+            vec![
+                "ifconfig vlan11 create",
+                "ifconfig vlan11 vlan 11 vlandev en7",
+                "ifconfig vlan11 inet 192.168.11.87 netmask 255.255.255.0",
+                // In-subnet gatewayless: no route (self-MAC black-hole).
+                // Out-of-subnet multicast group: an interface-scoped host route.
+                "route add -host 239.255.0.255 -interface vlan11",
+            ],
+            "macOS rendering changed"
+        );
+    }
+
+    #[test]
+    fn macos_rendering_of_an_untagged_profile_with_static_arp_is_pinned() {
+        let i = Interface {
+            vlan: None,
+            address: "192.168.1.100/24".parse().unwrap(),
+            mtu: None,
+            routes: vec![Route {
+                destination: "192.168.10.151/32".to_string(),
+                gateway: None,
+                mac: Some("3a:42:f7:79:32:2e".to_string()),
+            }],
+        };
+        let rendered: Vec<String> = bringup_commands_for(&MacOs, &i, "en7")
+            .iter()
+            .map(|c| c.display())
+            .collect();
+        assert_eq!(
+            rendered,
+            vec![
+                "ifconfig en7 inet 192.168.1.100 netmask 255.255.255.0 alias",
+                "route add -host 192.168.10.151 -interface en7",
+                "arp -s 192.168.10.151 3a:42:f7:79:32:2e",
+            ],
+            "macOS rendering changed"
+        );
     }
 
     fn tagged(id: u16, cidr: &str) -> Interface {
