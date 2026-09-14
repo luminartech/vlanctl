@@ -1,38 +1,8 @@
-# cargo-release configuration for vlanctl.
-#
-# Developer workflow:
-#   cargo release <major|minor|patch>
-#   -> bumps the version in Cargo.toml, commits, tags, pushes the tag
-#   -> CI (.github/workflows/ci.yml, the `publish` job) sees the tag, runs
-#      the full test/lint suite again, then publishes to Kellnr
-#
-# This mirrors luminartech/beacon's release.toml, this org's other
-# Kellnr-published Rust project — see that repo's release.toml and
-# .github/cargo-release-ci.toml for the two-file split this pattern relies
-# on. Registry credentials never touch a developer machine: the token that
-# can write to Kellnr exists only as the `KELLNR_CI_TOKEN` GitHub Actions
-# secret, threaded into CI as `CARGO_REGISTRIES_KELLNR_TOKEN`.
-
-tag-name = "v{{version}}"
-pre-release-commit-message = "chore(release): prepare v{{version}}"
-tag-message = "vlanctl v{{version}}"
-
-# CI owns publishing; a local `cargo release` only bumps, commits and tags.
-# The CI publish job re-enables this by layering
-# .github/cargo-release-ci.toml on top (via `cargo release publish -c
-# .github/cargo-release-ci.toml`), which is the only place `publish = true`
-# is set.
+# cargo-release config for the standalone vlanctl repo (single crate).
 publish = false
-
-# vlanctl's default (and only long-lived) branch is `main` — unlike beacon,
-# which also releases from `master` and `LTS/*`, vlanctl has no LTS branches
-# to release from. The CI publish job overrides this allowlist too: a tag
-# checkout is a detached HEAD, not a branch, and `git branch --show-current`
-# reports nothing there, so release.toml's allow-branch would refuse it.
+registry = "crates-io"
+tag-name = "v{{version}}"
+tag-message = "vlanctl v{{version}}"
+pre-release-commit-message = "chore(release): v{{version}}"
 allow-branch = ["main"]
-
-# Smoke-check locally before pushing the tag that kicks off CI. Cheap
-# insurance against tagging a release off a red suite; CI runs the same
-# suite again independently before publish, so this is a fast local
-# early-out, not the release's real gate.
 pre-release-hook = ["cargo", "test", "--locked"]

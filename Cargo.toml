@@ -2,20 +2,21 @@
 name = "vlanctl"
 version = "0.1.0"
 edition = "2024"
-# Required for `cargo publish`/`cargo release` to a registry at all — cargo
-# refuses to publish a package with no license/description. The values below
-# mirror beacon's `[workspace.package]` (this org's other Kellnr-published
-# Rust project): `LicenseRef-Proprietary` because this is unpublished
-# internal tooling with no OSI license, and the same authors string, since
-# both crates are Microvision-owned rather than attributed to an individual.
-license = "LicenseRef-Proprietary"
-authors = ["Microvision, Inc."]
+# Edition 2024 alone only requires rustc 1.85, but src/plan.rs uses let-chain
+# expressions (`if let ... && let ...`), stabilized in 1.88 — confirmed
+# locally: 1.85 and 1.87 fail to compile this crate with E0658, 1.88
+# succeeds. 1.88.0 is therefore the honest MSRV floor, and the shared CI
+# workflow's `msrv` job builds against exactly this version to keep the
+# claim honest.
+rust-version = "1.88.0"
+license = "MIT OR Apache-2.0"
+authors = ["Justin Kovacich <justin_kovacich@microvision.com>", "Zach Heylmun <zheylmun@gmail.com>"]
 description = "Apply and tear down named VLAN profiles for lidar sensor networking"
 repository = "https://github.com/luminartech/vlanctl"
-# Restricts `cargo publish` to the named registry so a bare `cargo publish`
-# (no --registry flag) can never push this internal crate to crates.io by
-# mistake — same safety rail beacon puts on every one of its crates.
-publish = ["kellnr"]
+homepage = "https://github.com/luminartech/vlanctl"
+documentation = "https://docs.rs/vlanctl"
+keywords = ["vlan", "networking", "cli", "macos", "interface"]
+categories = ["command-line-utilities", "network-programming", "os::macos-apis"]
 
 [lib]
 name = "vlanctl"
