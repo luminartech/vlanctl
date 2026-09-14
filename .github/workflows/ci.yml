@@ -1,0 +1,130 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # `.cargo/config.toml` sends every crates.io dependency (anyhow, clap,
+  # ipnet, serde, ...) through Kellnr's proxy rather than crates.io directly,
+  # matching luminartech/beacon. That means EVERY job below that runs cargo
+  # needs read access to Kellnr, not only the publish job — each job sets
+  # CARGO_REGISTRIES_KELLNR_TOKEN itself for that reason.
+  CARGO_REGISTRIES_KELLNR_INDEX: "sparse+https://kellnr-eq-dc.sw-ci.kraken.as/api/v1/crates/"
+
+jobs:
+  # Build, test, lint and format-check in one job: vlanctl is a single small
+  # crate (lib + bin, ~112 tests, sub-second to compile and run), so there is
+  # nothing here that benefits from beacon's ~20-job split (fuzz, miri,
+  # sanitizers, differential tests, SBOM, ...) — those exist for a
+  # multi-crate HIL framework with unsafe FFI and concurrency to worry about.
+  # vlanctl has neither. One job that fails fast and says clearly what broke
+  # is the right size for this repo.
+  test:
+    name: Build, test, lint, format
+    # Self-hosted, org-standard labels (matches every job in beacon and
+    # dft-wire-observe's cicd.yml) — not a stylistic choice: Kellnr
+    # (kellnr-eq-dc.sw-ci.kraken.as) is only reachable from this org's
+    # on-net runners, and since crates.io itself is proxied through Kellnr
+    # (see .cargo/config.toml), a GitHub-hosted runner couldn't resolve
+    # *any* dependency here, not just fetch from Kellnr directly.
+    runs-on: [x86, Linux, small]
+    env:
+      CARGO_REGISTRIES_KELLNR_TOKEN: ${{ secrets.KELLNR_CI_TOKEN }}
+    steps:
+      # lum-checkout (luminartech/fw_ci) over stock actions/checkout: on a
+      # pull_request event it resolves the real PR head SHA rather than
+      # GitHub's synthetic merge commit, and it sets `safe.directory` for
+      # git operating as a different user than the one that created the
+      # checkout — both matter on this org's self-hosted runners in a way
+      # they wouldn't on GitHub-hosted ones. vlanctl needs none of its other
+      # inputs (no LFS assets, no cross-repo submodules), so this is used
+      # with its defaults.
+      - uses: luminartech/fw_ci/.github/actions/lum-checkout@v4
+
+      # beacon and dft-wire-observe get their Rust toolchain from a
+      # per-repo container image built via luminartech/fw_ci's
+      # image-lifecycle workflow (see beacon's tools/docker/rust/Dockerfile
+      # and its `image-lifecycle` job). That machinery exists to give a
+      # large, multi-crate workspace a pinned, reproducible, network-
+      # isolated build environment, and adopting it here would mean vlanctl
+      # owning and maintaining its own Dockerfile-based image — real
+      # infrastructure this packaging-only change does not add.
+      #
+      # dtolnay/rust-toolchain is the smaller, more proportionate choice for
+      # one crate: no image to build or maintain, and it reads the
+      # toolchain vlanctl already builds against on this machine (edition
+      # 2024, stable). The one open question this doesn't answer: whether
+      # this org's self-hosted runners have outbound access to fetch the
+      # toolchain themselves, the way they can reach Kellnr. dft's CI has a
+      # comment noting its on-prem runners "can't reach public apt mirrors
+      # anyway" inside their custom container — if that restriction also
+      # applies to a bare (non-container) self-hosted runner, this step
+      # will need to change to the image-lifecycle + tools/docker/rust
+      # pattern beacon and dft use. Flagged for a human to confirm; this
+      # could not be verified from a disconnected dev machine.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Build
+        run: cargo build --locked --all-targets
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Format
+        run: cargo fmt --check
+
+  # Runs only on a version tag (`cargo release` pushes `vX.Y.Z`, see
+  # release.toml), and only after `test` passes — the same tag that
+  # triggers this job is checked out fresh and built/tested/linted again by
+  # `test` above (the `push.tags` trigger fires both jobs; `needs: test`
+  # gates this one on that run, not on whatever validation happened before
+  # the tag was pushed).
+  publish:
+    name: Publish to Kellnr
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: [x86, Linux, small]
+    env:
+      CARGO_REGISTRIES_KELLNR_TOKEN: ${{ secrets.KELLNR_CI_TOKEN }}
+    steps:
+      - uses: luminartech/fw_ci/.github/actions/lum-checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # cargo-release isn't part of the toolchain image beacon/dft bake it
+      # into, and vlanctl has no such image (see the `test` job above) — so
+      # it's installed here instead. `--locked` pins it to the versions in
+      # its own lockfile for a reproducible install; this crate itself is
+      # still fetched through the Kellnr crates.io proxy per
+      # .cargo/config.toml.
+      - name: Install cargo-release
+        run: cargo install cargo-release --locked
+
+      # No "skip already-published crates" step here, unlike beacon's
+      # publish job. That step exists there to make a re-run of a *partial*
+      # multi-crate publish resumable: cargo-release's own already-published
+      # detection only understands crates.io, so on Kellnr every crate looks
+      # "new" and a naive re-run would die re-uploading the first crate that
+      # already made it up. vlanctl is a single crate — there is no partial
+      # state to resume from. If this job is re-run after a successful
+      # publish, `cargo release publish` fails outright with a
+      # straightforward "already exists" error from Kellnr, which is
+      # immediately legible for one crate and does not need automating away.
+      - name: Publish to Kellnr
+        run: |
+          cargo release publish --execute --no-confirm \
+            -c .github/cargo-release-ci.toml
