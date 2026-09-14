@@ -85,13 +85,16 @@ RUN curl -fsSL "https://github.com/cargo-bins/cargo-binstall/releases/download/v
 #   the previous release (or the default branch on PR/branch builds) and, on
 #   a tag, gates `publish` on the result — see that job for the first-release
 #   bootstrap problem (no previous tag to compare against) and how it's
-#   handled.
-# All three pinned to the same versions luminartech/beacon bakes into its own
-# rust image, since all three repos publish to / are checked against the
-# same tooling.
+#   handled. Pinned to 0.50.0, not beacon's 0.47.0: 0.47.0 only understands
+#   rustdoc JSON formats v56/v57 and this image's rustc (1.98.1) emits v60,
+#   so `semver-checks` failed outright with "unsupported rustdoc format v60"
+#   before ever comparing an API. v60 support landed in 0.49.0 (trustfall_rustdoc
+#   upgrade, obi1kenobi/cargo-semver-checks#1661); 0.50.0 is the latest past
+#   that point (it drops v56 support and adds v61, neither of which affects
+#   v60) so it's pinned here rather than the bare minimum 0.49.0.
 RUN cargo-binstall cargo-release --locked --version 0.25.17 \
     && cargo-binstall cargo-llvm-cov --locked --version 0.8.7 \
-    && cargo-binstall cargo-semver-checks --locked --version 0.47.0 \
+    && cargo-binstall cargo-semver-checks --locked --version 0.50.0 \
     && rm -rf /opt/cargo/registry /opt/cargo/git
 
 # actions/checkout (via lum-checkout) expects to write into /__w and
