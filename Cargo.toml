@@ -10,7 +10,7 @@ edition = "2024"
 # claim honest.
 rust-version = "1.88.0"
 license = "MIT OR Apache-2.0"
-authors = ["Justin Kovacich <justin_kovacich@microvision.com>", "Zach Heylmun <zheylmun@gmail.com>"]
+authors = ["Justin Kovacich <justin_kovacich@microvision.com>", "Zachary Heylmun <zachary_heylmun@microvision.com>"]
 description = "Apply and tear down named VLAN profiles for lidar sensor networking"
 repository = "https://github.com/luminartech/vlanctl"
 homepage = "https://github.com/luminartech/vlanctl"
