@@ -1,0 +1,7 @@
+image_name_prefix: vlanctl
+linux_images:
+  - IMAGE_NAME: rust
+    REGISTRY: harbor-eq-dc.sw-ci.kraken.as/firmware
+    DOCKERFILE: tools/docker/rust/Dockerfile
+    DOCKER_CONTEXT_PATH: tools/docker/rust
+    GITHUB_TAG: [x86, Linux, small]

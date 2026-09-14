@@ -9,6 +9,7 @@ on:
       - 'v*'
 
 permissions:
+  actions: read
   contents: read
 
 env:
@@ -19,8 +20,26 @@ env:
   # needs read access to Kellnr, not only the publish job — each job sets
   # CARGO_REGISTRIES_KELLNR_TOKEN itself for that reason.
   CARGO_REGISTRIES_KELLNR_INDEX: "sparse+https://kellnr-eq-dc.sw-ci.kraken.as/api/v1/crates/"
+  # Single place to change vlanctl's long-lived branch (matches release.toml's
+  # `allow-branch`). The `semver-checks` job below fetches this branch as the
+  # comparison baseline on PR/branch builds.
+  DEFAULT_BRANCH: main
 
 jobs:
+  # Builds (or reuses, content-hashed) the container image every job below
+  # runs in. See tools/docker/rust/Dockerfile and .image-lifecycle.yml for
+  # what's in the image and why it exists at all: we do not control what's
+  # on our self-hosted runners, so every job pins its whole environment to a
+  # container instead of fetching a toolchain at job time. Same shared
+  # workflow luminartech/beacon and luminartech/dft use.
+  image-lifecycle:
+    name: Image Lifecycle
+    uses: luminartech/fw_ci/.github/workflows/image-lifecycle.yml@v4
+    secrets: inherit
+    with:
+      images: rust
+      s3-project: vlanctl
+
   # Build, test, lint and format-check in one job: vlanctl is a single small
   # crate (lib + bin, ~112 tests, sub-second to compile and run), so there is
   # nothing here that benefits from beacon's ~20-job split (fuzz, miri,
@@ -30,6 +49,7 @@ jobs:
   # is the right size for this repo.
   test:
     name: Build, test, lint, format
+    needs: [image-lifecycle]
     # Self-hosted, org-standard labels (matches every job in beacon and
     # dft-wire-observe's cicd.yml) — not a stylistic choice: Kellnr
     # (kellnr-eq-dc.sw-ci.kraken.as) is only reachable from this org's
@@ -37,6 +57,11 @@ jobs:
     # (see .cargo/config.toml), a GitHub-hosted runner couldn't resolve
     # *any* dependency here, not just fetch from Kellnr directly.
     runs-on: [x86, Linux, small]
+    container:
+      image: ${{ fromJson(needs.image-lifecycle.outputs.data).rust.image }}
+      credentials:
+        username: ${{ secrets[fromJson(needs.image-lifecycle.outputs.data).rust.username_secret] }}
+        password: ${{ secrets[fromJson(needs.image-lifecycle.outputs.data).rust.token_secret] }}
     env:
       CARGO_REGISTRIES_KELLNR_TOKEN: ${{ secrets.KELLNR_CI_TOKEN }}
     steps:
@@ -50,31 +75,13 @@ jobs:
       # with its defaults.
       - uses: luminartech/fw_ci/.github/actions/lum-checkout@v4
 
-      # beacon and dft-wire-observe get their Rust toolchain from a
-      # per-repo container image built via luminartech/fw_ci's
-      # image-lifecycle workflow (see beacon's tools/docker/rust/Dockerfile
-      # and its `image-lifecycle` job). That machinery exists to give a
-      # large, multi-crate workspace a pinned, reproducible, network-
-      # isolated build environment, and adopting it here would mean vlanctl
-      # owning and maintaining its own Dockerfile-based image — real
-      # infrastructure this packaging-only change does not add.
-      #
-      # dtolnay/rust-toolchain is the smaller, more proportionate choice for
-      # one crate: no image to build or maintain, and it reads the
-      # toolchain vlanctl already builds against on this machine (edition
-      # 2024, stable). The one open question this doesn't answer: whether
-      # this org's self-hosted runners have outbound access to fetch the
-      # toolchain themselves, the way they can reach Kellnr. dft's CI has a
-      # comment noting its on-prem runners "can't reach public apt mirrors
-      # anyway" inside their custom container — if that restriction also
-      # applies to a bare (non-container) self-hosted runner, this step
-      # will need to change to the image-lifecycle + tools/docker/rust
-      # pattern beacon and dft use. Flagged for a human to confirm; this
-      # could not be verified from a disconnected dev machine.
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy, rustfmt
-
+      # No toolchain-install step here: rustc, cargo, clippy and rustfmt all
+      # come baked into the container image resolved by `image-lifecycle`
+      # above (see tools/docker/rust/Dockerfile). That image is what makes
+      # this job immune to runner drift — a `dtolnay/rust-toolchain@stable`
+      # step here would depend on the runner's own network egress and
+      # whatever else happens to be installed on it at job time, which is
+      # exactly the dependency this container removes.
       - name: Build
         run: cargo build --locked --all-targets
 
@@ -87,32 +94,173 @@ jobs:
       - name: Format
         run: cargo fmt --check
 
-  # Runs only on a version tag (`cargo release` pushes `vX.Y.Z`, see
-  # release.toml), and only after `test` passes — the same tag that
-  # triggers this job is checked out fresh and built/tested/linted again by
-  # `test` above (the `push.tags` trigger fires both jobs; `needs: test`
-  # gates this one on that run, not on whatever validation happened before
-  # the tag was pushed).
-  publish:
-    name: Publish to Kellnr
-    needs: test
-    if: startsWith(github.ref, 'refs/tags/v')
+  # Line-coverage report, run separately from `test` above so a coverage dip
+  # never blocks a merge or a release — vlanctl has no coverage-floor policy
+  # (unlike beacon's 85% gate, sized for a much larger, safety-relevant
+  # workspace). This job is purely informational: it does not appear in
+  # `publish`'s `needs`, and `continue-on-error` keeps a coverage-tool
+  # failure from going red in the PR checks list.
+  #
+  # Runs on the stable toolchain, not nightly: cargo-llvm-cov's basic
+  # line-coverage report only needs rustc's `-C instrument-coverage`, stable
+  # since Rust 1.60. Nightly buys a more precise report (the
+  # `#[coverage(off)]` attribute beacon's `.cargo/config.toml` `cov` alias
+  # uses to exclude test modules from the numbers) at the cost of carrying a
+  # whole second toolchain in the image — not worth it for one small crate.
+  # `--ignore-filename-regex` gets the same "don't count test code" result
+  # for the integration test file (tests/lib_surface.rs) without it: that
+  # flag is cargo-llvm-cov's own reporting option, not a compiler feature, so
+  # it works the same on stable as on nightly.
+  coverage:
+    name: Coverage
+    needs: [image-lifecycle]
+    continue-on-error: true
     runs-on: [x86, Linux, small]
+    container:
+      image: ${{ fromJson(needs.image-lifecycle.outputs.data).rust.image }}
+      credentials:
+        username: ${{ secrets[fromJson(needs.image-lifecycle.outputs.data).rust.username_secret] }}
+        password: ${{ secrets[fromJson(needs.image-lifecycle.outputs.data).rust.token_secret] }}
     env:
       CARGO_REGISTRIES_KELLNR_TOKEN: ${{ secrets.KELLNR_CI_TOKEN }}
     steps:
       - uses: luminartech/fw_ci/.github/actions/lum-checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      # Run the suite once under instrumentation (`--no-report` just
+      # collects profile data), then ask for as many report formats as we
+      # want from that one run — same split beacon uses so re-running the
+      # tests per format is never necessary. No cobertura here: beacon's is
+      # consumed by a Testspace upload vlanctl has no equivalent of; add it
+      # back if something starts reading it.
+      - name: Run tests with coverage
+        run: |
+          mkdir -p target/llvm-cov
+          cargo llvm-cov --locked --all-targets --no-report
+          cargo llvm-cov report --ignore-filename-regex '[/\\]tests[/\\]' \
+            --lcov --output-path target/llvm-cov/lcov.info
+          cargo llvm-cov report --ignore-filename-regex '[/\\]tests[/\\]' \
+            --html --output-dir target/llvm-cov/html
 
-      # cargo-release isn't part of the toolchain image beacon/dft bake it
-      # into, and vlanctl has no such image (see the `test` job above) — so
-      # it's installed here instead. `--locked` pins it to the versions in
-      # its own lockfile for a reproducible install; this crate itself is
-      # still fetched through the Kellnr crates.io proxy per
-      # .cargo/config.toml.
-      - name: Install cargo-release
-        run: cargo install cargo-release --locked
+      # Written to both the job log and $GITHUB_STEP_SUMMARY: the point of
+      # this job is a coverage number a human can see at a glance on the
+      # run's summary page, not one they have to click into a job and scroll
+      # the log to find (which is all beacon's own `Display coverage
+      # summary` step does).
+      - name: Display coverage summary
+        run: |
+          {
+            echo '### Line coverage'
+            echo '```'
+            cargo llvm-cov report --ignore-filename-regex '[/\\]tests[/\\]' --summary-only
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # No minimum-coverage gate here (beacon has one: it greps the summary
+      # for the line-coverage percentage and fails under 85%). Deliberately
+      # deferred until after phase 2/3, once there's a measured baseline to
+      # pick a sensible floor from — not an oversight. When that lands, it
+      # is a step here, not a change to `needs: test` or `publish`: coverage
+      # should stay advisory-by-default even once it can fail.
+      - name: Upload coverage report (LCOV + HTML)
+        if: always()
+        uses: luminartech/fw_ci/.github/actions/lum-upload-artifact@v4
+        with:
+          name: coverage-report
+          path: target/llvm-cov
+          s3-project: vlanctl
+          s3-path: coverage
+          s3-access-key: ${{ vars.LUM_CEPH_ACCESS_KEY_ID }}
+          s3-secret-key: ${{ secrets.LUM_CEPH_SECRET_ACCESS_KEY }}
+
+  # Compares this build's public API against a baseline and fails on a
+  # breaking change cargo hasn't bumped the major/minor version for.
+  # Advisory on PR/branch builds (continue-on-error), a hard gate on tag
+  # builds — there it runs directly ahead of `publish` (which lists this job
+  # in `needs`), so a real semver break must block the release rather than
+  # just get logged.
+  semver-checks:
+    name: Semver Checks
+    needs: [image-lifecycle]
+    continue-on-error: ${{ github.ref_type != 'tag' }}
+    runs-on: [x86, Linux, small]
+    container:
+      image: ${{ fromJson(needs.image-lifecycle.outputs.data).rust.image }}
+      credentials:
+        username: ${{ secrets[fromJson(needs.image-lifecycle.outputs.data).rust.username_secret] }}
+        password: ${{ secrets[fromJson(needs.image-lifecycle.outputs.data).rust.token_secret] }}
+    env:
+      CARGO_REGISTRIES_KELLNR_TOKEN: ${{ secrets.KELLNR_CI_TOKEN }}
+    steps:
+      - uses: luminartech/fw_ci/.github/actions/lum-checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Pick the baseline the comparison answers for:
+      #  - Tag builds: the previous release tag — the latest version already
+      #    on Kellnr, which is what decides whether THIS version number is
+      #    legal to publish. vlanctl has published nothing yet, so its very
+      #    first tag has no previous tag to compare against; that's the only
+      #    case this skips (and it only skips the check, never the job — the
+      #    job still succeeds, since "nothing to compare" isn't a failure).
+      #  - PR/branch builds: `main`, to catch a breaking change before it
+      #    merges rather than at release time.
+      - name: Determine semver baseline
+        id: baseline
+        shell: bash
+        run: |
+          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+            git fetch origin '+refs/tags/*:refs/tags/*'
+            prev="$(git tag --list 'v[0-9]*' --sort=-v:refname | grep -Fxv '${{ github.ref_name }}' | head -n1 || true)"
+            if [[ -z "$prev" ]]; then
+              echo "::notice::No previous release tag exists; skipping semver check for the first release."
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "Comparing ${{ github.ref_name }} against previous release $prev"
+              echo "rev=$prev" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            git fetch origin "+refs/heads/${DEFAULT_BRANCH}:refs/remotes/origin/${DEFAULT_BRANCH}"
+            echo "rev=origin/${DEFAULT_BRANCH}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check semver
+        if: steps.baseline.outputs.skip != 'true'
+        uses: obi1kenobi/cargo-semver-checks-action@v2
+        with:
+          baseline-rev: ${{ steps.baseline.outputs.rev }}
+          # The container already ships an active stable toolchain; letting
+          # the action `rustup toolchain install` its own fails with
+          # "Invalid cross-device link" (rustup's tmp dir and the toolchains
+          # dir sit on different mounts in this image) — use what's already
+          # present instead, same workaround beacon uses.
+          rust-toolchain: manual
+
+  # Runs only on a version tag (`cargo release` pushes `vX.Y.Z`, see
+  # release.toml), and only after `test` and `semver-checks` pass — the same
+  # tag that triggers this job is checked out fresh and built/tested/linted
+  # again by `test` above (the `push.tags` trigger fires all these jobs;
+  # `needs` gates this one on that run, not on whatever validation happened
+  # before the tag was pushed). `coverage` is deliberately not in `needs`:
+  # see that job's comment for why it's informational only.
+  publish:
+    name: Publish to Kellnr
+    needs: [test, image-lifecycle, semver-checks]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: [x86, Linux, small]
+    container:
+      image: ${{ fromJson(needs.image-lifecycle.outputs.data).rust.image }}
+      credentials:
+        username: ${{ secrets[fromJson(needs.image-lifecycle.outputs.data).rust.username_secret] }}
+        password: ${{ secrets[fromJson(needs.image-lifecycle.outputs.data).rust.token_secret] }}
+    env:
+      CARGO_REGISTRIES_KELLNR_TOKEN: ${{ secrets.KELLNR_CI_TOKEN }}
+    steps:
+      - uses: luminartech/fw_ci/.github/actions/lum-checkout@v4
+
+      # No "Install cargo-release" step here: it's baked into the image
+      # (tools/docker/rust/Dockerfile), pinned the same way beacon pins it
+      # in its own rust image, since both repos publish to the same Kellnr
+      # registry with the same tool.
 
       # No "skip already-published crates" step here, unlike beacon's
       # publish job. That step exists there to make a re-run of a *partial*
