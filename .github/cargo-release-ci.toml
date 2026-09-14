@@ -1,0 +1,29 @@
+# cargo-release overrides for the CI publish job ONLY, layered on top of
+# release.toml via `cargo release publish -c .github/cargo-release-ci.toml`
+# (`-c` layers above the base config, per cargo-release's own precedence
+# rules). Same split as luminartech/beacon's file of the same name — see
+# that repo for the pattern this was copied from. Two things differ from the
+# local developer flow that release.toml configures:
+#
+#  - publish = true: release.toml disables the publish step so a local
+#    `cargo release <level>` never uploads; this job's entire purpose is the
+#    upload, and `cargo release publish` silently skips any package whose
+#    resolved config says publish = false.
+#  - allow-branch = ["HEAD"]: this job runs on the tag's detached-HEAD
+#    checkout, where the branch reports as `HEAD` and release.toml's `main`
+#    allowlist would refuse it.
+publish = true
+allow-branch = ["HEAD"]
+
+# Publish-only: the tag was already pushed by the developer's `cargo
+# release`, and a detached-HEAD checkout has no push target anyway (this
+# silences the "push target `origin/HEAD` doesn't exist" warning).
+push = false
+
+# Unlike beacon.toml (a multi-crate workspace whose [rate-limit] override
+# exists because Kellnr reports every crate in the workspace as "new" to
+# cargo-release, which would otherwise trip its crates.io-oriented rate
+# limit before the workspace's full publishable-crate count clears it),
+# vlanctl is a single crate. One publish never approaches that default
+# limit, so no [rate-limit] override is needed here — if vlanctl grows into
+# a workspace, revisit this the same way beacon did.
