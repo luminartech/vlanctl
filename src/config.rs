@@ -306,12 +306,12 @@ address = "10.0.0.5/24"
     fn accepts_mac_on_gatewayless_host_route() {
         let p = profile_with(
             "[[interface]]\naddress = \"192.168.1.100/24\"\n\
-             [[interface.route]]\ndestination = \"192.168.10.151/32\"\nmac = \"3a:42:f7:79:32:2e\"\n",
+             [[interface.route]]\ndestination = \"192.168.10.151/32\"\nmac = \"00:00:5e:00:53:01\"\n",
         )
         .unwrap();
         assert_eq!(
             p.interfaces[0].routes[0].mac.as_deref(),
-            Some("3a:42:f7:79:32:2e")
+            Some("00:00:5e:00:53:01")
         );
     }
 
@@ -319,7 +319,7 @@ address = "10.0.0.5/24"
     fn rejects_mac_with_gateway() {
         let err = profile_with(
             "[[interface]]\naddress = \"192.168.1.2/24\"\n\
-             [[interface.route]]\ndestination = \"192.168.10.151/32\"\ngateway = \"192.168.1.1\"\nmac = \"3a:42:f7:79:32:2e\"\n",
+             [[interface.route]]\ndestination = \"192.168.10.151/32\"\ngateway = \"192.168.1.1\"\nmac = \"00:00:5e:00:53:01\"\n",
         )
         .unwrap_err();
         assert!(err.to_string().contains("gateway"));
@@ -329,7 +329,7 @@ address = "10.0.0.5/24"
     fn rejects_mac_on_non_host_route() {
         let err = profile_with(
             "[[interface]]\naddress = \"192.168.1.2/24\"\n\
-             [[interface.route]]\ndestination = \"192.168.10.0/24\"\nmac = \"3a:42:f7:79:32:2e\"\n",
+             [[interface.route]]\ndestination = \"192.168.10.0/24\"\nmac = \"00:00:5e:00:53:01\"\n",
         )
         .unwrap_err();
         assert!(err.to_string().contains("/32") || err.to_string().contains("single host"));

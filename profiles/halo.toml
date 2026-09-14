@@ -17,7 +17,7 @@ address = "192.168.1.100/24"
   # hand-authored profiles.)
   [[interface.route]]
   destination = "192.168.10.151/32"
-  mac = "3a:42:f7:79:32:2e"
+  mac = "00:00:5e:00:53:01"
 
   # SOME/IP-SD multicast group.
   [[interface.route]]
@@ -48,6 +48,6 @@ address = "192.168.11.87/24"
   destination = "192.168.11.151/32"
 
 # HARDWARE NOTE: requires a USB NIC that transmits 802.1Q tags under macOS.
-# The 98:fc:84:ec:ea:f1 dongle (en7) silently drops tags on TX; the Realtek
+# The 98:fc:84:… dongle (en7) silently drops tags on TX; the Realtek
 # dongle (00:e0:4c:..., en16) works. Pin `device` to the good adapter if
 # auto-detect might pick the bad one.

@@ -996,7 +996,7 @@ mod tests {
             routes: vec![Route {
                 destination: "192.168.10.151/32".to_string(),
                 gateway: None,
-                mac: Some("3a:42:f7:79:32:2e".to_string()),
+                mac: Some("00:00:5e:00:53:01".to_string()),
             }],
         };
         let rendered: Vec<String> = bringup_commands_for(&MacOs, &i, "en7")
@@ -1008,7 +1008,7 @@ mod tests {
             vec![
                 "ifconfig en7 inet 192.168.1.100 netmask 255.255.255.0 alias",
                 "route add -host 192.168.10.151 -interface en7",
-                "arp -s 192.168.10.151 3a:42:f7:79:32:2e",
+                "arp -s 192.168.10.151 00:00:5e:00:53:01",
             ],
             "macOS rendering changed"
         );
@@ -1169,7 +1169,7 @@ mod tests {
         u.routes.push(Route {
             destination: "192.168.10.151/32".to_string(),
             gateway: None,
-            mac: Some("3a:42:f7:79:32:2e".to_string()),
+            mac: Some("00:00:5e:00:53:01".to_string()),
         });
         let cmds = bringup_commands(&u, "en16");
         let rendered: Vec<String> = cmds.iter().map(|c| c.display()).collect();
@@ -1178,7 +1178,7 @@ mod tests {
             vec![
                 "ifconfig en16 inet 192.168.1.100 netmask 255.255.255.0 alias",
                 "route add -host 192.168.10.151 -interface en16",
-                "arp -s 192.168.10.151 3a:42:f7:79:32:2e",
+                "arp -s 192.168.10.151 00:00:5e:00:53:01",
             ]
         );
     }
@@ -1308,7 +1308,7 @@ mod tests {
         let route = Route {
             destination: "192.168.11.151/32".to_string(),
             gateway: None,
-            mac: Some("3a:42:f7:79:32:2e".to_string()),
+            mac: Some("00:00:5e:00:53:01".to_string()),
         };
         let rendered: Vec<String> = Linux
             .route_commands(&route, true, "eth0.11")
@@ -1319,7 +1319,7 @@ mod tests {
             rendered,
             vec![
                 "ip route add 192.168.11.151/32 dev eth0.11",
-                "ip neigh replace 192.168.11.151 lladdr 3a:42:f7:79:32:2e dev eth0.11",
+                "ip neigh replace 192.168.11.151 lladdr 00:00:5e:00:53:01 dev eth0.11",
             ],
             "got {rendered:?}"
         );
@@ -1331,7 +1331,7 @@ mod tests {
         let route = Route {
             destination: "192.168.11.151/32".to_string(),
             gateway: None,
-            mac: Some("3a:42:f7:79:32:2e".to_string()),
+            mac: Some("00:00:5e:00:53:01".to_string()),
         };
         // In-subnet on macOS: no route at all (self-MAC black-hole), arp only.
         let rendered: Vec<String> = MacOs
@@ -1346,7 +1346,7 @@ mod tests {
         assert!(
             rendered
                 .iter()
-                .any(|c| c == "arp -s 192.168.11.151 3a:42:f7:79:32:2e")
+                .any(|c| c == "arp -s 192.168.11.151 00:00:5e:00:53:01")
         );
     }
 
@@ -1355,7 +1355,7 @@ mod tests {
         let route = Route {
             destination: "192.168.10.151/32".to_string(),
             gateway: None,
-            mac: Some("3a:42:f7:79:32:2e".to_string()),
+            mac: Some("00:00:5e:00:53:01".to_string()),
         };
         let rendered: Vec<String> = MacOs
             .route_commands(&route, false, "en7")
@@ -1366,7 +1366,7 @@ mod tests {
             rendered,
             vec![
                 "route add -host 192.168.10.151 -interface en7",
-                "arp -s 192.168.10.151 3a:42:f7:79:32:2e",
+                "arp -s 192.168.10.151 00:00:5e:00:53:01",
             ],
             "order matters: arp -s overwrites the self-MAC entry the route installs, \
              and an `arp -d` between them deletes the route"
@@ -1403,7 +1403,7 @@ mod tests {
             routes: vec![Route {
                 destination: "192.168.10.151/32".to_string(),
                 gateway: None,
-                mac: Some("3a:42:f7:79:32:2e".to_string()),
+                mac: Some("00:00:5e:00:53:01".to_string()),
             }],
         };
         for i in [&tagged, &untagged] {

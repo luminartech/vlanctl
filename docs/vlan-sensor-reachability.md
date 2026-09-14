@@ -17,8 +17,8 @@ untagged), and **several of them share one IP subnet** across different VLANs:
 | DoIP       | 10 (Iris)| `192.168.10.150` | —                | |
 | Telnet (debug) | 12   | `192.168.10.152` | `192.168.10.1/24` | |
 
-The sensor's VLAN interfaces share one MAC (`3a:42:f7:79:32:2e`); the untagged
-point-cloud interface has its own (`00:11:c6:01:36:22`). Layouts differ by
+The sensor's VLAN interfaces share one MAC (`00:00:5e:00:53:01`); the untagged
+point-cloud interface has its own (`00:00:5e:00:53:02`). Layouts differ by
 product (the Iris VLAN-10/11 layout vs the Halo untagged-data + VLAN-12 layout),
 so confirm addresses from the device, not assumptions.
 
@@ -100,14 +100,14 @@ static entry. The working macOS sequence is exactly two commands:
 
 ```
 route add -host 192.168.10.151 -interface en16
-arp -s 192.168.10.151 3a:42:f7:79:32:2e
+arp -s 192.168.10.151 00:00:5e:00:53:01
 ```
 
 The `arp -s` overwrites the LLINFO self-MAC entry (#2) with the real MAC; frames
 then egress to the sensor. Result:
 
 ```
-? (192.168.10.151) at 3a:42:f7:79:32:2e on en16 permanent   (single, real MAC)
+? (192.168.10.151) at 00:00:5e:00:53:01 on en16 permanent   (single, real MAC)
 ```
 
 **Trap:** do *not* insert a defensive `arp -d <host>` between those two

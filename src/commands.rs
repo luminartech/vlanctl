@@ -813,7 +813,7 @@ mod tests {
         let p: Profile = toml::from_str(
             "name=\"halo\"\ndevice=\"en0\"\n\
              [[interface]]\naddress=\"192.168.1.100/24\"\n\
-             [[interface.route]]\ndestination=\"192.168.10.151/32\"\nmac=\"3a:42:f7:79:32:2e\"\n",
+             [[interface.route]]\ndestination=\"192.168.10.151/32\"\nmac=\"00:00:5e:00:53:01\"\n",
         )
         .unwrap();
         p.validate().unwrap();
@@ -831,7 +831,7 @@ mod tests {
         // The route is added, then a single static ARP entry — no `arp -d`,
         // which on macOS would delete the freshly-added host route.
         assert!(rendered.contains(&"route add -host 192.168.10.151 -interface en0".to_string()));
-        assert!(rendered.contains(&"arp -s 192.168.10.151 3a:42:f7:79:32:2e".to_string()));
+        assert!(rendered.contains(&"arp -s 192.168.10.151 00:00:5e:00:53:01".to_string()));
         assert!(!rendered.iter().any(|c| c.starts_with("arp -d")));
     }
 
