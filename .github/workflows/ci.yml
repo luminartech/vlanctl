@@ -54,6 +54,13 @@ jobs:
       use-audit-check: true
       # release-plz owns versioning, changelogs, tags, and publishing.
       use-release-plz: true
+      # run-msrv and run-semver-checks are left at their defaults (both
+      # true). Note for reviewers: Semver Checks will fail on every PR until
+      # vlanctl's first crates.io publish -- cargo-semver-checks compares
+      # against the published baseline and there isn't one yet
+      # ("vlanctl not found in registry (crates.io)"). That resolves itself
+      # once release-plz cuts the first release; it is not a bug in this
+      # workflow.
       # vlanctl is a std-only CLI (anyhow, clap, serde_json, ...); it has
       # never been built no_std and has no `alloc` feature to build/lint
       # for a bare-metal target.
@@ -65,6 +72,17 @@ jobs:
       run-property-tests: false
       # No fuzz/ directory or cargo-fuzz targets in this repo.
       run-fuzz-tests: false
+      # Confirmed by a real run: Miri's default isolation blocks the real
+      # filesystem syscalls (unlink, etc.) vlanctl's unit tests exercise for
+      # its on-disk state file (src/state.rs, src/commands.rs tests) --
+      # `error: unsupported operation: 'unlink' not available when isolation
+      # is enabled`. Disabling isolation would let Miri's tests touch the
+      # real filesystem, which is a bigger workflow change than a toggle
+      # here supports (there is no miri-args passthrough for MIRIFLAGS).
+      # vlanctl's only unsafe code is a single trivial `libc::getuid()` call
+      # (src/main.rs), so Miri's undefined-behavior detection buys little
+      # for the cost of reworking the test suite around it.
+      run-miri-tests: false
       # No .pre-commit-config.yaml in this repo; `pre-commit run --all-files`
       # would fail immediately looking for one.
       run-pre-commit: false
