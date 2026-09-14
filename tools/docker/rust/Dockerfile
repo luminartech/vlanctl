@@ -25,7 +25,10 @@
 # cargo-semver-checks ARE included below — both have jobs in
 # .github/workflows/ci.yml that invoke them. If vlanctl grows any of the
 # excluded needs, add the corresponding tool here rather than reaching for a
-# bare runner.
+# bare runner. This repo has no Python of its own, but it does carry the `uv`
+# binaries and a `uv python install`-ed interpreter below — that's a
+# dependency of a shared fw_ci action the `coverage` job calls, not of
+# vlanctl; see that COPY line's comment before removing it.
 
 FROM harbor-eq-dc.sw-ci.kraken.as/dockerhub-proxy/ubuntu:22.04
 
@@ -101,3 +104,22 @@ RUN cargo-binstall cargo-release --locked --version 0.25.17 \
 # /runner/_work; neither exists in a stock Ubuntu image and checkout fails
 # without them.
 RUN mkdir -m 1777 /__w && mkdir -m 1777 -p /runner/_work
+
+# uv (+ its `uvx` sibling): NOT a dependency of vlanctl itself, which has no
+# Python anywhere in this repo — this is here solely because
+# luminartech/fw_ci/.github/actions/lum-upload-artifact (used by the
+# `coverage` job to push the LCOV/HTML report to S3) is implemented as a
+# Python package and shells out to `uv run` internally. Without it that step
+# fails with "uv: command not found" before it ever gets to argument
+# validation. Same reason beacon and dft both carry uv in their rust images.
+# If you are doing a lean-image pass and this looks unused, it is not: remove
+# it and the `coverage` job's upload step breaks again.
+#
+# fw_ci's pyproject.toml pins `requires-python = ">=3.12,<4"`, which is newer
+# than Ubuntu 22.04's system Python (3.10), so `uv python install` bakes a
+# matching interpreter into the image at build time — same as beacon. This is
+# the minimum the action needs: no venv, no pytest/ruff (that's dft's
+# python-ci job, which vlanctl has no equivalent of).
+COPY --from=harbor-eq-dc.sw-ci.kraken.as/dockerhub-proxy/astral/uv:latest /uv /uvx /bin/
+ARG PYTHON_VERSION=3.12
+RUN uv python install ${PYTHON_VERSION}
