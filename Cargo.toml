@@ -15,8 +15,15 @@ description = "Apply and tear down named VLAN profiles for lidar sensor networki
 repository = "https://github.com/luminartech/vlanctl"
 homepage = "https://github.com/luminartech/vlanctl"
 documentation = "https://docs.rs/vlanctl"
-keywords = ["vlan", "networking", "cli", "macos", "interface"]
-categories = ["command-line-utilities", "network-programming", "os::macos-apis"]
+keywords = ["vlan", "networking", "cli", "macos", "linux"]
+categories = [
+    "command-line-utilities",
+    "network-programming",
+    "os::macos-apis",
+    "os::linux-apis",
+]
+# CI and release tooling are not part of what a consumer builds against.
+exclude = [".github/", ".gitignore", "deny.toml", "release.toml", "release-plz.toml"]
 
 [lib]
 name = "vlanctl"

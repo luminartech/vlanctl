@@ -6,7 +6,7 @@
 # `cargo package`/`cargo publish` picked up ~900 of this directory's index
 # files (transaction logs, manifests) alongside the ~20 files that actually
 # belong in the crate. Found via `cargo package --list` while wiring up the
-# Kellnr release pipeline; see release.toml and .github/cargo-release-ci.toml.
+# release pipeline; see release.toml and release-plz.toml.
 /.omniscient/
 
 # Working documents live on disk, not in git.
