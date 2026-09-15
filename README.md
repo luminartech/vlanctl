@@ -29,9 +29,8 @@ vlanctl status                     # what is currently up
 ```
 
 A global `--profiles-dir <dir>` (default `profiles`) selects where profiles are
-read from. `apply` with no profile argument defaults to the name `lum`, which is
-our bench profile — supply your own `profiles/lum.toml`, or name a profile
-explicitly.
+read from. `apply` with no profile argument defaults to the name `lum`; supply
+your own `profiles/lum.toml`, or name a profile explicitly.
 
 `apply` and `show` also take `--device <name>`, which picks the parent adapter
 the VLANs attach to and overrides any `device` field in the profile. The parent

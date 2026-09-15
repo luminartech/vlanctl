@@ -47,10 +47,12 @@ string. `Cmd::display()` renders a shell-*like* string, but only for `show` and
 
 ## Profiles
 
-Only `profiles/example.toml` ships in the published crate. The sensor profiles
-alongside it are bench configuration: they encode particular VLAN layouts, and
-`halo.toml` pins one unit's MAC for a static ARP entry. They are useful in this
-repository and misleading in a crate, so `Cargo.toml` excludes them.
+`profiles/example.toml` is the only profile in this repository. Bench profiles
+-- ones that encode a particular sensor's VLAN layout, or pin a unit's MAC for
+a static ARP entry -- are configuration for the bench that runs them, not
+examples for a general reader, and they live with that bench rather than here.
+A new profile added to this repository should be one anybody can read and learn
+the schema from.
 
 Every TOML block in `README.md` is a profile a reader will copy, so each one
 should parse and validate against the real deserializer. The README once

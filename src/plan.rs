@@ -1775,9 +1775,9 @@ mod tests {
         // untagged entry configures the parent device directly, and
         // `ip addr add` SUCCEEDS on an admin-down link — then the entry's own
         // routes are emitted against a down device and the kernel rejects them
-        // with ENETDOWN, aborting the apply. An untagged-only profile
-        // (profiles/halo.toml's datapath entry is exactly this, and it is
-        // applied FIRST) has no later tagged entry to raise the parent at all.
+        // with ENETDOWN, aborting the apply. An untagged-only profile has no
+        // later tagged entry to raise the parent at all -- and a sensor whose
+        // data path is untagged puts exactly that entry first.
         assert_eq!(
             rendered,
             vec![
