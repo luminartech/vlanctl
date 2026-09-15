@@ -10,8 +10,10 @@ is chosen from the host at run time.
 cargo install vlanctl
 ```
 
-Profiles are read from `--profiles-dir` (default `./profiles`). The examples in
-this repository's `profiles/` directory are a starting point.
+Profiles are read from `--profiles-dir` (default `./profiles`). The crate ships
+`profiles/example.toml` as a starting point; the sensor profiles used on our
+benches are bench configuration and live in the project repository rather than
+the published crate.
 
 ## Usage
 
@@ -27,7 +29,9 @@ vlanctl status                     # what is currently up
 ```
 
 A global `--profiles-dir <dir>` (default `profiles`) selects where profiles are
-read from.
+read from. `apply` with no profile argument defaults to the name `lum`, which is
+our bench profile — supply your own `profiles/lum.toml`, or name a profile
+explicitly.
 
 `apply` and `show` also take `--device <name>`, which picks the parent adapter
 the VLANs attach to and overrides any `device` field in the profile. The parent
@@ -45,7 +49,7 @@ carry 802.1Q VLANs); use `--device` when it is ambiguous or picks wrong.
 ```rust
 use vlanctl::{commands, config::Profile, net::RecordingRunner, plan::MacOs};
 
-let profile = Profile::load("profiles/lum.toml".as_ref())?;
+let profile = Profile::load("profiles/example.toml".as_ref())?;
 let mut runner = RecordingRunner::default();      // or SystemRunner to execute
 // 4th argument overrides the parent device. Profiles do not pin one — it is
 // host-local — so a consumer supplies it, or passes `None` to auto-detect
@@ -138,8 +142,8 @@ itself:
   mac = "00:00:5e:00:53:01"
 ```
 
-See `profiles/example.toml` (gateway route) and `profiles/lum.toml` /
-`profiles/lum_legacy.toml` (interface-scoped routes for real sensor setups).
+See `profiles/example.toml`, which uses a gateway route; the interface-scoped
+form above is what real sensor profiles use.
 
 ## Notes
 

@@ -22,8 +22,20 @@ categories = [
     "os::macos-apis",
     "os::linux-apis",
 ]
-# CI and release tooling are not part of what a consumer builds against.
-exclude = [".github/", ".gitignore", "deny.toml", "release.toml", "release-plz.toml"]
+# CI and release tooling are not part of what a consumer builds against. The
+# sensor profiles are bench configuration, not examples: halo.toml in
+# particular pins one unit's MAC for a static ARP entry, which is wrong for
+# every other reader. They stay in the repository; only example.toml ships.
+exclude = [
+    ".github/",
+    ".gitignore",
+    "deny.toml",
+    "release.toml",
+    "release-plz.toml",
+    "profiles/halo.toml",
+    "profiles/lum.toml",
+    "profiles/lum_legacy.toml",
+]
 
 [lib]
 name = "vlanctl"
