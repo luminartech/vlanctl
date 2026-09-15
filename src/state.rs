@@ -56,7 +56,7 @@ mod tests {
     fn round_trips_through_disk() {
         let path = std::env::temp_dir().join("vlanctl-test-state.json");
         let state = State {
-            active_profile: Some("iris_bench".to_string()),
+            active_profile: Some("example_bench".to_string()),
             interfaces: vec!["vlan0".to_string(), "vlan1".to_string()],
         };
         state.save(&path).unwrap();

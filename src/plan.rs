@@ -10,7 +10,7 @@ use ipnet::IpNet;
 /// Two of the emission methods return **decisions, not syntax**, and that is
 /// deliberate. The straight-line logic this trait replaces looked universal
 /// but encoded macOS semantics; a port that shared it would silently break
-/// the other platforms. See the dft-side design §4.3.1.
+/// the other platforms.
 ///
 /// The state-reading methods (`list_devices`, `addresses_on`, `is_wireless`,
 /// `link_is_active`) exist for the same reason: they parse the output of
@@ -37,7 +37,7 @@ pub trait Platform {
 
     /// Interface name for a profile entry. `vlan11` on macOS, `eth0.11` on
     /// Linux (or `vlan11` when the dotted form would exceed the kernel's
-    /// name limit), `vEthernet (IrisVlan11)` on Windows. Untagged entries
+    /// name limit), and a named `vEthernet` switch on Windows. Untagged entries
     /// return the parent device.
     ///
     /// This is the single source of every sub-interface name: bring-up,
@@ -468,8 +468,8 @@ impl Platform for Linux {
     }
 
     fn is_candidate_device(&self, name: &str) -> bool {
-        // Mirrors the exclusion list in the proven `iris_vlan_up.sh`, which
-        // is known to pick the right parent on this hardware. Linux wired
+        // Mirrors the exclusion list of the shell script this replaced, which
+        // was known to pick the right parent on our hardware. Linux wired
         // names are too varied to allow-list (`eth0`, `enp0s31f6`,
         // `enx<mac>`, `eno1`, `ens5`), so exclude what is definitely not a
         // parent instead. A name containing `.` is a VLAN sub-interface.
@@ -1948,7 +1948,7 @@ mod tests {
 
     #[test]
     fn linux_candidate_devices_exclude_loopback_virtual_and_vlan_subinterfaces() {
-        // Mirrors the proven `iris_vlan_up.sh` predicate. `eth0` is the real
+        // Mirrors that same predicate. `eth0` is the real
         // parent on this hardware and the macOS `starts_with("en")` filter
         // would have excluded it outright, which is why candidate selection
         // has to live behind the seam.
