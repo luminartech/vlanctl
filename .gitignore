@@ -1,5 +1,14 @@
 /target
 
+# Local semantic-search index for the omniscient MCP tool. It is untracked
+# scratch state, not source — and cargo's packaging step sweeps in *any*
+# untracked file that isn't gitignored, git repo or not. Without this line,
+# `cargo package`/`cargo publish` picked up ~900 of this directory's index
+# files (transaction logs, manifests) alongside the ~20 files that actually
+# belong in the crate. Found via `cargo package --list` while wiring up the
+# release pipeline; see release.toml and release-plz.toml.
+/.omniscient/
+
 # Working documents live on disk, not in git.
 #
 # Plans are consumed during execution and superseded by the commits they

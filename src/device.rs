@@ -112,9 +112,9 @@ mod tests {
 
     /// Two Wi-Fi (en0) + USB-LAN (en7) hardware ports, as `networksetup` prints them.
     fn hardware_ports() -> String {
-        "\nHardware Port: Wi-Fi\nDevice: en0\nEthernet Address: 84:2f:57:5f:c3:1a\n\n\
-         Hardware Port: USB 10/100/1000 LAN\nDevice: en7\nEthernet Address: 98:fc:84:ec:ea:f1\n\n\
-         Hardware Port: Ethernet Adapter (en4)\nDevice: en4\nEthernet Address: d6:d5:7e:e5:7c:1b\n"
+        "\nHardware Port: Wi-Fi\nDevice: en0\nEthernet Address: 00:00:5e:00:53:03\n\n\
+         Hardware Port: USB 10/100/1000 LAN\nDevice: en7\nEthernet Address: 00:00:5e:00:53:04\n\n\
+         Hardware Port: Ethernet Adapter (en4)\nDevice: en4\nEthernet Address: 00:00:5e:00:53:05\n"
             .to_string()
     }
 

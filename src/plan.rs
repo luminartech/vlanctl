@@ -10,7 +10,7 @@ use ipnet::IpNet;
 /// Two of the emission methods return **decisions, not syntax**, and that is
 /// deliberate. The straight-line logic this trait replaces looked universal
 /// but encoded macOS semantics; a port that shared it would silently break
-/// the other platforms. See the dft-side design §4.3.1.
+/// the other platforms.
 ///
 /// The state-reading methods (`list_devices`, `addresses_on`, `is_wireless`,
 /// `link_is_active`) exist for the same reason: they parse the output of
@@ -37,7 +37,7 @@ pub trait Platform {
 
     /// Interface name for a profile entry. `vlan11` on macOS, `eth0.11` on
     /// Linux (or `vlan11` when the dotted form would exceed the kernel's
-    /// name limit), `vEthernet (IrisVlan11)` on Windows. Untagged entries
+    /// name limit), and a named `vEthernet` switch on Windows. Untagged entries
     /// return the parent device.
     ///
     /// This is the single source of every sub-interface name: bring-up,
@@ -468,8 +468,8 @@ impl Platform for Linux {
     }
 
     fn is_candidate_device(&self, name: &str) -> bool {
-        // Mirrors the exclusion list in the proven `iris_vlan_up.sh`, which
-        // is known to pick the right parent on this hardware. Linux wired
+        // Mirrors the exclusion list of the shell script this replaced, which
+        // was known to pick the right parent on our hardware. Linux wired
         // names are too varied to allow-list (`eth0`, `enp0s31f6`,
         // `enx<mac>`, `eno1`, `ens5`), so exclude what is definitely not a
         // parent instead. A name containing `.` is a VLAN sub-interface.
@@ -996,7 +996,7 @@ mod tests {
             routes: vec![Route {
                 destination: "192.168.10.151/32".to_string(),
                 gateway: None,
-                mac: Some("3a:42:f7:79:32:2e".to_string()),
+                mac: Some("00:00:5e:00:53:01".to_string()),
             }],
         };
         let rendered: Vec<String> = bringup_commands_for(&MacOs, &i, "en7")
@@ -1008,7 +1008,7 @@ mod tests {
             vec![
                 "ifconfig en7 inet 192.168.1.100 netmask 255.255.255.0 alias",
                 "route add -host 192.168.10.151 -interface en7",
-                "arp -s 192.168.10.151 3a:42:f7:79:32:2e",
+                "arp -s 192.168.10.151 00:00:5e:00:53:01",
             ],
             "macOS rendering changed"
         );
@@ -1169,7 +1169,7 @@ mod tests {
         u.routes.push(Route {
             destination: "192.168.10.151/32".to_string(),
             gateway: None,
-            mac: Some("3a:42:f7:79:32:2e".to_string()),
+            mac: Some("00:00:5e:00:53:01".to_string()),
         });
         let cmds = bringup_commands(&u, "en16");
         let rendered: Vec<String> = cmds.iter().map(|c| c.display()).collect();
@@ -1178,7 +1178,7 @@ mod tests {
             vec![
                 "ifconfig en16 inet 192.168.1.100 netmask 255.255.255.0 alias",
                 "route add -host 192.168.10.151 -interface en16",
-                "arp -s 192.168.10.151 3a:42:f7:79:32:2e",
+                "arp -s 192.168.10.151 00:00:5e:00:53:01",
             ]
         );
     }
@@ -1308,7 +1308,7 @@ mod tests {
         let route = Route {
             destination: "192.168.11.151/32".to_string(),
             gateway: None,
-            mac: Some("3a:42:f7:79:32:2e".to_string()),
+            mac: Some("00:00:5e:00:53:01".to_string()),
         };
         let rendered: Vec<String> = Linux
             .route_commands(&route, true, "eth0.11")
@@ -1319,7 +1319,7 @@ mod tests {
             rendered,
             vec![
                 "ip route add 192.168.11.151/32 dev eth0.11",
-                "ip neigh replace 192.168.11.151 lladdr 3a:42:f7:79:32:2e dev eth0.11",
+                "ip neigh replace 192.168.11.151 lladdr 00:00:5e:00:53:01 dev eth0.11",
             ],
             "got {rendered:?}"
         );
@@ -1331,7 +1331,7 @@ mod tests {
         let route = Route {
             destination: "192.168.11.151/32".to_string(),
             gateway: None,
-            mac: Some("3a:42:f7:79:32:2e".to_string()),
+            mac: Some("00:00:5e:00:53:01".to_string()),
         };
         // In-subnet on macOS: no route at all (self-MAC black-hole), arp only.
         let rendered: Vec<String> = MacOs
@@ -1346,7 +1346,7 @@ mod tests {
         assert!(
             rendered
                 .iter()
-                .any(|c| c == "arp -s 192.168.11.151 3a:42:f7:79:32:2e")
+                .any(|c| c == "arp -s 192.168.11.151 00:00:5e:00:53:01")
         );
     }
 
@@ -1355,7 +1355,7 @@ mod tests {
         let route = Route {
             destination: "192.168.10.151/32".to_string(),
             gateway: None,
-            mac: Some("3a:42:f7:79:32:2e".to_string()),
+            mac: Some("00:00:5e:00:53:01".to_string()),
         };
         let rendered: Vec<String> = MacOs
             .route_commands(&route, false, "en7")
@@ -1366,7 +1366,7 @@ mod tests {
             rendered,
             vec![
                 "route add -host 192.168.10.151 -interface en7",
-                "arp -s 192.168.10.151 3a:42:f7:79:32:2e",
+                "arp -s 192.168.10.151 00:00:5e:00:53:01",
             ],
             "order matters: arp -s overwrites the self-MAC entry the route installs, \
              and an `arp -d` between them deletes the route"
@@ -1403,7 +1403,7 @@ mod tests {
             routes: vec![Route {
                 destination: "192.168.10.151/32".to_string(),
                 gateway: None,
-                mac: Some("3a:42:f7:79:32:2e".to_string()),
+                mac: Some("00:00:5e:00:53:01".to_string()),
             }],
         };
         for i in [&tagged, &untagged] {
@@ -1775,9 +1775,9 @@ mod tests {
         // untagged entry configures the parent device directly, and
         // `ip addr add` SUCCEEDS on an admin-down link — then the entry's own
         // routes are emitted against a down device and the kernel rejects them
-        // with ENETDOWN, aborting the apply. An untagged-only profile
-        // (profiles/halo.toml's datapath entry is exactly this, and it is
-        // applied FIRST) has no later tagged entry to raise the parent at all.
+        // with ENETDOWN, aborting the apply. An untagged-only profile has no
+        // later tagged entry to raise the parent at all -- and a sensor whose
+        // data path is untagged puts exactly that entry first.
         assert_eq!(
             rendered,
             vec![
@@ -1948,7 +1948,7 @@ mod tests {
 
     #[test]
     fn linux_candidate_devices_exclude_loopback_virtual_and_vlan_subinterfaces() {
-        // Mirrors the proven `iris_vlan_up.sh` predicate. `eth0` is the real
+        // Mirrors that same predicate. `eth0` is the real
         // parent on this hardware and the macOS `starts_with("en")` filter
         // would have excluded it outright, which is why candidate selection
         // has to live behind the seam.

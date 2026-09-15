@@ -1,0 +1,99 @@
+# Thin caller for the org-wide reusable Rust CI workflow. This file owns the
+# triggers and repo-specific configuration; luminartech/rust_workflow owns the
+# jobs (pre-commit, lint, build, no_std canary, unit/property/fuzz tests,
+# miri, MSRV, semver, security audit, docs, publish dry run, and release-plz
+# automation).
+name: CI
+
+on:
+  pull_request:
+  merge_group:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '0 5 * * *'
+  workflow_dispatch:
+    inputs:
+      enable-comprehensive-tests:
+        description: 'Run comprehensive test suites (longer fuzz, miri)'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    uses: luminartech/rust_workflow/.github/workflows/rust-ci.yml@v1
+    # Test jobs downscope themselves to contents: read; this grant is only
+    # used by the release-plz jobs (release PR + tag/GitHub-release publish).
+    permissions:
+      contents: write
+      pull-requests: write
+      # For audit-check's PR annotations (use-audit-check below).
+      checks: write
+    secrets:
+      cargo-registry-token: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      codecov-token: ${{ secrets.CODECOV_TOKEN }}
+      # release-plz-app-id / release-plz-app-private-key are intentionally
+      # omitted: vlanctl has no GitHub App configured. The release-plz jobs
+      # fall back to github.token, whose only real cost is that a
+      # release-plz release PR does not itself trigger this workflow (a
+      # human push, or a re-run, is needed to get CI on that PR). Add the
+      # App secrets here if that becomes a problem.
+    with:
+      # Restrict publishing to the canonical repo so forks never publish.
+      publish-repository: luminartech/vlanctl
+      # Publish cargo-audit findings as a check run with PR annotations
+      # (fork PRs automatically fall back to the plain cargo-audit step).
+      use-audit-check: true
+      # release-plz owns versioning, changelogs, tags, and publishing.
+      use-release-plz: true
+      # run-msrv and run-semver-checks are left at their defaults (both
+      # true). Note for reviewers: Semver Checks will fail on every PR until
+      # vlanctl's first crates.io publish -- cargo-semver-checks compares
+      # against the published baseline and there isn't one yet
+      # ("vlanctl not found in registry (crates.io)"). That resolves itself
+      # once release-plz cuts the first release; it is not a bug in this
+      # workflow.
+      # vlanctl is a std-only CLI (anyhow, clap, serde_json, ...); it has
+      # never been built no_std and has no `alloc` feature to build/lint
+      # for a bare-metal target.
+      run-no-std: false
+      alloc-feature: ''
+      # No property tests (no `prop_`-prefixed tests, no proptest
+      # dependency). Leaving this on would run nextest with the default
+      # `test(~prop_)` filter, select zero tests, and fail the job.
+      run-property-tests: false
+      # No fuzz/ directory or cargo-fuzz targets in this repo.
+      run-fuzz-tests: false
+      # Confirmed by a real run: Miri's default isolation blocks the real
+      # filesystem syscalls (unlink, etc.) vlanctl's unit tests exercise for
+      # its on-disk state file (src/state.rs, src/commands.rs tests) --
+      # `error: unsupported operation: 'unlink' not available when isolation
+      # is enabled`. Disabling isolation would let Miri's tests touch the
+      # real filesystem, which is a bigger workflow change than a toggle
+      # here supports (there is no miri-args passthrough for MIRIFLAGS).
+      # vlanctl's only unsafe code is a single trivial `libc::getuid()` call
+      # (src/main.rs), so Miri's undefined-behavior detection buys little
+      # for the cost of reworking the test suite around it.
+      run-miri-tests: false
+      # No .pre-commit-config.yaml in this repo; `pre-commit run --all-files`
+      # would fail immediately looking for one.
+      run-pre-commit: false
+      # The shared workflow's default also denies clippy::pedantic. vlanctl
+      # was never written against pedantic (74 findings today, mostly
+      # redundant-closure-for-method-calls in src/plan.rs) and fixing that
+      # lint tier is out of scope for this re-template. Keep the warnings
+      # gate the hand-rolled CI already enforced.
+      clippy-args: '-D warnings'
+      # No CODECOV_TOKEN secret exists on this repo yet. Coverage still runs
+      # inside the Unit Tests job (and uploads as a build artifact); only the
+      # Codecov upload step is off. Flip this to true once CODECOV_TOKEN is
+      # added as a repo secret.
+      upload-codecov: false

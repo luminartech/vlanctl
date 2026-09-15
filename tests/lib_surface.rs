@@ -39,15 +39,15 @@ fn library_builds_without_the_cli_feature() {
 
 /// Compile-tests the README's "Library use" snippet: a consumer supplies a
 /// `CommandRunner` and a `Platform` and drives `commands::apply` directly,
-/// without shelling out to the `vlanctl` binary. `lum.toml` pins `device`,
-/// so this needs no `ifconfig -l` seeding to resolve one.
+/// without shelling out to the `vlanctl` binary. The device is supplied as an
+/// override, so this needs no `ifconfig -l` seeding to resolve one.
 #[test]
 fn readme_library_use_snippet_applies_a_profile_through_a_recording_runner() {
     use vlanctl::plan::MacOs;
     use vlanctl::{commands, net::RecordingRunner};
 
     let profile =
-        Profile::load("profiles/lum.toml".as_ref()).expect("the README's own example profile");
+        Profile::load("profiles/example.toml".as_ref()).expect("the README's own example profile");
     let state_path = std::env::temp_dir().join("vlanctl-readme-library-snippet-state.json");
     let _ = std::fs::remove_file(&state_path);
 

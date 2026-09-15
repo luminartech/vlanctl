@@ -263,7 +263,7 @@ mod tests {
                     "replace",
                     "192.168.11.151",
                     "lladdr",
-                    "3a:42:f7:79:32:2e",
+                    "00:00:5e:00:53:01",
                     "dev",
                     "eth0.11",
                 ],
@@ -276,7 +276,7 @@ mod tests {
                 "route",
                 &["add", "-host", "192.168.10.151", "-interface", "en7"],
             ),
-            Cmd::new("arp", &["-s", "192.168.10.151", "3a:42:f7:79:32:2e"]),
+            Cmd::new("arp", &["-s", "192.168.10.151", "00:00:5e:00:53:01"]),
         ];
         for cmd in &mutations {
             assert!(

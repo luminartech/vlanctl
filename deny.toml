@@ -1,0 +1,20 @@
+[licenses]
+version = 2
+confidence-threshold = 0.8
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Unicode-3.0",
+  "Unlicense",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "allow"
+
+[advisories]
+yanked = "warn"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
