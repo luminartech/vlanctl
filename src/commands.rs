@@ -197,7 +197,34 @@ pub fn apply<R: CommandRunner>(
     state.active_profile = Some(profile.name.clone());
     state.interfaces = created.clone();
     if !dry_run {
+        // Saved before the check below, deliberately: if verification fails
+        // the host is partly configured, and the caller needs a state file
+        // for `down` to have something to clean up.
         state.save(state_path)?;
+        // The bring-up commands exited 0; now ask the host, the way `down`
+        // does. A command that succeeds and an interface that exists are
+        // different claims.
+        let present = surviving_interfaces(runner, platform, &created)?;
+        let missing: Vec<&String> = created.iter().filter(|c| !present.contains(c)).collect();
+        if !missing.is_empty() {
+            bail!(
+                "applied profile '{}', but {} not on this host afterward: {}. \
+                 The commands reported success, so something removed or \
+                 refused {} after creation",
+                profile.name,
+                if missing.len() == 1 {
+                    "one interface is"
+                } else {
+                    "some interfaces are"
+                },
+                missing
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                if missing.len() == 1 { "it" } else { "them" },
+            );
+        }
     }
     Ok(created)
 }
@@ -391,8 +418,18 @@ mod tests {
 
     fn runner_with_device() -> RecordingRunner {
         let mut r = RecordingRunner::default();
-        r.stdout
-            .insert("ifconfig -l".to_string(), "lo0 en0".to_string());
+        // The pre-apply host, consumed by the collision guard.
+        r.stdout_queue.insert(
+            "ifconfig -l".to_string(),
+            ["lo0 en0"].into_iter().map(String::from).collect(),
+        );
+        // Every later answer is the host *after* bring-up, carrying the
+        // interfaces `profile()` creates. `apply` verifies its own work now,
+        // so a fixture that never gains them describes a failed apply.
+        r.stdout.insert(
+            "ifconfig -l".to_string(),
+            "lo0 en0 vlan100 vlan200".to_string(),
+        );
         r
     }
 
@@ -422,7 +459,23 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join(",")
         );
-        r.stdout.insert("ip -json link show".to_string(), json);
+        // The pre-apply host, consumed by the collision guard...
+        r.stdout_queue.insert(
+            "ip -json link show".to_string(),
+            [json.clone()].into_iter().collect(),
+        );
+        // ...and every later answer is the host after bring-up, carrying what
+        // `linux_profile()` creates. `apply` verifies its own work now, so a
+        // fixture that never gains them describes a failed apply.
+        let after = format!(
+            "[{}]",
+            live.split_whitespace()
+                .chain(["eth0.100", "eth0.200"])
+                .map(|n| format!(r#"{{"ifname":"{n}"}}"#))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        r.stdout.insert("ip -json link show".to_string(), after);
         // The vlan-id guard's probe. A real host always emits a JSON array,
         // so an empty default here would be an unrealistic fixture — and the
         // parse is deliberately strict, treating unreadable output as a
@@ -448,6 +501,37 @@ mod tests {
         assert_eq!(state.active_profile.as_deref(), Some("t"));
         assert_eq!(state.interfaces, vec!["eth0.100", "eth0.200"]);
         std::fs::remove_file(&state_path).unwrap();
+    }
+
+    /// The bring-up commands exiting 0 is not the same as the interfaces
+    /// existing. `apply` asks the host afterward, the way `down` does.
+    #[test]
+    fn apply_reports_interfaces_that_never_appeared() {
+        let state_path = std::env::temp_dir().join("vlanctl-apply-missing.json");
+        let _ = std::fs::remove_file(&state_path);
+        let mut r = linux_runner("lo eth0");
+        // Override the post-apply answer: the commands succeeded but the
+        // host never gained the interfaces.
+        r.stdout.insert(
+            "ip -json link show".to_string(),
+            r#"[{"ifname":"lo"},{"ifname":"eth0"}]"#.to_string(),
+        );
+
+        let err = apply(&mut r, &Linux, &linux_profile(), None, &state_path, false)
+            .expect_err("interfaces that never appeared are not a successful apply");
+        let text = err.to_string();
+        assert!(
+            text.contains("eth0.100"),
+            "the missing interface must be named: {text}"
+        );
+
+        // State is still written: the caller needs `down` to be able to clean
+        // up whatever *did* get created.
+        assert_eq!(
+            State::load(&state_path).unwrap().active_profile.as_deref(),
+            Some("t")
+        );
+        let _ = std::fs::remove_file(&state_path);
     }
 
     #[test]
@@ -809,7 +893,10 @@ mod tests {
         let err = down(&mut r, &MacOs, &state_path, false)
             .expect_err("a surviving interface is not a clean teardown");
         let text = err.to_string();
-        assert!(text.contains("vlan10"), "the survivor must be named: {text}");
+        assert!(
+            text.contains("vlan10"),
+            "the survivor must be named: {text}"
+        );
 
         // The record is kept, not cleared: a retry needs to know what it is
         // still responsible for, and the caller was just told the host is
@@ -850,7 +937,11 @@ mod tests {
     fn apply_untagged_configures_parent_and_records_only_vlan() {
         let state_path = std::env::temp_dir().join("vlanctl-apply-untagged.json");
         let _ = std::fs::remove_file(&state_path);
-        let mut r = runner_with_device(); // "ifconfig -l" -> "lo0 en0"; "ifconfig en0" -> empty
+        let mut r = runner_with_device();
+        // This profile creates vlan12, not the vlan100/200 the shared
+        // helper scripts; `apply` verifies against the host afterward.
+        r.stdout
+            .insert("ifconfig -l".to_string(), "lo0 en0 vlan12".to_string()); // "ifconfig -l" -> "lo0 en0"; "ifconfig en0" -> empty
         let created = apply(
             &mut r,
             &MacOs,
@@ -876,6 +967,10 @@ mod tests {
         let state_path = std::env::temp_dir().join("vlanctl-apply-untagged-idem.json");
         let _ = std::fs::remove_file(&state_path);
         let mut r = runner_with_device();
+        // This profile creates vlan12, not the vlan100/200 the shared
+        // helper scripts; `apply` verifies against the host afterward.
+        r.stdout
+            .insert("ifconfig -l".to_string(), "lo0 en0 vlan12".to_string());
         r.stdout.insert(
             "ifconfig en0".to_string(),
             "\tinet 192.168.1.100 netmask 0xffffff00 broadcast 192.168.1.255".to_string(),
