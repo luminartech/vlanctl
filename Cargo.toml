@@ -36,6 +36,11 @@ path = "src/main.rs"
 [features]
 default = ["cli"]
 cli = ["dep:clap", "dep:libc"]
+# Opt-in: runs the permanence tests that shell out to a real `netplan
+# generate` and read what it produced. Off by default because CI containers
+# do not ship `netplan.io`; on a Linux host that has opted in, a missing
+# binary is a hard failure rather than a silent skip.
+netplan-tests = []
 
 [dependencies]
 anyhow = "1.0"
