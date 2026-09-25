@@ -232,10 +232,60 @@ pub fn down<R: CommandRunner>(
             runner.run(&cmd)?;
         }
     }
-    if !dry_run {
-        State::default().save(state_path)?;
+    if dry_run {
+        return Ok(());
     }
+    // The commands exited 0; now ask the host. Something outside vlanctl can
+    // hold an interface up — a NetworkManager connection profile for the same
+    // name re-creates it as fast as the teardown removes it — and a caller
+    // that trusts the exit code tells its operator the host is clean when it
+    // is not.
+    let survivors = surviving_interfaces(runner, platform, &state.interfaces)?;
+    if !survivors.is_empty() {
+        // The record is deliberately NOT cleared. A retry needs to know what
+        // it is still responsible for, and the caller has just been told the
+        // teardown did not finish.
+        bail!(
+            "tore down '{}', but {} still present on this host: {}. \
+             Something outside vlanctl is holding {} up — a connection \
+             manager with a profile for {} will re-create {} as fast as it \
+             is removed",
+            state.active_profile.as_deref().unwrap_or("(unnamed)"),
+            if survivors.len() == 1 {
+                "one interface is"
+            } else {
+                "some interfaces are"
+            },
+            survivors.join(", "),
+            if survivors.len() == 1 { "it" } else { "them" },
+            if survivors.len() == 1 {
+                "that name"
+            } else {
+                "those names"
+            },
+            if survivors.len() == 1 { "it" } else { "them" },
+        );
+    }
+    State::default().save(state_path)?;
     Ok(())
+}
+
+/// Which of `interfaces` are still present on the host.
+///
+/// Its own function because both [`down`] and [`apply`] need the same
+/// question asked of the host rather than of the exit codes — one to confirm
+/// interfaces went away, the other to confirm they arrived.
+fn surviving_interfaces<R: CommandRunner>(
+    runner: &mut R,
+    platform: &dyn Platform,
+    interfaces: &[String],
+) -> Result<Vec<String>> {
+    let live = platform.list_devices(runner)?;
+    Ok(interfaces
+        .iter()
+        .filter(|name| live.contains(name))
+        .cloned()
+        .collect())
 }
 
 /// Render the full bring-up plan for a profile as displayable command lines,
@@ -677,8 +727,16 @@ mod tests {
         };
         state.save(&state_path).unwrap();
         let mut r = RecordingRunner::default();
-        r.stdout
-            .insert("ifconfig -l".to_string(), "lo0 en0 vlan0 vlan1".to_string());
+        // Live before teardown, gone after it — `down` now asks twice, and a
+        // constant answer would make a successful teardown indistinguishable
+        // from one that did nothing.
+        r.stdout_queue.insert(
+            "ifconfig -l".to_string(),
+            ["lo0 en0 vlan0 vlan1", "lo0 en0"]
+                .into_iter()
+                .map(String::from)
+                .collect(),
+        );
         down(&mut r, &MacOs, &state_path, false).unwrap();
         // Drop the `ifconfig -l` probe; assert on the teardown commands only.
         let rendered: Vec<String> = r
@@ -709,14 +767,58 @@ mod tests {
         .unwrap();
         let mut r = RecordingRunner::default();
         // vlan10 survived (somehow), vlan11 is gone. Only vlan10 should be
-        // destroyed; the missing vlan11 is silently skipped.
-        r.stdout
-            .insert("ifconfig -l".to_string(), "lo0 en0 vlan10".to_string());
+        // destroyed; the missing vlan11 is silently skipped. The second
+        // answer is the post-teardown host, with vlan10 now gone too.
+        r.stdout_queue.insert(
+            "ifconfig -l".to_string(),
+            ["lo0 en0 vlan10", "lo0 en0"]
+                .into_iter()
+                .map(String::from)
+                .collect(),
+        );
         down(&mut r, &MacOs, &state_path, false).unwrap();
         let rendered: Vec<String> = r.commands.iter().map(|c| c.display()).collect();
         assert!(rendered.contains(&"ifconfig vlan10 destroy".to_string()));
         assert!(!rendered.contains(&"ifconfig vlan11 destroy".to_string()));
         assert_eq!(State::load(&state_path).unwrap(), State::default());
+        std::fs::remove_file(&state_path).unwrap();
+    }
+
+    /// `down` exiting 0 is not the same as the host being clean. Something
+    /// outside vlanctl can hold an interface up — a NetworkManager
+    /// connection profile for the same name re-creates it as fast as
+    /// `ip link del` removes it, which was measured on a bench where the
+    /// ifindex moved while the interface never disappeared.
+    ///
+    /// Reporting success there is the worst answer available: the caller
+    /// tells its operator the host is clean and everyone stops looking.
+    #[test]
+    fn down_reports_interfaces_that_survive_teardown() {
+        let state_path = std::env::temp_dir().join("vlanctl-down-survivor.json");
+        State {
+            active_profile: Some("t".to_string()),
+            interfaces: vec!["vlan10".to_string()],
+        }
+        .save(&state_path)
+        .unwrap();
+        let mut r = RecordingRunner::default();
+        // Live before teardown, and still live after it.
+        r.stdout
+            .insert("ifconfig -l".to_string(), "lo0 en0 vlan10".to_string());
+
+        let err = down(&mut r, &MacOs, &state_path, false)
+            .expect_err("a surviving interface is not a clean teardown");
+        let text = err.to_string();
+        assert!(text.contains("vlan10"), "the survivor must be named: {text}");
+
+        // The record is kept, not cleared: a retry needs to know what it is
+        // still responsible for, and the caller was just told the host is
+        // not clean.
+        assert_eq!(
+            State::load(&state_path).unwrap().interfaces,
+            vec!["vlan10".to_string()],
+            "state must survive a teardown that did not finish"
+        );
         std::fs::remove_file(&state_path).unwrap();
     }
 
