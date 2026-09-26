@@ -13,8 +13,12 @@
 //!
 //! Needs a raw datalink channel: `CAP_NET_RAW` on Linux, read access to
 //! `/dev/bpf*` on macOS. A probe that cannot run says so
-//! ([`Conflict::Unavailable`]) rather than reporting the address free.
+//! ([`Conflict::Unavailable`]) rather than reporting the address free, and
+//! says why as a [`ProbeError`] a caller can match on: a missing privilege
+//! wants different handling from a missing interface.
 
+use std::fmt;
+use std::io;
 use std::net::Ipv4Addr;
 use std::time::{Duration, Instant};
 
@@ -27,17 +31,101 @@ use std::time::{Duration, Instant};
 pub const DEFAULT_WINDOW: Duration = Duration::from_millis(500);
 
 /// What the segment said about an address.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum Conflict {
     /// The probe ran for the whole window and nobody else claimed the address.
     Free,
     /// Another host claimed the address; `mac` is the hardware address it
     /// claimed it from.
     InUse { mac: [u8; 6] },
-    /// The probe could not run, so nothing is known about the address — no
-    /// capture privilege, an interface with no hardware address, or a send
-    /// or read failure. The string says which.
-    Unavailable(String),
+    /// The probe could not run, so nothing is known about the address.
+    Unavailable(ProbeError),
+}
+
+/// Why a [`probe`] could not run.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum ProbeError {
+    /// No interface by this name exists.
+    NoSuchInterface { interface: String },
+    /// The interface has no hardware address to send from.
+    NoHardwareAddress { interface: String },
+    /// Opening a raw channel was refused: `CAP_NET_RAW` is missing on Linux,
+    /// or `/dev/bpf*` is not readable on macOS.
+    PermissionDenied {
+        interface: String,
+        source: io::Error,
+    },
+    /// The interface offered a channel, but not an Ethernet one.
+    NotEthernet { interface: String },
+    /// Opening a raw channel failed for a reason other than permission.
+    Open {
+        interface: String,
+        source: io::Error,
+    },
+    /// Sending the probe failed.
+    Send {
+        interface: String,
+        source: io::Error,
+    },
+    /// Reading failed before the window ended.
+    Read {
+        interface: String,
+        source: io::Error,
+    },
+    /// This platform has no probe implementation (anything but Linux and
+    /// macOS).
+    Unsupported,
+}
+
+impl fmt::Display for ProbeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ProbeError::NoSuchInterface { interface } => {
+                write!(f, "interface {interface} does not exist")
+            }
+            ProbeError::NoHardwareAddress { interface } => {
+                write!(f, "interface {interface} has no hardware address")
+            }
+            ProbeError::PermissionDenied { interface, source } => write!(
+                f,
+                "no permission to open a raw channel on {interface} ({source}); \
+                 this needs CAP_NET_RAW on Linux or /dev/bpf access on macOS"
+            ),
+            ProbeError::NotEthernet { interface } => {
+                write!(f, "{interface} did not offer an Ethernet channel")
+            }
+            ProbeError::Open { interface, source } => {
+                write!(f, "could not open a raw channel on {interface}: {source}")
+            }
+            ProbeError::Send { interface, source } => {
+                write!(f, "could not send an ARP probe on {interface}: {source}")
+            }
+            ProbeError::Read { interface, source } => write!(
+                f,
+                "reading from {interface} failed before the window ended: {source}"
+            ),
+            ProbeError::Unsupported => write!(
+                f,
+                "address-conflict probing is implemented for Linux and macOS only"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ProbeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            ProbeError::PermissionDenied { source, .. }
+            | ProbeError::Open { source, .. }
+            | ProbeError::Send { source, .. }
+            | ProbeError::Read { source, .. } => Some(source),
+            ProbeError::NoSuchInterface { .. }
+            | ProbeError::NoHardwareAddress { .. }
+            | ProbeError::NotEthernet { .. }
+            | ProbeError::Unsupported => None,
+        }
+    }
 }
 
 /// Probe `interface` for another host holding `address`, listening for
@@ -109,7 +197,7 @@ fn claimant(frame: &[u8], address: Ipv4Addr, own_mac: [u8; 6]) -> Option<[u8; 6]
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod imp {
-    use super::{Conflict, Duration, Instant, Ipv4Addr, build_probe, claimant};
+    use super::{Conflict, Duration, Instant, Ipv4Addr, ProbeError, build_probe, claimant};
 
     /// Per-read wait. Bounds how far past the window one non-matching frame
     /// on a busy segment can carry the probe.
@@ -124,14 +212,15 @@ mod imp {
         // spent from the window rather than added to it.
         let deadline = Instant::now() + window;
 
+        let interface = interface.to_string();
         let Some(iface) = pnet_datalink::interfaces()
             .into_iter()
             .find(|i| i.name == interface)
         else {
-            return Conflict::Unavailable(format!("interface {interface} does not exist"));
+            return Conflict::Unavailable(ProbeError::NoSuchInterface { interface });
         };
         let Some(own_mac) = iface.mac.map(|m| m.octets()).filter(|m| m != &[0u8; 6]) else {
-            return Conflict::Unavailable(format!("interface {interface} has no hardware address"));
+            return Conflict::Unavailable(ProbeError::NoHardwareAddress { interface });
         };
 
         let config = pnet_datalink::Config {
@@ -141,32 +230,19 @@ mod imp {
         };
         let (mut tx, mut rx) = match pnet_datalink::channel(&iface, config) {
             Ok(pnet_datalink::Channel::Ethernet(tx, rx)) => (tx, rx),
-            Ok(_) => {
-                return Conflict::Unavailable(format!(
-                    "{interface} did not offer an Ethernet channel"
-                ));
+            Ok(_) => return Conflict::Unavailable(ProbeError::NotEthernet { interface }),
+            Err(source) if source.kind() == std::io::ErrorKind::PermissionDenied => {
+                return Conflict::Unavailable(ProbeError::PermissionDenied { interface, source });
             }
-            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                return Conflict::Unavailable(format!(
-                    "no permission to open a raw channel on {interface} ({e}); \
-                     this needs CAP_NET_RAW on Linux or /dev/bpf access on macOS"
-                ));
-            }
-            Err(e) => {
-                return Conflict::Unavailable(format!(
-                    "could not open a raw channel on {interface}: {e}"
-                ));
-            }
+            Err(source) => return Conflict::Unavailable(ProbeError::Open { interface, source }),
         };
 
         let frame = build_probe(own_mac, address);
         for _ in 0..2 {
             match tx.send_to(&frame, None) {
                 Some(Ok(())) => {}
-                Some(Err(e)) => {
-                    return Conflict::Unavailable(format!(
-                        "could not send an ARP probe on {interface}: {e}"
-                    ));
+                Some(Err(source)) => {
+                    return Conflict::Unavailable(ProbeError::Send { interface, source });
                 }
                 // pnet's "buffer too small for the frame". 42 bytes fits any
                 // real MTU; the retry, or the read loop, still stands.
@@ -183,10 +259,8 @@ mod imp {
                 }
                 // One read interval passing is not the window ending.
                 Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {}
-                Err(e) => {
-                    return Conflict::Unavailable(format!(
-                        "reading from {interface} failed before the window ended: {e}"
-                    ));
+                Err(source) => {
+                    return Conflict::Unavailable(ProbeError::Read { interface, source });
                 }
             }
         }
@@ -196,12 +270,10 @@ mod imp {
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 mod imp {
-    use super::{Conflict, Duration, Ipv4Addr};
+    use super::{Conflict, Duration, Ipv4Addr, ProbeError};
 
     pub(super) fn probe(_interface: &str, _address: Ipv4Addr, _window: Duration) -> Conflict {
-        Conflict::Unavailable(
-            "address-conflict probing is implemented for Linux and macOS only".into(),
-        )
+        Conflict::Unavailable(ProbeError::Unsupported)
     }
 }
 
@@ -280,6 +352,38 @@ mod tests {
     #[test]
     fn a_missing_interface_is_unavailable_not_free() {
         let got = probe("vlanctl-test-no-such-if0", ADDR, Duration::from_millis(10));
-        assert!(matches!(got, Conflict::Unavailable(_)), "got {got:?}");
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        assert!(
+            matches!(
+                &got,
+                Conflict::Unavailable(ProbeError::NoSuchInterface { interface })
+                    if interface == "vlanctl-test-no-such-if0"
+            ),
+            "got {got:?}"
+        );
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        assert!(
+            matches!(got, Conflict::Unavailable(ProbeError::Unsupported)),
+            "got {got:?}"
+        );
+    }
+
+    /// A consumer has to be able to tell a missing privilege from every other
+    /// failure without parsing text, and the underlying error has to survive
+    /// for its logs.
+    #[test]
+    fn a_refused_channel_is_its_own_case_and_keeps_its_cause() {
+        use std::error::Error as _;
+        let e = ProbeError::PermissionDenied {
+            interface: "eth0.10".into(),
+            source: io::Error::from(io::ErrorKind::PermissionDenied),
+        };
+        assert!(e.to_string().contains("CAP_NET_RAW"), "{e}");
+        assert_eq!(
+            e.source()
+                .and_then(|s| s.downcast_ref::<io::Error>())
+                .map(io::Error::kind),
+            Some(io::ErrorKind::PermissionDenied)
+        );
     }
 }
