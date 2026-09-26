@@ -205,29 +205,95 @@ pub fn apply<R: CommandRunner>(
         // does. A command that succeeds and an interface that exists are
         // different claims.
         let present = surviving_interfaces(runner, platform, &created)?;
-        let missing: Vec<&String> = created.iter().filter(|c| !present.contains(c)).collect();
+        let missing: Vec<String> = created
+            .iter()
+            .filter(|c| !present.contains(c))
+            .cloned()
+            .collect();
         if !missing.is_empty() {
-            bail!(
-                "applied profile '{}', but {} not on this host afterward: {}. \
-                 The commands reported success, so something removed or \
-                 refused {} after creation",
-                profile.name,
-                if missing.len() == 1 {
-                    "one interface is"
-                } else {
-                    "some interfaces are"
-                },
-                missing
-                    .iter()
-                    .map(|s| s.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                if missing.len() == 1 { "it" } else { "them" },
-            );
+            return Err(BringUpIncomplete {
+                profile: profile.name.clone(),
+                missing,
+            }
+            .into());
         }
     }
     Ok(created)
 }
+
+/// [`apply`]'s bring-up commands all succeeded, but some interfaces it
+/// created were not on the host when it looked afterward.
+///
+/// Returned inside the `anyhow::Error`, so a caller that needs the names —
+/// to show the operator exactly what is missing — can
+/// `err.downcast_ref::<BringUpIncomplete>()` instead of parsing the message.
+/// The state file has already been saved, so [`down`] can clean up.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BringUpIncomplete {
+    pub profile: String,
+    pub missing: Vec<String>,
+}
+
+impl std::fmt::Display for BringUpIncomplete {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let one = self.missing.len() == 1;
+        write!(
+            f,
+            "applied profile '{}', but {} not on this host afterward: {}. \
+             The commands reported success, so something removed or \
+             refused {} after creation",
+            self.profile,
+            if one {
+                "one interface is"
+            } else {
+                "some interfaces are"
+            },
+            self.missing.join(", "),
+            if one { "it" } else { "them" },
+        )
+    }
+}
+
+impl std::error::Error for BringUpIncomplete {}
+
+/// [`down`]'s teardown commands all succeeded, but some recorded interfaces
+/// were still on the host afterward — typically because a connection
+/// manager re-creates them as fast as they are removed.
+///
+/// Returned inside the `anyhow::Error`; `err.downcast_ref::<TeardownIncomplete>()`
+/// recovers the names. The state file is deliberately left in place, so a
+/// retry still knows what it is responsible for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TeardownIncomplete {
+    /// The profile the state file recorded, if it named one.
+    pub profile: Option<String>,
+    pub survivors: Vec<String>,
+}
+
+impl std::fmt::Display for TeardownIncomplete {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let one = self.survivors.len() == 1;
+        write!(
+            f,
+            "tore down '{}', but {} still present on this host: {}. \
+             Something outside vlanctl is holding {} up — a connection \
+             manager with a profile for {} will re-create {} as fast as it \
+             is removed",
+            self.profile.as_deref().unwrap_or("(unnamed)"),
+            if one {
+                "one interface is"
+            } else {
+                "some interfaces are"
+            },
+            self.survivors.join(", "),
+            if one { "it" } else { "them" },
+            if one { "that name" } else { "those names" },
+            if one { "it" } else { "them" },
+        )
+    }
+}
+
+impl std::error::Error for TeardownIncomplete {}
 
 /// Destroy created interfaces in reverse order, ignoring errors (best effort).
 fn rollback<R: CommandRunner>(runner: &mut R, platform: &dyn Platform, created: &[String]) {
@@ -272,26 +338,11 @@ pub fn down<R: CommandRunner>(
         // The record is deliberately NOT cleared. A retry needs to know what
         // it is still responsible for, and the caller has just been told the
         // teardown did not finish.
-        bail!(
-            "tore down '{}', but {} still present on this host: {}. \
-             Something outside vlanctl is holding {} up — a connection \
-             manager with a profile for {} will re-create {} as fast as it \
-             is removed",
-            state.active_profile.as_deref().unwrap_or("(unnamed)"),
-            if survivors.len() == 1 {
-                "one interface is"
-            } else {
-                "some interfaces are"
-            },
-            survivors.join(", "),
-            if survivors.len() == 1 { "it" } else { "them" },
-            if survivors.len() == 1 {
-                "that name"
-            } else {
-                "those names"
-            },
-            if survivors.len() == 1 { "it" } else { "them" },
-        );
+        return Err(TeardownIncomplete {
+            profile: state.active_profile.clone(),
+            survivors,
+        }
+        .into());
     }
     State::default().save(state_path)?;
     Ok(())
@@ -524,6 +575,13 @@ mod tests {
             text.contains("eth0.100"),
             "the missing interface must be named: {text}"
         );
+        // And recoverable as data, so a caller can act on the names without
+        // parsing the message.
+        let typed = err
+            .downcast_ref::<BringUpIncomplete>()
+            .expect("a failed verification is a BringUpIncomplete");
+        assert_eq!(typed.profile, "t");
+        assert_eq!(typed.missing, vec!["eth0.100", "eth0.200"]);
 
         // State is still written: the caller needs `down` to be able to clean
         // up whatever *did* get created.
@@ -896,6 +954,14 @@ mod tests {
         assert!(
             text.contains("vlan10"),
             "the survivor must be named: {text}"
+        );
+        assert_eq!(
+            err.downcast_ref::<TeardownIncomplete>(),
+            Some(&TeardownIncomplete {
+                profile: Some("t".to_string()),
+                survivors: vec!["vlan10".to_string()],
+            }),
+            "a failed teardown is a TeardownIncomplete carrying the survivors"
         );
 
         // The record is kept, not cleared: a retry needs to know what it is
