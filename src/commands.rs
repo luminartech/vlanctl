@@ -93,19 +93,22 @@ pub fn apply<R: CommandRunner>(
     )?;
     // The names this run will create, derived from the *resolved* device
     // through the platform's own naming, so the guard below cannot disagree
-    // with what bring-up actually creates. Tagged entries only: an untagged
-    // entry configures the parent device, which is never guarded.
+    // with what bring-up actually creates. Entries that name an interface
+    // of their own, that is: on macOS and Linux an untagged entry configures
+    // the parent device itself, which is never guarded, and `iface_name`
+    // returns the parent for it. On Windows every entry is a virtual adapter
+    // vlanctl creates, untagged included, and each is guarded.
     let interfaces: Vec<String> = profile
         .interfaces
         .iter()
-        .filter(|i| i.vlan.is_some())
         .map(|i| platform.iface_name(i, &device))
+        .filter(|name| *name != device)
         .collect();
 
-    // Refuse to touch a vlan<id> sub-interface that already exists and is not
-    // ours. The physical device is never guarded — untagged apply is additive.
-    // Through the platform, so a Linux host reads `ip -json link show`
-    // rather than the BSD-only `ifconfig -l` (seam gap 2).
+    // Refuse to touch an interface that already exists and is not ours. The
+    // physical device is never guarded — an untagged apply onto it is
+    // additive. Through the platform, so a Linux host reads `ip -json link
+    // show` rather than the BSD-only `ifconfig -l` (seam gap 2).
     let existing = platform.list_devices(runner)?;
     for iface in &interfaces {
         if existing.contains(iface) {
@@ -137,58 +140,45 @@ pub fn apply<R: CommandRunner>(
 
     let mut created: Vec<String> = Vec::new();
     for interface in &profile.interfaces {
-        match interface.vlan {
-            // Untagged: configure the parent device, idempotently. If the alias
-            // address is already present, a previous apply set it up (and its
-            // routes) — skip. Never recorded, regardless of the platform:
-            // `platform.reverts_parent_config()` names *whether* reverting
-            // parent config is appropriate, but an untagged entry is an
-            // address alias, and undoing one needs `-alias <addr>` — syntax
-            // the generic `platform.teardown_commands(iface)` used for
-            // tagged sub-interfaces has no way to express (on macOS it would
-            // render as `ifconfig <device> destroy`, which destroys the real
-            // NIC). Recording it here would also bypass the tagged-only
-            // collision guard above and mislabel the parent device as a
-            // managed interface in `status`. A platform that actually wants
-            // to revert parent config (a Windows vSwitch binding, say) needs
-            // its own recording/teardown path built deliberately, not this
-            // one reused by accident.
-            None => {
-                let already_configured = platform
-                    .addresses_on(runner, &device)?
-                    .iter()
-                    .any(|net| net.addr() == interface.address.addr());
-                if already_configured {
-                    continue;
-                }
-                for cmd in bringup_commands_for(platform, interface, &device) {
-                    if let Err(e) = runner.run(&cmd) {
-                        rollback(runner, platform, &created);
-                        return Err(e).with_context(|| {
-                            format!("applying profile '{}'; rolled back", profile.name)
-                        });
-                    }
-                }
+        let iface = platform.iface_name(interface, &device);
+        // Untagged: idempotent. If the address is already on the interface
+        // the entry names, a previous apply set it up (and its routes) —
+        // skip. On macOS and Linux that interface is the parent device
+        // itself; on Windows it is the untagged virtual adapter, which does
+        // not exist before the first apply and so reports no addresses.
+        if interface.vlan.is_none() {
+            let already_configured = platform
+                .addresses_on(runner, &iface)?
+                .iter()
+                .any(|net| net.addr() == interface.address.addr());
+            if already_configured {
+                continue;
             }
-            // Tagged: create the vlan sub-interface, recording it as soon as the
-            // `create` succeeds so rollback can destroy it if a later step fails.
-            Some(_) => {
-                let iface = platform.iface_name(interface, &device);
-                for cmd in bringup_commands_for(platform, interface, &device) {
-                    let is_create = platform.records_created_interface(&cmd);
-                    match runner.run(&cmd) {
-                        Ok(_) => {
-                            if is_create {
-                                created.push(iface.clone());
-                            }
-                        }
-                        Err(e) => {
-                            rollback(runner, platform, &created);
-                            return Err(e).with_context(|| {
-                                format!("applying profile '{}'; rolled back", profile.name)
-                            });
-                        }
+        }
+        // Record the interface as soon as its creation command succeeds, so
+        // rollback can destroy it if a later step fails. What counts as a
+        // creation is the platform's call (`records_created_interface`), and
+        // that is what decides whether an untagged entry is recorded: an
+        // address alias on the parent (macOS `ifconfig ... alias`, Linux
+        // `ip addr add`) creates nothing, so the parent is never recorded,
+        // never guarded above, and never handed to `teardown_commands` —
+        // which on macOS would render `ifconfig <device> destroy` and
+        // destroy the real NIC. A Windows untagged entry is a virtual
+        // adapter the backend creates and can remove, so there it is
+        // recorded and torn down like a tagged one.
+        for cmd in bringup_commands_for(platform, interface, &device) {
+            let is_create = platform.records_created_interface(&cmd);
+            match runner.run(&cmd) {
+                Ok(_) => {
+                    if is_create {
+                        created.push(iface.clone());
                     }
+                }
+                Err(e) => {
+                    rollback(runner, platform, &created);
+                    return Err(e).with_context(|| {
+                        format!("applying profile '{}'; rolled back", profile.name)
+                    });
                 }
             }
         }
@@ -502,7 +492,7 @@ pub fn status<R: CommandRunner>(
 mod tests {
     use super::*;
     use crate::net::RecordingRunner;
-    use crate::plan::{Linux, MacOs};
+    use crate::plan::{Linux, MacOs, Windows};
 
     fn profile() -> Profile {
         // Pin `device` so these tests exercise apply/down orchestration without
@@ -761,6 +751,108 @@ mod tests {
         );
         assert!(!rendered.contains(&"ip link del eth0.200".to_string()));
         assert_eq!(State::load(&state_path).unwrap(), State::default());
+        let _ = std::fs::remove_file(&state_path);
+    }
+
+    /// [`untagged_profile`] on a Windows-named parent: an untagged entry and
+    /// VLAN 12, both of which become Hyper-V virtual adapters there.
+    fn windows_profile() -> Profile {
+        let p: Profile = toml::from_str(
+            "name=\"halo\"\ndevice=\"Ethernet 2\"\n\
+             [[interface]]\naddress=\"192.168.1.100/24\"\n\
+             [[interface.route]]\ndestination=\"192.168.10.151/32\"\n\
+             [[interface]]\nvlan=12\naddress=\"192.168.10.1/24\"\n",
+        )
+        .unwrap();
+        p.validate().unwrap();
+        p
+    }
+
+    /// A runner whose Windows `list_devices` probe answers `live`, one
+    /// adapter name per line. The probe's command line is taken from the
+    /// backend rather than spelled out, so a change to how it is rendered
+    /// cannot silently turn this stub into an unmapped command.
+    fn windows_runner(live: &[&str]) -> RecordingRunner {
+        let mut probe = RecordingRunner::default();
+        Windows.list_devices(&mut probe).unwrap();
+        let mut r = RecordingRunner::default();
+        r.stdout
+            .insert(probe.commands[0].display(), live.join("\r\n"));
+        r
+    }
+
+    #[test]
+    fn apply_with_windows_records_the_untagged_adapter_and_down_removes_it() {
+        // On macOS and Linux an untagged entry is an address on the parent
+        // and is never recorded. On Windows it is a virtual adapter the
+        // backend creates, so it must be recorded — or `down` would leave
+        // it, and with it the switch binding that took the parent over.
+        let state_path = std::env::temp_dir().join("vlanctl-windows-apply-ok.json");
+        let _ = std::fs::remove_file(&state_path);
+        let mut r = windows_runner(&["Ethernet 2", "Wi-Fi"]);
+        let created = apply(
+            &mut r,
+            &Windows,
+            &windows_profile(),
+            None,
+            &state_path,
+            false,
+        )
+        .unwrap();
+        assert_eq!(created, vec!["vEthernet (untagged)", "vEthernet (vlan12)"]);
+        let state = State::load(&state_path).unwrap();
+        assert_eq!(state.interfaces, created);
+
+        // Both adapters are live now; `down` must remove both, in reverse.
+        let mut r = windows_runner(&["Ethernet 2", "vEthernet (untagged)", "vEthernet (vlan12)"]);
+        down(&mut r, &Windows, &state_path, false).unwrap();
+        let teardowns: Vec<&str> = r
+            .commands
+            .iter()
+            .filter(|c| Windows.teardown_commands("x")[0].program == c.program)
+            .filter_map(|c| c.args.last())
+            .filter(|s| s.contains("Remove-VMNetworkAdapter"))
+            .map(String::as_str)
+            .collect();
+        assert_eq!(teardowns.len(), 2, "{teardowns:?}");
+        assert!(teardowns[0].contains("-Name 'vlan12'"), "{}", teardowns[0]);
+        assert!(
+            teardowns[1].contains("-Name 'untagged'"),
+            "{}",
+            teardowns[1]
+        );
+        assert_eq!(State::load(&state_path).unwrap(), State::default());
+        let _ = std::fs::remove_file(&state_path);
+    }
+
+    #[test]
+    fn apply_with_windows_guards_the_untagged_adapter_too() {
+        // The collision guard covers every interface the platform names,
+        // not only tagged ones: a leftover `vEthernet (untagged)` from
+        // something else is refused, not silently doubled.
+        let state_path = std::env::temp_dir().join("vlanctl-windows-apply-guard.json");
+        let _ = std::fs::remove_file(&state_path);
+        let mut r = windows_runner(&["Ethernet 2", "vEthernet (untagged)"]);
+        let err = apply(
+            &mut r,
+            &Windows,
+            &windows_profile(),
+            None,
+            &state_path,
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("vEthernet (untagged) already exists"),
+            "{err}"
+        );
+        assert!(
+            !r.commands
+                .iter()
+                .any(|c| Windows.records_created_interface(c)),
+            "nothing may be created after a refusal"
+        );
         let _ = std::fs::remove_file(&state_path);
     }
 

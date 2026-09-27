@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+#[cfg(not(windows))]
 const STATE_PATH: &str = "/usr/local/var/vlanctl/state.json";
 
 /// Persistent record of what vlanctl has brought up.
@@ -14,8 +15,28 @@ pub struct State {
 }
 
 impl State {
+    /// Where the CLI keeps its state: `/usr/local/var/vlanctl/state.json` on
+    /// macOS and Linux, `%ProgramData%\vlanctl\state.json` on Windows. A
+    /// library consumer chooses its own path and need not use this.
     pub fn default_path() -> PathBuf {
-        PathBuf::from(STATE_PATH)
+        #[cfg(windows)]
+        {
+            // The machine-wide application-data root, which is what a state
+            // file written by an elevated process and read back by the next
+            // one should live under. The variable is always set on a
+            // running Windows; the literal is the value it has had since
+            // Vista, kept only so an oddly-scrubbed environment still gets
+            // a sensible path rather than a relative one.
+            std::env::var_os("ProgramData")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
+                .join("vlanctl")
+                .join("state.json")
+        }
+        #[cfg(not(windows))]
+        {
+            PathBuf::from(STATE_PATH)
+        }
     }
 
     /// Load state from `path`; a missing file yields the default (empty) state.

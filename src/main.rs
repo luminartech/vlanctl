@@ -100,12 +100,16 @@ fn is_read_only_probe(cmd: &net::Cmd) -> bool {
         "cat" | "ls" => {
             matches!(args.as_slice(), [path] if path.starts_with("/sys/class/net/"))
         }
+        // Windows. A PowerShell command line cannot be told apart on argv
+        // alone — the script is one argument — so the backend owns the
+        // allowlist for its own probes, statement by statement.
+        "powershell.exe" => plan::Windows::is_read_only_probe(cmd),
         _ => false,
     }
 }
 
-/// macOS: root has uid 0. Bail if not elevated.
-#[cfg(feature = "cli")]
+/// Unix: root has uid 0. Bail if not elevated.
+#[cfg(all(feature = "cli", unix))]
 fn require_root() -> Result<()> {
     // SAFETY: getuid is always safe to call and has no preconditions.
     let uid = unsafe { libc::getuid() };
@@ -113,6 +117,64 @@ fn require_root() -> Result<()> {
         bail!("this command modifies network interfaces and must be run with sudo");
     }
     Ok(())
+}
+
+/// Windows: the process token must be elevated. Membership of the
+/// Administrators group is not enough — under UAC an administrator's normal
+/// shell runs with a filtered token, and Hyper-V cmdlets and `netsh` both
+/// fail from it.
+#[cfg(all(feature = "cli", windows))]
+fn require_root() -> Result<()> {
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::Security::{
+        GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    let mut token: HANDLE = std::ptr::null_mut();
+    // SAFETY: `GetCurrentProcess` returns a pseudo-handle that needs no
+    // closing, and `token` is a valid out-pointer that `OpenProcessToken`
+    // fills on success.
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        bail!(
+            "cannot read this process's token to check for elevation: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
+    let mut returned: u32 = 0;
+    // SAFETY: `token` is the open handle from above; `elevation` is a
+    // correctly-sized, writable buffer for the `TokenElevation` class, and
+    // its size is passed alongside it.
+    let ok = unsafe {
+        GetTokenInformation(
+            token,
+            TokenElevation,
+            (&raw mut elevation).cast(),
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut returned,
+        )
+    };
+    let query_error = (ok == 0).then(std::io::Error::last_os_error);
+    // SAFETY: `token` came from `OpenProcessToken` and is closed exactly once.
+    unsafe { CloseHandle(token) };
+    if let Some(e) = query_error {
+        bail!("cannot read this process's elevation state: {e}");
+    }
+    if elevation.TokenIsElevated == 0 {
+        bail!(
+            "this command modifies network interfaces and must be run from an \
+             elevated (Run as administrator) shell"
+        );
+    }
+    Ok(())
+}
+
+/// Any other platform has no backend, so `host_platform()` refuses before
+/// anything here could run; this only has to compile.
+#[cfg(all(feature = "cli", not(any(unix, windows))))]
+fn require_root() -> Result<()> {
+    bail!("vlanctl cannot check for elevation on this platform")
 }
 
 #[cfg(not(feature = "cli"))]
@@ -233,6 +295,7 @@ fn main() -> Result<()> {
 mod tests {
     use super::*;
     use net::Cmd;
+    use plan::Platform;
 
     /// THE safety property. `is_read_only_probe` decides what a dry run
     /// executes for real, so a false positive here turns a preview into an
@@ -277,7 +340,76 @@ mod tests {
                 &["add", "-host", "192.168.10.151", "-interface", "en7"],
             ),
             Cmd::new("arp", &["-s", "192.168.10.151", "00:00:5e:00:53:01"]),
+            // Windows. `netsh` never passes (the backend issues no probe
+            // through it), and a PowerShell command line passes only when
+            // every statement is one of the backend's probe shapes.
+            Cmd::new(
+                "netsh",
+                &[
+                    "interface",
+                    "ipv4",
+                    "set",
+                    "address",
+                    "vEthernet (vlan11)",
+                    "static",
+                    "192.168.11.87",
+                    "255.255.255.0",
+                ],
+            ),
+            Cmd::new(
+                "netsh",
+                &[
+                    "interface",
+                    "ipv4",
+                    "add",
+                    "route",
+                    "239.255.0.255/32",
+                    "vEthernet (vlan11)",
+                ],
+            ),
+            Cmd::new(
+                "powershell.exe",
+                &[
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-Command",
+                    "$ErrorActionPreference = 'Stop'; Remove-VMSwitch -Name 'vlanctl' -Force",
+                ],
+            ),
+            // A probe shape with a mutation appended.
+            Cmd::new(
+                "powershell.exe",
+                &[
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-Command",
+                    "$ErrorActionPreference = 'Stop'; Get-NetAdapter | ForEach-Object { $_.Name }; \
+                     Remove-VMSwitch -Name 'vlanctl' -Force",
+                ],
+            ),
         ];
+        // And every mutation the Windows backend itself renders.
+        let tagged = config::Interface {
+            vlan: Some(11),
+            address: "192.168.11.87/24".parse().unwrap(),
+            mtu: Some(1500),
+            routes: vec![config::Route {
+                destination: "192.168.11.151/32".to_string(),
+                gateway: None,
+                mac: Some("00:00:5e:00:53:01".to_string()),
+            }],
+        };
+        let mut mutations = mutations.to_vec();
+        mutations.extend(plan::bringup_commands_for(
+            &plan::Windows,
+            &tagged,
+            "Ethernet 2",
+        ));
+        mutations.extend(plan::Windows.teardown_commands("vEthernet (vlan11)"));
         for cmd in &mutations {
             assert!(
                 !is_read_only_probe(cmd),
@@ -303,6 +435,25 @@ mod tests {
             Cmd::new("ifconfig", &["en0"]),
             Cmd::new("networksetup", &["-listallhardwareports"]),
         ];
+        // The Windows probes are rendered by the backend rather than spelled
+        // out here, so this test follows the backend's own shapes. Each is
+        // issued against a recording runner and the command it recorded is
+        // what the allowlist must recognise.
+        let mut windows_probes = Vec::new();
+        {
+            let mut runner = net::RecordingRunner::default();
+            let _ = plan::Windows.list_devices(&mut runner);
+            let _ = plan::Windows.addresses_on(&mut runner, "vEthernet (vlan11)");
+            let _ = plan::Windows.is_wireless(&mut runner, "Ethernet 2");
+            let _ = plan::Windows.link_is_active(&mut runner, "Ethernet 2");
+            windows_probes.extend(runner.commands);
+        }
+        assert_eq!(
+            windows_probes.len(),
+            4,
+            "every Windows probe should issue one command"
+        );
+        let probes: Vec<Cmd> = probes.into_iter().chain(windows_probes).collect();
         for cmd in &probes {
             assert!(
                 is_read_only_probe(cmd),

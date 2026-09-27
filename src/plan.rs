@@ -5,6 +5,9 @@ use crate::net::{Cmd, CommandRunner};
 use anyhow::{Context, Result};
 use ipnet::IpNet;
 
+mod windows;
+pub use windows::{SWITCH_NAME as WINDOWS_SWITCH_NAME, Windows};
+
 /// Per-operating-system command generation and host-state reading.
 ///
 /// Two of the emission methods return **decisions, not syntax**, and that is
@@ -37,8 +40,11 @@ pub trait Platform {
 
     /// Interface name for a profile entry. `vlan11` on macOS, `eth0.11` on
     /// Linux (or `vlan11` when the dotted form would exceed the kernel's
-    /// name limit), and a named `vEthernet` switch on Windows. Untagged entries
-    /// return the parent device.
+    /// name limit), and the `vEthernet (vlan11)` alias of a Hyper-V virtual
+    /// adapter on Windows. Untagged entries return the parent device on
+    /// macOS and Linux, where they configure it directly; on Windows the
+    /// parent has no stack of its own once bound to the switch, so an
+    /// untagged entry is a virtual adapter too and is named as one.
     ///
     /// This is the single source of every sub-interface name: bring-up,
     /// teardown, the collision guard in `commands::apply`, and creation
@@ -117,8 +123,25 @@ pub trait Platform {
     /// comment in `commands::apply` for the full reasoning). A platform that
     /// must actually revert parent configuration needs its own recording and
     /// teardown path built for that purpose — implementing this method as
-    /// `true` alone gets a backend nothing.
+    /// `true` alone gets a backend nothing. Windows has that path: its
+    /// untagged entry is a virtual adapter whose creation
+    /// [`Platform::records_created_interface`] recognises, so `apply`
+    /// records it and `down` removes it like any tagged one.
     fn reverts_parent_config(&self) -> bool;
+
+    /// Whether attaching to a parent device takes it away from the host's
+    /// own use, so that picking the wrong one would sever the host from a
+    /// network it was relying on.
+    ///
+    /// `false` (the default) for macOS and Linux: a VLAN sub-interface sits
+    /// alongside the parent's own addressing, and a wrong guess wastes an
+    /// apply but disconnects nothing. `true` for Windows, where the parent
+    /// is bound to a Hyper-V switch and loses its own TCP/IP binding until
+    /// `down`. `device::resolve_device` refuses to auto-detect a parent on
+    /// a platform that answers `true` and asks the caller to name it.
+    fn claims_parent_exclusively(&self) -> bool {
+        false
+    }
 
     /// Names of every network device currently on the host, physical and
     /// virtual, in the OS's own naming.
@@ -589,9 +612,9 @@ impl Platform for Linux {
 /// The platform this build targets, for a **real (mutating)** operation —
 /// `apply` or `down` without `--dry-run`.
 ///
-/// Returns [`MacOs`] on macOS and [`Linux`] on Linux. Every other platform
-/// returns an `Err`: a Windows backend is not implemented yet, and returning
-/// a silently-wrong platform to run mutating commands against a real network
+/// Returns [`MacOs`] on macOS, [`Linux`] on Linux and [`Windows`] on
+/// Windows. Every other platform returns an `Err`: returning a
+/// silently-wrong platform to run mutating commands against a real network
 /// stack would be far worse than refusing. A caller that already has a
 /// `Platform` for this OS (for example, an embedder with its own backend)
 /// should construct it explicitly rather than calling this function.
@@ -607,6 +630,7 @@ pub fn host_platform() -> Result<Box<dyn Platform>> {
     match std::env::consts::OS {
         "macos" => Ok(Box::new(MacOs)),
         "linux" => Ok(Box::new(Linux)),
+        "windows" => Ok(Box::new(Windows)),
         os => Err(no_backend_error(os)),
     }
 }
@@ -617,11 +641,12 @@ pub fn host_platform() -> Result<Box<dyn Platform>> {
 /// for that runs on every host.
 fn no_backend_error(os: &str) -> anyhow::Error {
     anyhow::anyhow!(
-        "no Platform implementation for {os} yet; only '{}' and '{}' are \
-         implemented today. A Windows backend is not implemented yet — \
-         construct a Platform explicitly if you have one for this OS.",
+        "no Platform implementation for {os}; only '{}', '{}' and '{}' are \
+         implemented today. Construct a Platform explicitly if you have one \
+         for this OS.",
         MacOs.name(),
         Linux.name(),
+        Windows.name(),
     )
 }
 
@@ -871,15 +896,15 @@ mod tests {
     use std::net::IpAddr;
 
     /// `host_platform()` must refuse cleanly (`Err`, never a panic) on a host
-    /// with no `Platform` implementation at all (e.g. Windows).
+    /// with no `Platform` implementation at all (a BSD, say).
     ///
-    /// Linux now has a real backend (see
-    /// `host_platform_resolves_to_linux_on_linux` below), so this can no
-    /// longer be asserted on every non-macOS host — only on one with neither
-    /// backend. The wording of the refusal is checked unconditionally in
+    /// macOS, Linux and Windows all have real backends now, so this can only
+    /// be asserted on a host with none of them — which is no host this crate
+    /// is developed or tested on. The wording of the refusal is checked
+    /// unconditionally in
     /// `no_backend_error_names_supported_platforms_without_phase_labels`.
     #[test]
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     fn host_platform_refuses_cleanly_with_no_backend() {
         let err = host_platform()
             .map(|_| ())
@@ -896,10 +921,10 @@ mod tests {
     /// actually refuses — that test never runs where this crate is developed.
     #[test]
     fn no_backend_error_names_supported_platforms_without_phase_labels() {
-        let msg = no_backend_error("windows").to_string();
-        assert!(msg.contains("windows"), "must name the host OS: {msg}");
+        let msg = no_backend_error("freebsd").to_string();
+        assert!(msg.contains("freebsd"), "must name the host OS: {msg}");
         assert!(
-            msg.contains("macos") && msg.contains("linux"),
+            msg.contains("macos") && msg.contains("linux") && msg.contains("windows"),
             "expected the error to name the supported platforms: {msg}"
         );
         assert!(
@@ -941,6 +966,17 @@ mod tests {
     #[cfg(target_os = "macos")]
     fn preview_platform_follows_the_host_backend_on_macos() {
         assert_eq!(preview_platform().name(), "macos");
+    }
+
+    /// On Windows, `host_platform()` resolves to the Hyper-V backend, and a
+    /// preview renders the PowerShell and `netsh` an apply would run rather
+    /// than the macOS `ifconfig` it fell back to before the backend existed.
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn host_and_preview_platform_resolve_to_windows_on_windows() {
+        let platform = host_platform().expect("Windows backend must be available on Windows");
+        assert_eq!(platform.name(), "windows");
+        assert_eq!(preview_platform().name(), "windows");
     }
 
     /// The macOS regression net, replacing the four scratch baseline files
