@@ -204,7 +204,11 @@ pub fn apply<R: CommandRunner>(
         // The bring-up commands exited 0; now ask the host, the way `down`
         // does. A command that succeeds and an interface that exists are
         // different claims.
-        let present = surviving_interfaces(runner, platform, &created)?;
+        let present =
+            surviving_interfaces(runner, platform, &created).map_err(|e| BringUpUnverified {
+                profile: profile.name.clone(),
+                reason: format!("{e:#}"),
+            })?;
         let missing: Vec<String> = created
             .iter()
             .filter(|c| !present.contains(c))
@@ -295,6 +299,59 @@ impl std::fmt::Display for TeardownIncomplete {
 
 impl std::error::Error for TeardownIncomplete {}
 
+/// [`apply`]'s bring-up commands all succeeded, but the host could not be
+/// listed afterward, so whether the interfaces exist is unknown.
+///
+/// Distinct from a failed apply, which a caller must treat differently:
+/// the state file has been saved, so [`down`] can take down whatever was
+/// created. Recover it with `err.downcast_ref::<BringUpUnverified>()`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BringUpUnverified {
+    pub profile: String,
+    /// Why the listing failed.
+    pub reason: String,
+}
+
+impl std::fmt::Display for BringUpUnverified {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "applied profile '{}', but could not list this host's interfaces \
+             afterward to confirm it ({})",
+            self.profile, self.reason
+        )
+    }
+}
+
+impl std::error::Error for BringUpUnverified {}
+
+/// [`down`]'s teardown commands all succeeded, but the host could not be
+/// listed afterward, so whether anything survived is unknown.
+///
+/// The state file is left in place, as for [`TeardownIncomplete`]. Recover
+/// it with `err.downcast_ref::<TeardownUnverified>()`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TeardownUnverified {
+    /// The profile the state file recorded, if it named one.
+    pub profile: Option<String>,
+    /// Why the listing failed.
+    pub reason: String,
+}
+
+impl std::fmt::Display for TeardownUnverified {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "tore down '{}', but could not list this host's interfaces \
+             afterward to confirm it ({})",
+            self.profile.as_deref().unwrap_or("(unnamed)"),
+            self.reason
+        )
+    }
+}
+
+impl std::error::Error for TeardownUnverified {}
+
 /// Destroy created interfaces in reverse order, ignoring errors (best effort).
 fn rollback<R: CommandRunner>(runner: &mut R, platform: &dyn Platform, created: &[String]) {
     for iface in created.iter().rev() {
@@ -333,7 +390,12 @@ pub fn down<R: CommandRunner>(
     // name re-creates it as fast as the teardown removes it — and a caller
     // that trusts the exit code tells its operator the host is clean when it
     // is not.
-    let survivors = surviving_interfaces(runner, platform, &state.interfaces)?;
+    let survivors = surviving_interfaces(runner, platform, &state.interfaces).map_err(|e| {
+        TeardownUnverified {
+            profile: state.active_profile.clone(),
+            reason: format!("{e:#}"),
+        }
+    })?;
     if !survivors.is_empty() {
         // The record is deliberately NOT cleared. A retry needs to know what
         // it is still responsible for, and the caller has just been told the
@@ -590,6 +652,74 @@ mod tests {
             Some("t")
         );
         let _ = std::fs::remove_file(&state_path);
+    }
+
+    /// A post-apply listing that fails is not a failed apply: the commands
+    /// ran and the state was saved. It has to be distinguishable from one, or
+    /// a caller tells its operator nothing was touched.
+    #[test]
+    fn apply_whose_host_cannot_be_listed_afterward_is_unverified() {
+        let state_path = std::env::temp_dir().join("vlanctl-apply-unverified.json");
+        let _ = std::fs::remove_file(&state_path);
+        let mut r = linux_runner("lo eth0");
+        r.stdout
+            .insert("ip -json link show".to_string(), "not json".to_string());
+
+        let err = apply(&mut r, &Linux, &linux_profile(), None, &state_path, false)
+            .expect_err("an unconfirmed apply is not a success");
+        let typed = err
+            .downcast_ref::<BringUpUnverified>()
+            .unwrap_or_else(|| panic!("expected BringUpUnverified; got {err:#}"));
+        assert_eq!(typed.profile, "t");
+        assert_eq!(
+            State::load(&state_path).unwrap().active_profile.as_deref(),
+            Some("t"),
+            "the state is saved so `down` can clean up"
+        );
+        let _ = std::fs::remove_file(&state_path);
+    }
+
+    /// The teardown counterpart: commands ran, the host could not be asked.
+    #[test]
+    fn down_whose_host_cannot_be_listed_afterward_is_unverified() {
+        let state_path = std::env::temp_dir().join("vlanctl-down-unverified.json");
+        State {
+            active_profile: Some("t".to_string()),
+            interfaces: vec!["eth0.100".to_string()],
+        }
+        .save(&state_path)
+        .unwrap();
+        let mut r = RecordingRunner::default();
+        // Live before teardown; unreadable after it.
+        r.stdout_queue.insert(
+            "ip -json link show".to_string(),
+            [r#"[{"ifname":"eth0"},{"ifname":"eth0.100"}]"#.to_string()]
+                .into_iter()
+                .collect(),
+        );
+        r.stdout
+            .insert("ip -json link show".to_string(), "not json".to_string());
+
+        let err = down(&mut r, &Linux, &state_path, false)
+            .expect_err("an unconfirmed teardown is not a clean one");
+        assert_eq!(
+            err.downcast_ref::<TeardownUnverified>()
+                .map(|t| t.profile.as_deref()),
+            Some(Some("t")),
+            "expected TeardownUnverified; got {err:#}"
+        );
+        assert!(
+            r.commands
+                .iter()
+                .any(|c| c.display().starts_with("ip link del")),
+            "the teardown itself must have run"
+        );
+        assert_eq!(
+            State::load(&state_path).unwrap().interfaces,
+            vec!["eth0.100".to_string()],
+            "state survives an unconfirmed teardown"
+        );
+        std::fs::remove_file(&state_path).unwrap();
     }
 
     #[test]
