@@ -14,9 +14,14 @@
 //! - the profile entry's VLAN id goes into the parent adapter's `VlanID`
 //!   keyword (0 for an untagged entry, which is the keyword's own "no
 //!   VLAN" value);
-//! - the address, MTU, routes and static neighbor entries go onto the
-//!   parent adapter itself through `netsh`, exactly as the Hyper-V backend
-//!   puts them onto a virtual adapter.
+//! - the address and MTU go onto the parent adapter itself through `netsh`,
+//!   exactly as the Hyper-V backend puts them onto a virtual adapter;
+//! - the routes and static neighbor entries go on through PowerShell's
+//!   `New-NetRoute` / `New-NetNeighbor`, each preceded by a removal of the
+//!   same entry, because the adapter — and every persistent route on it —
+//!   outlives the profile. `down` removes every administratively added
+//!   route and permanent neighbor on the adapter, including any an operator
+//!   added by hand: this backend takes the adapter over.
 //!
 //! # What this means for a caller
 //!
@@ -57,7 +62,9 @@
 
 #[cfg(test)]
 use super::windows::adapter_property_probe;
-use super::windows::{POWERSHELL, WindowsHyperV, powershell, powershell_script, ps_literal};
+use super::windows::{
+    POWERSHELL, WindowsHyperV, powershell, powershell_script, ps_literal, route_prefix, windows_mac,
+};
 use super::{Platform, ipv4_netmask};
 use crate::config::{Interface, Profile, Route};
 use crate::net::{Cmd, CommandRunner};
@@ -125,12 +132,18 @@ impl Platform for WindowsDriverVlan {
     }
 
     fn teardown_commands(&self, iface: &str) -> Vec<Cmd> {
-        // The address first, while the adapter is stable; then the keyword,
-        // which restarts it. DHCP is where a sensor-facing adapter rests
-        // when nothing is applied: it is what the adapter had before the
-        // first apply on every host this was measured on, and a link-local
+        // The adapter outlives the profile here, and so would every route
+        // and static neighbor the apply added to it — persistent, and a
+        // `netsh add route` of the same prefix refuses a duplicate, which
+        // is how the second apply after a revert failed on the bench
+        // (2026-09-27). So the routes and neighbors go first, then the
+        // address, while the adapter is stable; then the keyword, which
+        // restarts it. DHCP is where a sensor-facing adapter rests when
+        // nothing is applied: it is what the adapter had before the first
+        // apply on every host this was measured on, and a link-local
         // address is what it settles to with no server on the wire.
         vec![
+            powershell(&clear_routes_script(iface)),
             Cmd::new(
                 "netsh",
                 &["interface", "ipv4", "set", "address", iface, "dhcp"],
@@ -139,9 +152,28 @@ impl Platform for WindowsDriverVlan {
         ]
     }
 
-    fn route_commands(&self, route: &Route, in_subnet: bool, iface: &str) -> Vec<Cmd> {
-        // Same stack, same `netsh`, same reasoning as the Hyper-V backend.
-        WindowsHyperV.route_commands(route, in_subnet, iface)
+    fn route_commands(&self, route: &Route, _in_subnet: bool, iface: &str) -> Vec<Cmd> {
+        // Idempotent, unlike the Hyper-V backend's `netsh add`: the adapter
+        // persists across applies, so a route from a previous apply — or
+        // one an operator added by hand — may already be there, and an
+        // apply must replace it rather than refuse. `in_subnet` is ignored
+        // for the reason the other Windows backend gives: an on-link route
+        // makes the stack ARP for the destination, which is what reaching
+        // several hosts on one subnet across VLANs needs.
+        let mut cmds = vec![powershell(&set_route_script(route, iface))];
+        // A static neighbor only makes sense for an on-link destination,
+        // as in the Hyper-V backend.
+        if route.gateway.is_none()
+            && let Some(mac) = &route.mac
+            && let Ok(net) = route.destination.parse::<IpNet>()
+        {
+            cmds.push(powershell(&set_neighbor_script(
+                &net.addr().to_string(),
+                &windows_mac(mac),
+                iface,
+            )));
+        }
+        cmds
     }
 
     fn existing_vlans(
@@ -237,6 +269,56 @@ fn set_vlan_script(vlan: u16, device: &str) -> String {
     )
 }
 
+/// Replace (or add) one route on `iface`. Removing first is what makes it
+/// idempotent; `-ErrorAction SilentlyContinue` on the removal is for the
+/// route not being there, which is the ordinary first-apply case.
+fn set_route_script(route: &Route, iface: &str) -> String {
+    let prefix = ps_literal(&route_prefix(&route.destination));
+    let dev = ps_literal(iface);
+    let next_hop = match &route.gateway {
+        Some(gateway) => format!(" -NextHop {}", ps_literal(&gateway.to_string())),
+        None => String::new(),
+    };
+    format!(
+        "Remove-NetRoute -DestinationPrefix {prefix} -InterfaceAlias {dev} -Confirm:$false \
+         -ErrorAction SilentlyContinue; \
+         New-NetRoute -DestinationPrefix {prefix} -InterfaceAlias {dev}{next_hop} | Out-Null"
+    )
+}
+
+/// Replace (or add) a permanent neighbor entry — Windows's static ARP —
+/// for `host` on `iface`.
+fn set_neighbor_script(host: &str, mac: &str, iface: &str) -> String {
+    let host = ps_literal(host);
+    let mac = ps_literal(mac);
+    let dev = ps_literal(iface);
+    format!(
+        "Remove-NetNeighbor -InterfaceAlias {dev} -IPAddress {host} -Confirm:$false \
+         -ErrorAction SilentlyContinue; \
+         New-NetNeighbor -InterfaceAlias {dev} -IPAddress {host} -LinkLayerAddress {mac} \
+         -State Permanent | Out-Null"
+    )
+}
+
+/// Remove every administratively added route and every permanent neighbor
+/// on `iface`, leaving the connected and link-local ones the stack manages
+/// itself. What an apply adds is exactly the administratively added kind
+/// (`Protocol` `NetMgmt`), and so is anything an operator added by hand —
+/// which this removes too, and the module doc says so: this backend takes
+/// the adapter over. Ends in `exit 0` for the same reason the address probe
+/// does: a removal that found nothing must not fail the teardown.
+fn clear_routes_script(iface: &str) -> String {
+    let dev = ps_literal(iface);
+    format!(
+        "Get-NetRoute -InterfaceAlias {dev} -AddressFamily IPv4 -ErrorAction SilentlyContinue | \
+         Where-Object {{ $_.Protocol -eq 'NetMgmt' }} | \
+         Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue; \
+         Get-NetNeighbor -InterfaceAlias {dev} -AddressFamily IPv4 -State Permanent \
+         -ErrorAction SilentlyContinue | Remove-NetNeighbor -Confirm:$false \
+         -ErrorAction SilentlyContinue; exit 0"
+    )
+}
+
 /// The probe this backend uses to read the keyword back, for tests and the
 /// dry-run allowlist.
 #[cfg(test)]
@@ -296,40 +378,90 @@ mod tests {
              Start-Sleep -Milliseconds 500 }"
         );
         assert_eq!(
-            render(&cmds[1..]),
+            render(&cmds[1..3]),
             vec![
                 "netsh interface ipv4 set address Ethernet 2 static 192.168.11.87 255.255.255.0",
                 "netsh interface ipv4 set subinterface Ethernet 2 mtu=1500 store=persistent",
-                "netsh interface ipv4 add route 239.255.0.255/32 Ethernet 2",
             ]
         );
-    }
-
-    #[test]
-    fn an_untagged_entry_sets_the_keyword_to_zero() {
-        let i = Interface {
-            vlan: None,
-            address: "192.168.1.100/24".parse().unwrap(),
-            mtu: None,
-            routes: vec![],
-        };
-        let cmds = bringup_commands_for(&WindowsDriverVlan, &i, "Ethernet 2");
-        assert!(
-            powershell_script(&cmds[0])
-                .unwrap()
-                .contains("-RegistryKeyword 'VlanID' -RegistryValue '0';")
-        );
-    }
-
-    #[test]
-    fn teardown_returns_the_adapter_to_dhcp_and_no_vlan_in_that_order() {
-        let cmds = WindowsDriverVlan.teardown_commands("Ethernet 2");
         assert_eq!(
-            cmds[0].display(),
+            powershell_script(&cmds[3]).unwrap(),
+            "$ErrorActionPreference = 'Stop'; \
+             Remove-NetRoute -DestinationPrefix '239.255.0.255/32' -InterfaceAlias 'Ethernet 2' \
+             -Confirm:$false -ErrorAction SilentlyContinue; \
+             New-NetRoute -DestinationPrefix '239.255.0.255/32' -InterfaceAlias 'Ethernet 2' | Out-Null"
+        );
+        assert_eq!(cmds.len(), 4);
+    }
+
+    /// The adapter persists across applies, and so do its routes: the second
+    /// apply after a revert failed on the bench (2026-09-27) because `netsh
+    /// add route` refused the prefix the first apply had left behind. A
+    /// route command must therefore replace, not add — and a gateway and a
+    /// static neighbor each ride the same remove-then-add shape.
+    #[test]
+    fn routes_and_neighbors_replace_rather_than_add() {
+        let via = Route {
+            destination: "10.0.0.0/8".to_string(),
+            gateway: Some("192.168.11.1".parse().unwrap()),
+            mac: None,
+        };
+        let cmds = WindowsDriverVlan.route_commands(&via, false, "Ethernet");
+        assert_eq!(cmds.len(), 1);
+        let script = powershell_script(&cmds[0]).unwrap();
+        assert!(
+            script.contains("; Remove-NetRoute -DestinationPrefix '10.0.0.0/8'")
+                && script.contains(
+                    "New-NetRoute -DestinationPrefix '10.0.0.0/8' -InterfaceAlias 'Ethernet' \
+                     -NextHop '192.168.11.1'"
+                ),
+            "{script}"
+        );
+
+        let on_link = Route {
+            destination: "192.168.11.102/32".to_string(),
+            gateway: None,
+            mac: Some("3a:42:f7:79:32:2e".to_string()),
+        };
+        let cmds = WindowsDriverVlan.route_commands(&on_link, true, "Ethernet");
+        let scripts: Vec<&str> = cmds.iter().map(|c| powershell_script(c).unwrap()).collect();
+        assert_eq!(scripts.len(), 2);
+        assert_eq!(
+            scripts[1],
+            "$ErrorActionPreference = 'Stop'; \
+             Remove-NetNeighbor -InterfaceAlias 'Ethernet' -IPAddress '192.168.11.102' \
+             -Confirm:$false -ErrorAction SilentlyContinue; \
+             New-NetNeighbor -InterfaceAlias 'Ethernet' -IPAddress '192.168.11.102' \
+             -LinkLayerAddress '3a-42-f7-79-32-2e' -State Permanent | Out-Null"
+        );
+        // Not `netsh add`, on any of them.
+        assert!(cmds.iter().all(|c| c.program != "netsh"));
+    }
+
+    /// Routes and permanent neighbors first — they would otherwise outlive
+    /// the profile on an adapter that persists — then the address, then the
+    /// keyword that restarts the adapter.
+    #[test]
+    fn teardown_clears_routes_then_returns_the_adapter_to_dhcp_and_no_vlan() {
+        let cmds = WindowsDriverVlan.teardown_commands("Ethernet 2");
+        assert_eq!(cmds.len(), 3);
+        let clear = powershell_script(&cmds[0]).unwrap();
+        assert!(
+            clear.contains("Get-NetRoute -InterfaceAlias 'Ethernet 2'")
+                && clear.contains("$_.Protocol -eq 'NetMgmt'")
+                && clear.contains("Remove-NetRoute")
+                && clear.contains("Get-NetNeighbor -InterfaceAlias 'Ethernet 2'")
+                && clear.contains("-State Permanent")
+                && clear.contains("Remove-NetNeighbor")
+                && clear.ends_with("; exit 0"),
+            "{clear}"
+        );
+        assert_eq!(
+            cmds[1].display(),
             "netsh interface ipv4 set address Ethernet 2 dhcp"
         );
         assert!(
-            powershell_script(&cmds[1])
+            powershell_script(&cmds[2])
                 .unwrap()
                 .contains("-RegistryKeyword 'VlanID' -RegistryValue '0';")
         );

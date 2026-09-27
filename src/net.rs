@@ -74,11 +74,18 @@ impl CommandRunner for SystemRunner {
     fn run(&mut self, cmd: &Cmd) -> Result<String> {
         let output = Command::new(&cmd.program).args(&cmd.args).output()?;
         if !output.status.success() {
-            bail!(
-                "command `{}` failed: {}",
-                cmd.display(),
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
+            // stderr is where a failure's reason belongs, but not every tool
+            // puts it there: `netsh` explains a refused route on stdout and
+            // leaves stderr empty, which rendered as "failed: " on the
+            // bench. Fall back to stdout so the message carries something.
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let reason = if stderr.trim().is_empty() {
+                stdout.trim()
+            } else {
+                stderr.trim()
+            };
+            bail!("command `{}` failed: {reason}", cmd.display());
         }
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     }
