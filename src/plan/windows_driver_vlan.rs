@@ -305,8 +305,13 @@ fn set_neighbor_script(host: &str, mac: &str, iface: &str) -> String {
 /// itself. What an apply adds is exactly the administratively added kind
 /// (`Protocol` `NetMgmt`), and so is anything an operator added by hand —
 /// which this removes too, and the module doc says so: this backend takes
-/// the adapter over. Ends in `exit 0` for the same reason the address probe
-/// does: a removal that found nothing must not fail the teardown.
+/// the adapter over. The stack's own multicast and broadcast neighbor
+/// entries are `Permanent` too (measured 2026-09-27: `224.0.0.22`,
+/// `239.255.255.250`, the subnet broadcast), so the neighbor filter is on
+/// the link-layer address: a static neighbor an apply added is never a
+/// multicast or broadcast MAC. Ends in `exit 0` for the same reason the
+/// address probe does: a removal that found nothing must not fail the
+/// teardown.
 fn clear_routes_script(iface: &str) -> String {
     let dev = ps_literal(iface);
     format!(
@@ -314,8 +319,10 @@ fn clear_routes_script(iface: &str) -> String {
          Where-Object {{ $_.Protocol -eq 'NetMgmt' }} | \
          Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue; \
          Get-NetNeighbor -InterfaceAlias {dev} -AddressFamily IPv4 -State Permanent \
-         -ErrorAction SilentlyContinue | Remove-NetNeighbor -Confirm:$false \
-         -ErrorAction SilentlyContinue; exit 0"
+         -ErrorAction SilentlyContinue | \
+         Where-Object {{ $_.LinkLayerAddress -notlike '01-00-5E-*' -and \
+         $_.LinkLayerAddress -ne 'FF-FF-FF-FF-FF-FF' }} | \
+         Remove-NetNeighbor -Confirm:$false -ErrorAction SilentlyContinue; exit 0"
     )
 }
 
@@ -452,6 +459,8 @@ mod tests {
                 && clear.contains("Remove-NetRoute")
                 && clear.contains("Get-NetNeighbor -InterfaceAlias 'Ethernet 2'")
                 && clear.contains("-State Permanent")
+                && clear.contains("$_.LinkLayerAddress -notlike '01-00-5E-*'")
+                && clear.contains("$_.LinkLayerAddress -ne 'FF-FF-FF-FF-FF-FF'")
                 && clear.contains("Remove-NetNeighbor")
                 && clear.ends_with("; exit 0"),
             "{clear}"
