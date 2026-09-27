@@ -31,7 +31,7 @@
 //! **Binding the parent takes it away from the host.** Once the switch is
 //! bound, the parent adapter carries no address of its own until `down`
 //! removes the switch again. Point this backend at the machine's uplink and
-//! the machine loses its uplink. That is why [`Windows`] answers `true` to
+//! the machine loses its uplink. That is why [`WindowsHyperV`] answers `true` to
 //! [`Platform::claims_parent_exclusively`] and device auto-detection refuses
 //! to guess here: name the sensor-facing adapter explicitly.
 //!
@@ -88,7 +88,7 @@ const UNTAGGED_VNIC: &str = "untagged";
 /// The interpreter every cmdlet goes through. Windows PowerShell 5.1 ships
 /// with every supported Windows and is where the Hyper-V module lives;
 /// `pwsh` is not assumed.
-const POWERSHELL: &str = "powershell.exe";
+pub(super) const POWERSHELL: &str = "powershell.exe";
 
 /// Every script starts with this. `-Command` reports success unless the
 /// *last* statement failed, and cmdlet errors are non-terminating by
@@ -103,9 +103,9 @@ const SCRIPT_PREFIX: &str = "$ErrorActionPreference = 'Stop'; ";
 const ADAPTER_WAIT_POLLS: u32 = 40;
 
 /// Windows, through Hyper-V. See the module documentation for the model.
-pub struct Windows;
+pub struct WindowsHyperV;
 
-impl Windows {
+impl WindowsHyperV {
     /// Whether `cmd` is one of this backend's read-only probes.
     ///
     /// A dry run executes exactly the commands this returns `true` for, so
@@ -139,9 +139,9 @@ impl Windows {
     }
 }
 
-impl Platform for Windows {
+impl Platform for WindowsHyperV {
     fn name(&self) -> &'static str {
-        "windows"
+        "windows-hyperv"
     }
 
     fn iface_name(&self, interface: &Interface, _device: &str) -> String {
@@ -389,7 +389,7 @@ fn vnic_from_alias(alias: &str) -> Option<&str> {
 /// argument, PowerShell receives it as one command string, and nothing in
 /// between re-splits it. Scripts contain no double quotes by construction,
 /// which keeps that quoting trivial.
-fn powershell(script: &str) -> Cmd {
+pub(super) fn powershell(script: &str) -> Cmd {
     let script = format!("{SCRIPT_PREFIX}{script}");
     Cmd::new(
         POWERSHELL,
@@ -405,7 +405,7 @@ fn powershell(script: &str) -> Cmd {
 }
 
 /// The script inside a [`powershell`] command, if `cmd` has that shape.
-fn powershell_script(cmd: &Cmd) -> Option<&str> {
+pub(super) fn powershell_script(cmd: &Cmd) -> Option<&str> {
     match cmd.args.as_slice() {
         [no_profile, non_interactive, exec, bypass, command, script]
             if no_profile == "-NoProfile"
@@ -427,12 +427,12 @@ fn powershell_script(cmd: &Cmd) -> Option<&str> {
 /// makes this a complete escape for any value: an adapter name, a profile
 /// field, anything that must not be able to end the literal or start a
 /// statement.
-fn ps_literal(s: &str) -> String {
+pub(super) fn ps_literal(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
 
 /// `netsh` takes `0.0.0.0/0` where a profile says `default`.
-fn route_prefix(destination: &str) -> String {
+pub(super) fn route_prefix(destination: &str) -> String {
     if destination == "default" {
         "0.0.0.0/0".to_string()
     } else {
@@ -442,12 +442,12 @@ fn route_prefix(destination: &str) -> String {
 
 /// `netsh` writes a MAC with dashes; profiles are validated in the colon
 /// form. Dashes pass through unchanged.
-fn windows_mac(mac: &str) -> String {
+pub(super) fn windows_mac(mac: &str) -> String {
     mac.replace(':', "-")
 }
 
 /// A probe for one property of the adapter named exactly `device`.
-fn adapter_property_probe(device: &str, property: &str) -> Cmd {
+pub(super) fn adapter_property_probe(device: &str, property: &str) -> Cmd {
     powershell(&format!(
         "$a = Get-NetAdapter | Where-Object {{ $_.Name -eq {lit} }}; \
          if (-not $a) {{ throw 'no adapter named ' + {lit} }}; $a.{property}",
@@ -531,7 +531,7 @@ mod tests {
     #[test]
     fn a_tagged_entry_is_the_vethernet_alias_of_its_vlan() {
         assert_eq!(
-            Windows.iface_name(&tagged(11, "192.168.11.87/24"), "Ethernet 2"),
+            WindowsHyperV.iface_name(&tagged(11, "192.168.11.87/24"), "Ethernet 2"),
             "vEthernet (vlan11)"
         );
     }
@@ -546,7 +546,10 @@ mod tests {
         };
         // The parent's own stack is gone once it is bound to the switch, so
         // an untagged entry cannot live there as it does on macOS/Linux.
-        assert_eq!(Windows.iface_name(&i, "Ethernet 2"), "vEthernet (untagged)");
+        assert_eq!(
+            WindowsHyperV.iface_name(&i, "Ethernet 2"),
+            "vEthernet (untagged)"
+        );
     }
 
     #[test]
@@ -578,7 +581,7 @@ mod tests {
                 },
             ],
         };
-        let rendered = render(&bringup_commands_for(&Windows, &i, "Ethernet 2"));
+        let rendered = render(&bringup_commands_for(&WindowsHyperV, &i, "Ethernet 2"));
         assert_eq!(
             rendered,
             vec![
@@ -634,7 +637,7 @@ mod tests {
                 mac: Some("00:00:5e:00:53:01".to_string()),
             }],
         };
-        let cmds = bringup_commands_for(&Windows, &i, "Ethernet 2");
+        let cmds = bringup_commands_for(&WindowsHyperV, &i, "Ethernet 2");
         let script = powershell_script(&cmds[0]).unwrap();
         assert!(
             script.contains("-Name 'untagged' | Out-Null")
@@ -664,16 +667,16 @@ mod tests {
             mac: None,
         };
         assert_eq!(
-            render(&Windows.route_commands(&route, false, "vEthernet (vlan11)")),
+            render(&WindowsHyperV.route_commands(&route, false, "vEthernet (vlan11)")),
             vec!["netsh interface ipv4 add route 0.0.0.0/0 vEthernet (vlan11) 192.168.11.1"]
         );
     }
 
     #[test]
     fn teardown_removes_the_adapter_and_the_switch_when_it_was_the_last() {
-        let rendered = render(&Windows.teardown_commands("vEthernet (vlan11)"));
+        let rendered = render(&WindowsHyperV.teardown_commands("vEthernet (vlan11)"));
         assert_eq!(rendered.len(), 1);
-        let script = powershell_script(&Windows.teardown_commands("vEthernet (vlan11)")[0])
+        let script = powershell_script(&WindowsHyperV.teardown_commands("vEthernet (vlan11)")[0])
             .unwrap()
             .to_string();
         assert_eq!(
@@ -691,7 +694,7 @@ mod tests {
     fn teardown_of_an_unrecognised_name_treats_it_as_an_adapter_name() {
         // A hand-edited state file naming the adapter without its alias
         // still tears it down, rather than silently doing nothing.
-        let cmds = Windows.teardown_commands("vlan11");
+        let cmds = WindowsHyperV.teardown_commands("vlan11");
         assert!(
             powershell_script(&cmds[0])
                 .unwrap()
@@ -702,13 +705,13 @@ mod tests {
     #[test]
     fn only_the_create_script_is_recorded() {
         let i = tagged(11, "192.168.11.87/24");
-        let cmds = bringup_commands_for(&Windows, &i, "Ethernet 2");
+        let cmds = bringup_commands_for(&WindowsHyperV, &i, "Ethernet 2");
         let recorded: Vec<bool> = cmds
             .iter()
-            .map(|c| Windows.records_created_interface(c))
+            .map(|c| WindowsHyperV.records_created_interface(c))
             .collect();
         assert_eq!(recorded, vec![true, false]);
-        assert!(!Windows.records_created_interface(&Windows.teardown_commands("x")[0]));
+        assert!(!WindowsHyperV.records_created_interface(&WindowsHyperV.teardown_commands("x")[0]));
     }
 
     // ── escaping ────────────────────────────────────────────────────────
@@ -743,8 +746,8 @@ mod tests {
                 mac: Some("00:00:5e:00:53:01".to_string()),
             }],
         };
-        let mut all = bringup_commands_for(&Windows, &i, "Ethernet 2");
-        all.extend(Windows.teardown_commands("vEthernet (vlan11)"));
+        let mut all = bringup_commands_for(&WindowsHyperV, &i, "Ethernet 2");
+        all.extend(WindowsHyperV.teardown_commands("vEthernet (vlan11)"));
         all.push(adapter_property_probe("Ethernet 2", "Status"));
         for cmd in &all {
             if let Some(script) = powershell_script(cmd) {
@@ -766,7 +769,7 @@ mod tests {
         let probe = powershell("Get-NetAdapter | ForEach-Object { $_.Name }");
         let mut runner = runner_with(&probe, "Ethernet 2\r\nWi-Fi\r\nvEthernet (vlan11)\r\n");
         assert_eq!(
-            Windows.list_devices(&mut runner).unwrap(),
+            WindowsHyperV.list_devices(&mut runner).unwrap(),
             vec!["Ethernet 2", "Wi-Fi", "vEthernet (vlan11)"]
         );
     }
@@ -780,7 +783,7 @@ mod tests {
         );
         let mut runner = runner_with(&probe, "192.168.11.87/24\r\n169.254.12.34/16\r\n");
         assert_eq!(
-            Windows
+            WindowsHyperV
                 .addresses_on(&mut runner, "vEthernet (vlan11)")
                 .unwrap(),
             vec![
@@ -793,7 +796,7 @@ mod tests {
         // addresses", not as a failure.
         let mut runner = runner_with(&probe, "");
         assert_eq!(
-            Windows
+            WindowsHyperV
                 .addresses_on(&mut runner, "vEthernet (vlan11)")
                 .unwrap(),
             Vec::<IpNet>::new()
@@ -806,23 +809,35 @@ mod tests {
             &adapter_property_probe("Wi-Fi", "PhysicalMediaType"),
             "Native 802.11\r\n",
         );
-        assert!(Windows.is_wireless(&mut runner, "Wi-Fi").unwrap());
+        assert!(WindowsHyperV.is_wireless(&mut runner, "Wi-Fi").unwrap());
         let mut runner = runner_with(
             &adapter_property_probe("Ethernet 2", "PhysicalMediaType"),
             "802.3\r\n",
         );
-        assert!(!Windows.is_wireless(&mut runner, "Ethernet 2").unwrap());
+        assert!(
+            !WindowsHyperV
+                .is_wireless(&mut runner, "Ethernet 2")
+                .unwrap()
+        );
     }
 
     #[test]
     fn link_is_active_only_for_status_up() {
         let mut runner = runner_with(&adapter_property_probe("Ethernet 2", "Status"), "Up\r\n");
-        assert!(Windows.link_is_active(&mut runner, "Ethernet 2").unwrap());
+        assert!(
+            WindowsHyperV
+                .link_is_active(&mut runner, "Ethernet 2")
+                .unwrap()
+        );
         let mut runner = runner_with(
             &adapter_property_probe("Ethernet 2", "Status"),
             "Disconnected\r\n",
         );
-        assert!(!Windows.link_is_active(&mut runner, "Ethernet 2").unwrap());
+        assert!(
+            !WindowsHyperV
+                .link_is_active(&mut runner, "Ethernet 2")
+                .unwrap()
+        );
     }
 
     #[test]
@@ -835,21 +850,23 @@ mod tests {
             fail_at: Some(0),
             ..RecordingRunner::default()
         };
-        let err = Windows.link_is_active(&mut failing(), "Nope").unwrap_err();
+        let err = WindowsHyperV
+            .link_is_active(&mut failing(), "Nope")
+            .unwrap_err();
         assert!(err.to_string().contains("Nope"), "{err}");
-        assert!(Windows.is_wireless(&mut failing(), "Nope").is_err());
+        assert!(WindowsHyperV.is_wireless(&mut failing(), "Nope").is_err());
     }
 
     #[test]
     fn candidate_devices_exclude_virtual_wireless_and_placeholder_adapters() {
-        assert!(Windows.is_candidate_device("Ethernet"));
-        assert!(Windows.is_candidate_device("Ethernet 2"));
-        assert!(!Windows.is_candidate_device("vEthernet (vlan11)"));
-        assert!(!Windows.is_candidate_device("vEthernet (Default Switch)"));
-        assert!(!Windows.is_candidate_device("Wi-Fi"));
-        assert!(!Windows.is_candidate_device("Local Area Connection* 1"));
-        assert!(!Windows.is_candidate_device("Loopback Pseudo-Interface 1"));
-        assert!(!Windows.is_candidate_device("Bluetooth Network Connection"));
+        assert!(WindowsHyperV.is_candidate_device("Ethernet"));
+        assert!(WindowsHyperV.is_candidate_device("Ethernet 2"));
+        assert!(!WindowsHyperV.is_candidate_device("vEthernet (vlan11)"));
+        assert!(!WindowsHyperV.is_candidate_device("vEthernet (Default Switch)"));
+        assert!(!WindowsHyperV.is_candidate_device("Wi-Fi"));
+        assert!(!WindowsHyperV.is_candidate_device("Local Area Connection* 1"));
+        assert!(!WindowsHyperV.is_candidate_device("Loopback Pseudo-Interface 1"));
+        assert!(!WindowsHyperV.is_candidate_device("Bluetooth Network Connection"));
     }
 
     // ── the dry-run allowlist ────────────────────────────────────────────
@@ -866,15 +883,19 @@ mod tests {
             adapter_property_probe("Ethernet 2", "Status"),
             adapter_property_probe("Ethernet 2", "PhysicalMediaType"),
         ] {
-            assert!(Windows::is_read_only_probe(&probe), "{}", probe.display());
+            assert!(
+                WindowsHyperV::is_read_only_probe(&probe),
+                "{}",
+                probe.display()
+            );
         }
         let i = tagged(11, "192.168.11.87/24");
-        for mutation in bringup_commands_for(&Windows, &i, "Ethernet 2")
+        for mutation in bringup_commands_for(&WindowsHyperV, &i, "Ethernet 2")
             .iter()
-            .chain(Windows.teardown_commands("vEthernet (vlan11)").iter())
+            .chain(WindowsHyperV.teardown_commands("vEthernet (vlan11)").iter())
         {
             assert!(
-                !Windows::is_read_only_probe(mutation),
+                !WindowsHyperV::is_read_only_probe(mutation),
                 "{}",
                 mutation.display()
             );
@@ -883,12 +904,12 @@ mod tests {
         // not a probe: the literal keeps it inert, and the allowlist keeps
         // it out of a dry run regardless.
         let smuggled = adapter_property_probe("x'; Remove-VMSwitch -Name 'vlanctl", "Status");
-        assert!(!Windows::is_read_only_probe(&smuggled));
-        assert!(!Windows::is_read_only_probe(&Cmd::new(
+        assert!(!WindowsHyperV::is_read_only_probe(&smuggled));
+        assert!(!WindowsHyperV::is_read_only_probe(&Cmd::new(
             "powershell.exe",
             &["-Command", "Get-NetAdapter"]
         )));
-        assert!(!Windows::is_read_only_probe(&Cmd::new(
+        assert!(!WindowsHyperV::is_read_only_probe(&Cmd::new(
             "netsh",
             &["interface", "ipv4", "show", "addresses"]
         )));

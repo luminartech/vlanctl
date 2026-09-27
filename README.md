@@ -45,35 +45,58 @@ auto-detect and `--device` is required — see below for why.
 
 ### Windows
 
-Windows has no general 802.1Q sub-interface, so the Windows backend uses
-Hyper-V: it binds the parent adapter to an external virtual switch named
-`vlanctl` and creates one management-OS virtual adapter per `[[interface]]`
-entry, in access mode for that entry's VLAN. Addresses, routes and static
-neighbor entries are set with `netsh`. What that means in practice:
+Windows has no general 802.1Q sub-interface, so vlanctl has two Windows
+backends and picks one by the profile's shape:
 
-- **Hyper-V must be enabled** (`Enable-WindowsOptionalFeature -Online
-  -FeatureName Microsoft-Hyper-V-All`, which reboots). It is available on
-  Windows 10/11 Pro, Enterprise and Education and on Windows Server, not on
-  Home. vlanctl never enables it.
+- **One `[[interface]]` entry: the adapter driver's own VLAN setting.** Most
+  wired drivers implement the standardized `VlanID` keyword; with it set, the
+  driver tags everything it sends, accepts only that VLAN on receive, and
+  strips the tag. The physical adapter becomes an access port for that VLAN
+  and gets the entry's address directly. No virtual switch is involved. The
+  keyword holds one id, which is why this backend takes only single-entry
+  profiles: to work with a sensor's live-data VLAN most of the time and its
+  diagnostics VLAN occasionally, keep them as two profiles and apply the one
+  you need.
+- **Several entries: Hyper-V.** The parent adapter is bound to an external
+  virtual switch named `vlanctl`, with one management-OS virtual adapter per
+  entry in access mode for that entry's VLAN. Interface names are the
+  adapters Windows creates, `vEthernet (vlan11)` for VLAN 11 and `vEthernet
+  (untagged)` for an untagged entry; because the parent's own stack is gone
+  once bound, the untagged entry is a virtual adapter too and is removed on
+  `down`. Hyper-V must be enabled (`Enable-WindowsOptionalFeature -Online
+  -FeatureName Microsoft-Hyper-V-All`, which reboots; Windows 10/11 Pro,
+  Enterprise, Education and Server, not Home). vlanctl never enables it.
+
+Either way, addresses, routes and static neighbor entries are set with
+`netsh`, and:
+
 - **`apply` and `down` need an elevated shell** (Run as administrator), the
   Windows equivalent of `sudo`.
-- **Binding the parent takes it away from the host.** While the switch is up
-  the parent adapter has no addressing of its own, so pointing vlanctl at the
-  machine's uplink disconnects the machine until `down`. That is why `--device`
-  is required on Windows: vlanctl will not guess.
-- **Interface names are the adapters Windows creates**: `vEthernet (vlan11)`
-  for VLAN 11, `vEthernet (untagged)` for an untagged entry. Because the
-  parent's own stack is gone once bound, an untagged entry is a virtual adapter
-  too, and unlike on macOS and Linux it is removed on `down`.
-- **Everything persists across a reboot** — the switch, its adapters, their
-  addresses and routes. One thing does not recover by itself: if the parent
-  adapter is absent at boot (a dock that did not enumerate, a USB NIC that was
-  unplugged), Hyper-V leaves the switch unbound and does not rebind it when the
-  adapter returns. `vlanctl down` then `vlanctl apply` recovers it.
-- The Hyper-V cmdlets run through `powershell.exe -Command`, which is not
-  subject to script execution policy (no script file is involved), and
-  `netsh` is a plain executable, so nothing here needs signing or a policy
-  change.
+- **The parent adapter is taken over.** Under the driver setting it transmits
+  tagged only; under the switch it has no addressing of its own. Pointing
+  vlanctl at the machine's uplink disconnects the machine until `down`. That
+  is why `--device` is required on Windows: vlanctl will not guess.
+- **The state file records which backend applied**, and `down` runs through
+  that one, so switching between the two across profiles is safe.
+- **Everything persists across a reboot** — the keyword, the switch and its
+  adapters, their addresses and routes. One thing does not recover by itself:
+  if the parent adapter is absent at boot (a dock that did not enumerate, a
+  USB NIC that was unplugged), Hyper-V leaves the switch unbound and does not
+  rebind it when the adapter returns. `vlanctl down` then `vlanctl apply`
+  recovers it.
+- **Setting the driver keyword restarts the adapter**: the link drops for a
+  few seconds on apply and again on `down`.
+- **A peer that has cached the address's MAC keeps using it.** The two
+  backends put the same address on different MACs (the physical adapter's
+  under the driver setting, a virtual adapter's under the switch). A device
+  that resolved the address under one and keeps streaming to it, as a sensor
+  does with its point cloud, goes on sending to the old MAC after a switch to
+  the other until its own datapath restarts. vlanctl cannot tell it; plan a
+  restart of the peer's stream into any such switch.
+- The Hyper-V cmdlets and the keyword run through `powershell.exe -Command`,
+  which is not subject to script execution policy (no script file is
+  involved), and `netsh` is a plain executable, so nothing here needs signing
+  or a policy change.
 
 ## Library use
 

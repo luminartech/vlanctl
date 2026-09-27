@@ -77,6 +77,11 @@ pub fn apply<R: CommandRunner>(
     state_path: &Path,
     dry_run: bool,
 ) -> Result<Vec<String>> {
+    // A backend that cannot take this profile says so before anything is
+    // touched — including the active profile below, which a refusal must
+    // leave standing.
+    platform.validate_profile(profile)?;
+
     // Tear down whatever is currently active. The local `state` is rewritten
     // wholesale below, so there is no need to reload it after `down`.
     let mut state = State::load(state_path)?;
@@ -186,6 +191,11 @@ pub fn apply<R: CommandRunner>(
 
     state.active_profile = Some(profile.name.clone());
     state.interfaces = created.clone();
+    // Which backend made these, so `down` can run through the same one
+    // rather than whatever the host would pick for a fresh profile — on
+    // Windows those can differ, and the other backend's teardown would not
+    // undo this one's work.
+    state.backend = Some(platform.name().to_string());
     if !dry_run {
         // Saved before the check below, deliberately: if verification fails
         // the host is partly configured, and the caller needs a state file
@@ -492,7 +502,7 @@ pub fn status<R: CommandRunner>(
 mod tests {
     use super::*;
     use crate::net::RecordingRunner;
-    use crate::plan::{Linux, MacOs, Windows};
+    use crate::plan::{Linux, MacOs, WindowsDriverVlan, WindowsHyperV};
 
     fn profile() -> Profile {
         // Pin `device` so these tests exercise apply/down orchestration without
@@ -774,7 +784,7 @@ mod tests {
     /// cannot silently turn this stub into an unmapped command.
     fn windows_runner(live: &[&str]) -> RecordingRunner {
         let mut probe = RecordingRunner::default();
-        Windows.list_devices(&mut probe).unwrap();
+        WindowsHyperV.list_devices(&mut probe).unwrap();
         let mut r = RecordingRunner::default();
         r.stdout
             .insert(probe.commands[0].display(), live.join("\r\n"));
@@ -792,7 +802,7 @@ mod tests {
         let mut r = windows_runner(&["Ethernet 2", "Wi-Fi"]);
         let created = apply(
             &mut r,
-            &Windows,
+            &WindowsHyperV,
             &windows_profile(),
             None,
             &state_path,
@@ -805,11 +815,11 @@ mod tests {
 
         // Both adapters are live now; `down` must remove both, in reverse.
         let mut r = windows_runner(&["Ethernet 2", "vEthernet (untagged)", "vEthernet (vlan12)"]);
-        down(&mut r, &Windows, &state_path, false).unwrap();
+        down(&mut r, &WindowsHyperV, &state_path, false).unwrap();
         let teardowns: Vec<&str> = r
             .commands
             .iter()
-            .filter(|c| Windows.teardown_commands("x")[0].program == c.program)
+            .filter(|c| WindowsHyperV.teardown_commands("x")[0].program == c.program)
             .filter_map(|c| c.args.last())
             .filter(|s| s.contains("Remove-VMNetworkAdapter"))
             .map(String::as_str)
@@ -835,7 +845,7 @@ mod tests {
         let mut r = windows_runner(&["Ethernet 2", "vEthernet (untagged)"]);
         let err = apply(
             &mut r,
-            &Windows,
+            &WindowsHyperV,
             &windows_profile(),
             None,
             &state_path,
@@ -850,9 +860,86 @@ mod tests {
         assert!(
             !r.commands
                 .iter()
-                .any(|c| Windows.records_created_interface(c)),
+                .any(|c| WindowsHyperV.records_created_interface(c)),
             "nothing may be created after a refusal"
         );
+        let _ = std::fs::remove_file(&state_path);
+    }
+
+    #[test]
+    fn apply_records_the_backend_that_applied() {
+        let state_path = std::env::temp_dir().join("vlanctl-backend-recorded.json");
+        let _ = std::fs::remove_file(&state_path);
+        let mut r = linux_runner("lo eth0");
+        apply(&mut r, &Linux, &linux_profile(), None, &state_path, false).unwrap();
+        assert_eq!(
+            State::load(&state_path).unwrap().backend.as_deref(),
+            Some("linux")
+        );
+        let _ = std::fs::remove_file(&state_path);
+    }
+
+    #[test]
+    fn apply_with_the_driver_vlan_backend_records_the_parent_and_down_puts_it_back() {
+        // The parent adapter itself is the interface here: the keyword
+        // changes what it is, and `down` must reset the keyword and the
+        // address, so the parent is recorded although nothing new appeared.
+        let p: Profile = toml::from_str(
+            "name=\"live\"\ndevice=\"Ethernet 2\"\n\
+             [[interface]]\nvlan=11\naddress=\"192.168.11.87/24\"\n",
+        )
+        .unwrap();
+        p.validate().unwrap();
+        let state_path = std::env::temp_dir().join("vlanctl-driver-vlan-apply.json");
+        let _ = std::fs::remove_file(&state_path);
+        let mut r = windows_runner(&["Ethernet 2", "Wi-Fi"]);
+        let created = apply(&mut r, &WindowsDriverVlan, &p, None, &state_path, false).unwrap();
+        assert_eq!(created, vec!["Ethernet 2"]);
+        let state = State::load(&state_path).unwrap();
+        assert_eq!(state.backend.as_deref(), Some("windows-driver-vlan"));
+
+        let mut r = windows_runner(&["Ethernet 2", "Wi-Fi"]);
+        down(&mut r, &WindowsDriverVlan, &state_path, false).unwrap();
+        let rendered: Vec<String> = r.commands.iter().map(|c| c.display()).collect();
+        assert!(
+            rendered.contains(&"netsh interface ipv4 set address Ethernet 2 dhcp".to_string()),
+            "{rendered:?}"
+        );
+        assert!(
+            rendered
+                .iter()
+                .any(|c| c.contains("-RegistryKeyword 'VlanID' -RegistryValue '0'")),
+            "{rendered:?}"
+        );
+        assert_eq!(State::load(&state_path).unwrap(), State::default());
+        let _ = std::fs::remove_file(&state_path);
+    }
+
+    #[test]
+    fn a_backend_refusal_leaves_the_active_profile_standing() {
+        // Two entries on the driver VLAN backend: refused by
+        // `validate_profile`, and the refusal must come before the teardown
+        // of what is active, or "refused" would also mean "torn down".
+        let state_path = std::env::temp_dir().join("vlanctl-refusal-keeps-active.json");
+        let active = State {
+            active_profile: Some("live".to_string()),
+            interfaces: vec!["Ethernet 2".to_string()],
+            backend: Some("windows-driver-vlan".to_string()),
+        };
+        active.save(&state_path).unwrap();
+        let mut r = windows_runner(&["Ethernet 2"]);
+        let err = apply(
+            &mut r,
+            &WindowsDriverVlan,
+            &windows_profile(),
+            None,
+            &state_path,
+            false,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("one VLAN per adapter"), "{err}");
+        assert!(r.commands.is_empty(), "nothing may run: {:?}", r.commands);
+        assert_eq!(State::load(&state_path).unwrap(), active);
         let _ = std::fs::remove_file(&state_path);
     }
 
@@ -1088,6 +1175,7 @@ mod tests {
         let state = State {
             active_profile: Some("t".to_string()),
             interfaces: vec!["vlan0".to_string(), "vlan1".to_string()],
+            backend: None,
         };
         state.save(&state_path).unwrap();
         let mut r = RecordingRunner::default();
@@ -1126,6 +1214,7 @@ mod tests {
         State {
             active_profile: Some("t".to_string()),
             interfaces: vec!["vlan10".to_string(), "vlan11".to_string()],
+            backend: None,
         }
         .save(&state_path)
         .unwrap();
@@ -1326,6 +1415,7 @@ mod tests {
         State {
             active_profile: Some("t".to_string()),
             interfaces: vec!["vlan0".to_string(), "vlan9".to_string()],
+            backend: None,
         }
         .save(&state_path)
         .unwrap();

@@ -27,9 +27,16 @@ cargo fmt --check
 
 `Platform` in `src/plan.rs` is the seam between planning a change and naming
 the commands that carry it out. `MacOs` renders `ifconfig`/`route`, `Linux`
-renders `ip`, `Windows` (in `src/plan/windows.rs`) renders Hyper-V cmdlets
-through `powershell.exe` plus `netsh`, and `host_platform()` picks one from the
-running host — returning an error, not a default, on a host with no backend.
+renders `ip`, and Windows has two: `WindowsHyperV` (`src/plan/windows.rs`)
+renders Hyper-V cmdlets through `powershell.exe` plus `netsh`, and
+`WindowsDriverVlan` (`src/plan/windows_driver_vlan.rs`) sets the adapter
+driver's `VlanID` keyword instead and holds one VLAN per adapter.
+`host_platform()` picks a backend from the running host — returning an error,
+not a default, on a host with no backend — and `host_platform_for(profile)`
+refines that on Windows by the profile's shape. The state file records the
+backend's `name()` so `down` runs through the one that applied
+(`platform_named`); a backend that cannot take a profile at all says so in
+`validate_profile`, which `apply` checks before touching anything.
 
 Two rules keep that seam honest, and both have tests that will tell you when
 you break them:
@@ -39,21 +46,23 @@ you break them:
   `ip` commands. It was once pinned to `MacOs`, which made previews disagree
   with the applies they previewed.
 - **Tests render through an explicit platform, never the host's.** The
-  regression tests construct `&MacOs`, `&Linux` or `&Windows` directly, so they
-  assert the same thing on every developer's machine and in CI. A test that
-  depends on where it runs proves nothing.
+  regression tests construct `&MacOs`, `&Linux`, `&WindowsHyperV` or
+  `&WindowsDriverVlan` directly, so they assert the same thing on every
+  developer's machine and in CI. A test that depends on where it runs proves
+  nothing.
 
 Commands are built as argv — program plus arguments — and never as a shell
 string. `Cmd::display()` renders a shell-*like* string, but only for `show` and
 `--dry-run` output. Keep it that way; see [`SECURITY.md`](SECURITY.md).
 
-The Windows backend is the one place a command carries a script: a PowerShell
-command line is one argv element, `-Command <script>`, because Hyper-V has no
-executable to call. Two rules keep that inside the argv boundary. Every value
+The Windows backends are the one place a command carries a script: a
+PowerShell command line is one argv element, `-Command <script>`, because
+Hyper-V and the adapter keyword have no executable to call. Two rules keep
+that inside the argv boundary. Every value
 that enters a script goes through `ps_literal`, which renders a single-quoted
 PowerShell literal — the one context in PowerShell where nothing is
 interpolated and the only special character is `'`. And the dry-run allowlist
-for those commands lives with the backend (`Windows::is_read_only_probe`),
+for those commands lives with the backend (`WindowsHyperV::is_read_only_probe`),
 statement by statement, because `argv` alone cannot tell a probe from a
 mutation there.
 

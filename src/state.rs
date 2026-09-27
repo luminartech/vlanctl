@@ -12,6 +12,13 @@ pub struct State {
     pub active_profile: Option<String>,
     /// Interface names (e.g. "vlan0") this tool created for the active profile.
     pub interfaces: Vec<String>,
+    /// [`Platform::name`](crate::plan::Platform::name) of the backend that
+    /// applied the active profile, so `down` runs through the same one.
+    /// `None` in a state file written before this field existed; a reader
+    /// then falls back to the host's default backend, which is the only
+    /// backend such a file can have come from.
+    #[serde(default)]
+    pub backend: Option<String>,
 }
 
 impl State {
@@ -79,9 +86,24 @@ mod tests {
         let state = State {
             active_profile: Some("example_bench".to_string()),
             interfaces: vec!["vlan0".to_string(), "vlan1".to_string()],
+            backend: Some("macos".to_string()),
         };
         state.save(&path).unwrap();
         assert_eq!(State::load(&path).unwrap(), state);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn a_state_file_from_before_the_backend_field_still_loads() {
+        let path = std::env::temp_dir().join("vlanctl-test-state-old.json");
+        std::fs::write(
+            &path,
+            r#"{ "active_profile": "lum", "interfaces": ["vlan10", "vlan11"] }"#,
+        )
+        .unwrap();
+        let state = State::load(&path).unwrap();
+        assert_eq!(state.active_profile.as_deref(), Some("lum"));
+        assert_eq!(state.backend, None);
         std::fs::remove_file(&path).unwrap();
     }
 }

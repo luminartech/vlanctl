@@ -1,12 +1,12 @@
-#[cfg(test)]
-use crate::config::Profile;
-use crate::config::{Interface, Route};
+use crate::config::{Interface, Profile, Route};
 use crate::net::{Cmd, CommandRunner};
 use anyhow::{Context, Result};
 use ipnet::IpNet;
 
 mod windows;
-pub use windows::{SWITCH_NAME as WINDOWS_SWITCH_NAME, Windows};
+mod windows_driver_vlan;
+pub use windows::{SWITCH_NAME as WINDOWS_SWITCH_NAME, WindowsHyperV};
+pub use windows_driver_vlan::WindowsDriverVlan;
 
 /// Per-operating-system command generation and host-state reading.
 ///
@@ -141,6 +141,19 @@ pub trait Platform {
     /// a platform that answers `true` and asks the caller to name it.
     fn claims_parent_exclusively(&self) -> bool {
         false
+    }
+
+    /// Whether this backend can apply `profile` at all, checked by
+    /// `commands::apply` before it touches anything — before it even tears
+    /// down the previously active profile, so a refusal changes nothing.
+    ///
+    /// `Ok` by default: `Profile::validate` already covers what is wrong
+    /// with a profile on its own terms. This is for a limit that belongs to
+    /// one backend, such as [`WindowsDriverVlan`] holding one VLAN per
+    /// adapter, and the message should say which backend would take the
+    /// profile instead.
+    fn validate_profile(&self, _profile: &Profile) -> Result<()> {
+        Ok(())
     }
 
     /// Names of every network device currently on the host, physical and
@@ -612,7 +625,7 @@ impl Platform for Linux {
 /// The platform this build targets, for a **real (mutating)** operation —
 /// `apply` or `down` without `--dry-run`.
 ///
-/// Returns [`MacOs`] on macOS, [`Linux`] on Linux and [`Windows`] on
+/// Returns [`MacOs`] on macOS, [`Linux`] on Linux and [`WindowsHyperV`] on
 /// Windows. Every other platform returns an `Err`: returning a
 /// silently-wrong platform to run mutating commands against a real network
 /// stack would be far worse than refusing. A caller that already has a
@@ -630,7 +643,7 @@ pub fn host_platform() -> Result<Box<dyn Platform>> {
     match std::env::consts::OS {
         "macos" => Ok(Box::new(MacOs)),
         "linux" => Ok(Box::new(Linux)),
-        "windows" => Ok(Box::new(Windows)),
+        "windows" => Ok(Box::new(WindowsHyperV)),
         os => Err(no_backend_error(os)),
     }
 }
@@ -646,7 +659,7 @@ fn no_backend_error(os: &str) -> anyhow::Error {
          for this OS.",
         MacOs.name(),
         Linux.name(),
-        Windows.name(),
+        WindowsHyperV.name(),
     )
 }
 
@@ -670,6 +683,57 @@ fn no_backend_error(os: &str) -> anyhow::Error {
 #[must_use]
 pub fn preview_platform() -> Box<dyn Platform> {
     host_platform().unwrap_or_else(|_| Box::new(MacOs))
+}
+
+/// The backend a profile of this shape gets on this host, for a real
+/// operation.
+///
+/// Where the host has one backend this is [`host_platform`]. Windows has
+/// two, and the profile decides: a single `[[interface]]` entry goes to
+/// [`WindowsDriverVlan`], which sets the adapter driver's own VLAN keyword
+/// and needs no virtual switch; more than one goes to [`WindowsHyperV`],
+/// the only way to hold several VLANs on one adapter at once. A caller
+/// that wants the other one constructs it explicitly.
+pub fn host_platform_for(profile: &Profile) -> Result<Box<dyn Platform>> {
+    match std::env::consts::OS {
+        "windows" => Ok(windows_platform_for(profile)),
+        _ => host_platform(),
+    }
+}
+
+/// [`preview_platform`]'s counterpart of [`host_platform_for`]: never
+/// fails, and on a host with a backend renders through the one an apply of
+/// this profile would use.
+#[must_use]
+pub fn preview_platform_for(profile: &Profile) -> Box<dyn Platform> {
+    host_platform_for(profile).unwrap_or_else(|_| Box::new(MacOs))
+}
+
+/// The Windows backend for a profile of this shape — see
+/// [`host_platform_for`]. Written as its own function, and free of any
+/// `cfg`, so the rule is tested on every host.
+#[must_use]
+pub fn windows_platform_for(profile: &Profile) -> Box<dyn Platform> {
+    if profile.interfaces.len() <= 1 {
+        Box::new(WindowsDriverVlan)
+    } else {
+        Box::new(WindowsHyperV)
+    }
+}
+
+/// The backend called `name` — the string [`Platform::name`] returns and the
+/// state file records — so that `down` runs through the backend that
+/// applied, whatever this host would pick for a fresh profile. `None` for a
+/// name no backend answers to.
+#[must_use]
+pub fn platform_named(name: &str) -> Option<Box<dyn Platform>> {
+    match name {
+        "macos" => Some(Box::new(MacOs)),
+        "linux" => Some(Box::new(Linux)),
+        "windows-hyperv" => Some(Box::new(WindowsHyperV)),
+        "windows-driver-vlan" => Some(Box::new(WindowsDriverVlan)),
+        _ => None,
+    }
 }
 
 /// Interface name this entry configures: `vlan<id>` for a tagged interface,
@@ -951,6 +1015,51 @@ mod tests {
         assert!(!preview_platform().name().is_empty());
     }
 
+    /// Every backend's `name()` must resolve back to that backend, since the
+    /// state file records the name and `down` runs through whatever it
+    /// resolves to. A backend whose name is not in the table would be
+    /// applied by one backend and torn down by the host's default.
+    #[test]
+    fn every_backend_name_resolves_back_to_itself() {
+        let backends: [Box<dyn Platform>; 4] = [
+            Box::new(MacOs),
+            Box::new(Linux),
+            Box::new(WindowsHyperV),
+            Box::new(WindowsDriverVlan),
+        ];
+        for backend in &backends {
+            let named = platform_named(backend.name())
+                .unwrap_or_else(|| panic!("{} is not in platform_named", backend.name()));
+            assert_eq!(named.name(), backend.name());
+        }
+        assert!(platform_named("freebsd").is_none());
+        assert!(platform_named("").is_none());
+    }
+
+    /// The Windows choice is by entry count: one entry fits in the adapter
+    /// driver's single VLAN keyword, more needs the switch.
+    #[test]
+    fn windows_backend_is_chosen_by_the_profiles_entry_count() {
+        let one: Profile =
+            toml::from_str("name=\"live\"\n[[interface]]\nvlan=11\naddress=\"192.168.11.87/24\"\n")
+                .unwrap();
+        let two: Profile = toml::from_str(
+            "name=\"iris\"\n[[interface]]\nvlan=10\naddress=\"192.168.10.90/24\"\n\
+             [[interface]]\nvlan=11\naddress=\"192.168.11.87/24\"\n",
+        )
+        .unwrap();
+        assert_eq!(windows_platform_for(&one).name(), "windows-driver-vlan");
+        assert_eq!(windows_platform_for(&two).name(), "windows-hyperv");
+        // Off Windows the profile changes nothing: both resolve to the
+        // host's one backend (or refuse together where there is none).
+        if std::env::consts::OS != "windows" {
+            assert_eq!(
+                host_platform_for(&one).map(|p| p.name()).ok(),
+                host_platform().map(|p| p.name()).ok()
+            );
+        }
+    }
+
     /// A preview must render the platform the apply would actually use.
     /// Previously this was pinned to `MacOs` on every host, so on Linux
     /// `apply --dry-run` printed `ifconfig vlan10 create …` while the real
@@ -975,8 +1084,8 @@ mod tests {
     #[cfg(target_os = "windows")]
     fn host_and_preview_platform_resolve_to_windows_on_windows() {
         let platform = host_platform().expect("Windows backend must be available on Windows");
-        assert_eq!(platform.name(), "windows");
-        assert_eq!(preview_platform().name(), "windows");
+        assert_eq!(platform.name(), "windows-hyperv");
+        assert_eq!(preview_platform().name(), "windows-hyperv");
     }
 
     /// The macOS regression net, replacing the four scratch baseline files

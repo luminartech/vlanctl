@@ -103,7 +103,7 @@ fn is_read_only_probe(cmd: &net::Cmd) -> bool {
         // Windows. A PowerShell command line cannot be told apart on argv
         // alone — the script is one argument — so the backend owns the
         // allowlist for its own probes, statement by statement.
-        "powershell.exe" => plan::Windows::is_read_only_probe(cmd),
+        "powershell.exe" => plan::WindowsHyperV::is_read_only_probe(cmd),
         _ => false,
     }
 }
@@ -177,6 +177,25 @@ fn require_root() -> Result<()> {
     bail!("vlanctl cannot check for elevation on this platform")
 }
 
+/// The backend `down` and `status` run through: the one the state file
+/// says applied the active profile, so an apply through one Windows backend
+/// is never torn down through the other. A state file with no backend
+/// recorded predates the field and can only have come from the host's
+/// default backend, which is the fallback — the preview flavour for a dry
+/// run or `status`, which must keep working on a host with no backend.
+#[cfg(feature = "cli")]
+fn platform_for_state(
+    state_path: &std::path::Path,
+    preview: bool,
+) -> Result<Box<dyn plan::Platform>> {
+    let state = State::load(state_path)?;
+    match state.backend.as_deref().and_then(plan::platform_named) {
+        Some(platform) => Ok(platform),
+        None if preview => Ok(plan::preview_platform()),
+        None => plan::host_platform(),
+    }
+}
+
 #[cfg(not(feature = "cli"))]
 fn main() {
     eprintln!("vlanctl was built without the `cli` feature");
@@ -201,17 +220,20 @@ fn main() -> Result<()> {
             let mut probe = SystemRunner;
             // Resolved through the SAME reference platform the preview renders
             // with, so the device it picks and the commands it prints agree.
+            // Chosen for this profile: on Windows its shape decides between
+            // the two backends there.
+            let platform = plan::preview_platform_for(&p);
             let device = device::resolve_device(
-                &*plan::preview_platform(),
+                &*platform,
                 &mut probe,
                 device.as_deref().or(p.device.as_deref()),
             )?;
-            // A preview renders through the fixed reference platform, not
-            // `host_platform()`: like `apply --dry-run`/`down --dry-run`
+            // A preview renders through the reference platform, not
+            // `host_platform_for()`: like `apply --dry-run`/`down --dry-run`
             // below, it touches no real system and must keep working on any
             // host, so it must not fail just because this build has no real
             // backend for the host OS.
-            for line in commands::show_plan(&*plan::preview_platform(), &p, &device) {
+            for line in commands::show_plan(&*platform, &p, &device) {
                 println!("{line}");
             }
         }
@@ -238,7 +260,7 @@ fn main() -> Result<()> {
                 };
                 commands::apply(
                     &mut runner,
-                    &*plan::preview_platform(),
+                    &*plan::preview_platform_for(&p),
                     &p,
                     device.as_deref(),
                     &state_path,
@@ -247,7 +269,7 @@ fn main() -> Result<()> {
                 print_planned_commands(&runner.recorded);
             } else {
                 require_root()?;
-                let platform = plan::host_platform()?;
+                let platform = plan::host_platform_for(&p)?;
                 let mut runner = SystemRunner;
                 let created = commands::apply(
                     &mut runner,
@@ -263,18 +285,21 @@ fn main() -> Result<()> {
         Command::Down { dry_run } => {
             if dry_run {
                 // See the matching comment in `Command::Apply`: dry runs must
-                // keep working on any host, so they render through
-                // `plan::preview_platform()`, never the fallible
-                // `host_platform()`.
+                // keep working on any host, so a state file naming no
+                // backend falls back to `plan::preview_platform()`, never
+                // the fallible `host_platform()`.
                 let mut runner = PreviewRunner {
                     probe: SystemRunner,
                     recorded: Vec::new(),
                 };
-                commands::down(&mut runner, &*plan::preview_platform(), &state_path, true)?;
+                let platform = platform_for_state(&state_path, true)?;
+                commands::down(&mut runner, &*platform, &state_path, true)?;
                 print_planned_commands(&runner.recorded);
             } else {
                 require_root()?;
-                let platform = plan::host_platform()?;
+                // Through the backend that applied, not the one this host
+                // would pick for a fresh profile.
+                let platform = platform_for_state(&state_path, false)?;
                 let mut runner = SystemRunner;
                 commands::down(&mut runner, &*platform, &state_path, false)?;
                 println!("torn down");
@@ -282,9 +307,10 @@ fn main() -> Result<()> {
         }
         Command::Status => {
             let mut runner = SystemRunner;
+            let platform = platform_for_state(&state_path, true)?;
             print!(
                 "{}",
-                commands::status(&mut runner, &*plan::preview_platform(), &state_path)?
+                commands::status(&mut runner, &*platform, &state_path)?
             );
         }
     }
@@ -405,11 +431,11 @@ mod tests {
         };
         let mut mutations = mutations.to_vec();
         mutations.extend(plan::bringup_commands_for(
-            &plan::Windows,
+            &plan::WindowsHyperV,
             &tagged,
             "Ethernet 2",
         ));
-        mutations.extend(plan::Windows.teardown_commands("vEthernet (vlan11)"));
+        mutations.extend(plan::WindowsHyperV.teardown_commands("vEthernet (vlan11)"));
         for cmd in &mutations {
             assert!(
                 !is_read_only_probe(cmd),
@@ -442,10 +468,10 @@ mod tests {
         let mut windows_probes = Vec::new();
         {
             let mut runner = net::RecordingRunner::default();
-            let _ = plan::Windows.list_devices(&mut runner);
-            let _ = plan::Windows.addresses_on(&mut runner, "vEthernet (vlan11)");
-            let _ = plan::Windows.is_wireless(&mut runner, "Ethernet 2");
-            let _ = plan::Windows.link_is_active(&mut runner, "Ethernet 2");
+            let _ = plan::WindowsHyperV.list_devices(&mut runner);
+            let _ = plan::WindowsHyperV.addresses_on(&mut runner, "vEthernet (vlan11)");
+            let _ = plan::WindowsHyperV.is_wireless(&mut runner, "Ethernet 2");
+            let _ = plan::WindowsHyperV.link_is_active(&mut runner, "Ethernet 2");
             windows_probes.extend(runner.commands);
         }
         assert_eq!(
