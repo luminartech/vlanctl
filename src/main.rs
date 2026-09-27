@@ -202,10 +202,63 @@ fn main() {
     std::process::exit(2);
 }
 
+/// What `--report` writes. One shape for every command: `created` is
+/// empty for anything but a successful `apply`.
+#[cfg(feature = "cli")]
+#[derive(serde::Serialize)]
+struct Report<'a> {
+    command: &'a str,
+    ok: bool,
+    message: String,
+    created: &'a [String],
+}
+
+/// Write the report `--report` asked for. A failure to write it is its own
+/// error only when the command itself succeeded: a reader that finds no
+/// file already treats that as "vlanctl did not get as far as running",
+/// and a write failure must not hide the command's own error.
+#[cfg(feature = "cli")]
+fn write_report(path: &std::path::Path, command: &str, result: &Result<Vec<String>>) {
+    let (ok, message, created): (bool, String, &[String]) = match result {
+        Ok(created) => (true, String::new(), created),
+        Err(e) => (false, format!("{e:#}"), &[]),
+    };
+    let report = Report {
+        command,
+        ok,
+        message,
+        created,
+    };
+    let write = serde_json::to_string_pretty(&report)
+        .map_err(anyhow::Error::from)
+        .and_then(|text| std::fs::write(path, text).map_err(anyhow::Error::from));
+    if let Err(e) = write {
+        eprintln!(
+            "vlanctl: could not write --report {}: {e:#}",
+            path.display()
+        );
+    }
+}
+
 #[cfg(feature = "cli")]
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    let report_path = cli.report.clone();
+    let command = cli.command.name();
+    let result = run(cli);
+    if let Some(path) = &report_path {
+        write_report(path, command, &result);
+    }
+    result.map(|_| ())
+}
+
+/// Run the parsed command. Returns the interfaces a successful `apply`
+/// created, and nothing for every other command, which is what the report
+/// carries.
+#[cfg(feature = "cli")]
+fn run(cli: Cli) -> Result<Vec<String>> {
     let state_path = State::default_path();
+    let mut created_interfaces = Vec::new();
 
     match cli.command {
         Command::List => {
@@ -280,6 +333,7 @@ fn main() -> Result<()> {
                     false,
                 )?;
                 println!("applied '{}': {}", p.name, created.join(", "));
+                created_interfaces = created;
             }
         }
         Command::Down { dry_run } => {
@@ -314,7 +368,7 @@ fn main() -> Result<()> {
             );
         }
     }
-    Ok(())
+    Ok(created_interfaces)
 }
 
 #[cfg(all(test, feature = "cli"))]
