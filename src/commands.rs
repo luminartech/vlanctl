@@ -82,11 +82,23 @@ pub fn apply<R: CommandRunner>(
     // leave standing.
     platform.validate_profile(profile)?;
 
-    // Tear down whatever is currently active. The local `state` is rewritten
-    // wholesale below, so there is no need to reload it after `down`.
+    // Tear down whatever is currently active — through the backend that
+    // applied it, which the state file names, not through the one applying
+    // now. On Windows those can differ (a switch-backed profile giving way
+    // to a driver-keyword one, or the reverse), and the other backend's
+    // teardown would not undo what this one built. A state file naming no
+    // backend predates the field and can only have come from the host's
+    // default, which `platform` is off Windows. The local `state` is
+    // rewritten wholesale below, so there is no need to reload it after
+    // `down`.
     let mut state = State::load(state_path)?;
     if state.active_profile.is_some() {
-        down(runner, platform, state_path, dry_run)?;
+        let previous = state
+            .backend
+            .as_deref()
+            .and_then(crate::plan::platform_named);
+        let teardown_platform: &dyn Platform = previous.as_deref().unwrap_or(platform);
+        down(runner, teardown_platform, state_path, dry_run)?;
     }
 
     // The CLI override wins over the profile's own field: a committed
@@ -912,6 +924,46 @@ mod tests {
             "{rendered:?}"
         );
         assert_eq!(State::load(&state_path).unwrap(), State::default());
+        let _ = std::fs::remove_file(&state_path);
+    }
+
+    #[test]
+    fn apply_tears_the_previous_profile_down_through_the_backend_that_applied_it() {
+        // A switch-backed profile is active; a driver-keyword profile is
+        // applied over it. The switch must come down through the Hyper-V
+        // backend — the driver backend's teardown would set a VLAN keyword
+        // on a virtual adapter and leave the switch bound.
+        let state_path = std::env::temp_dir().join("vlanctl-cross-backend-teardown.json");
+        State {
+            active_profile: Some("iris".to_string()),
+            interfaces: vec!["vEthernet (vlan11)".to_string()],
+            backend: Some("windows-hyperv".to_string()),
+        }
+        .save(&state_path)
+        .unwrap();
+        let live: Profile = toml::from_str(
+            "name=\"live\"\ndevice=\"Ethernet 2\"\n\
+             [[interface]]\nvlan=11\naddress=\"192.168.11.87/24\"\n",
+        )
+        .unwrap();
+        let mut r = windows_runner(&["Ethernet 2", "vEthernet (vlan11)"]);
+        apply(&mut r, &WindowsDriverVlan, &live, None, &state_path, false).unwrap();
+        let rendered: Vec<String> = r.commands.iter().map(|c| c.display()).collect();
+        assert!(
+            rendered
+                .iter()
+                .any(|c| c.contains("Remove-VMNetworkAdapter -ManagementOS -Name 'vlan11'")),
+            "the switch's adapter must be removed through the Hyper-V backend: {rendered:?}"
+        );
+        assert!(
+            !rendered
+                .iter()
+                .any(|c| c.contains("set address vEthernet (vlan11) dhcp")),
+            "the driver backend's teardown must not touch the virtual adapter: {rendered:?}"
+        );
+        let state = State::load(&state_path).unwrap();
+        assert_eq!(state.backend.as_deref(), Some("windows-driver-vlan"));
+        assert_eq!(state.interfaces, vec!["Ethernet 2"]);
         let _ = std::fs::remove_file(&state_path);
     }
 
