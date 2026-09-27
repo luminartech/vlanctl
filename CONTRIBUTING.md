@@ -12,8 +12,9 @@ The minimum supported Rust version is **1.88.0**, declared as `rust-version` in
 `Cargo.toml`. That floor is real rather than conservative — `src/plan.rs` uses
 let-chain expressions, which 1.85 and 1.87 reject with E0658.
 
-`default = ["cli"]`, which pulls in `clap` and `libc` for argument parsing and
-the root check. The library builds without them:
+`default = ["cli"]`, which pulls in `clap` for argument parsing and, for the
+elevation check, `libc` on Unix or `windows-sys` on Windows. The library builds
+without them:
 
 ```sh
 cargo test                        # default: the CLI and the library
@@ -26,8 +27,9 @@ cargo fmt --check
 
 `Platform` in `src/plan.rs` is the seam between planning a change and naming
 the commands that carry it out. `MacOs` renders `ifconfig`/`route`, `Linux`
-renders `ip`, and `host_platform()` picks one from the running host —
-returning an error, not a default, on a host with no backend.
+renders `ip`, `Windows` (in `src/plan/windows.rs`) renders Hyper-V cmdlets
+through `powershell.exe` plus `netsh`, and `host_platform()` picks one from the
+running host — returning an error, not a default, on a host with no backend.
 
 Two rules keep that seam honest, and both have tests that will tell you when
 you break them:
@@ -37,13 +39,23 @@ you break them:
   `ip` commands. It was once pinned to `MacOs`, which made previews disagree
   with the applies they previewed.
 - **Tests render through an explicit platform, never the host's.** The
-  regression tests construct `&MacOs` or `&Linux` directly, so they assert the
-  same thing on every developer's machine and in CI. A test that depends on
-  where it runs proves nothing.
+  regression tests construct `&MacOs`, `&Linux` or `&Windows` directly, so they
+  assert the same thing on every developer's machine and in CI. A test that
+  depends on where it runs proves nothing.
 
 Commands are built as argv — program plus arguments — and never as a shell
 string. `Cmd::display()` renders a shell-*like* string, but only for `show` and
 `--dry-run` output. Keep it that way; see [`SECURITY.md`](SECURITY.md).
+
+The Windows backend is the one place a command carries a script: a PowerShell
+command line is one argv element, `-Command <script>`, because Hyper-V has no
+executable to call. Two rules keep that inside the argv boundary. Every value
+that enters a script goes through `ps_literal`, which renders a single-quoted
+PowerShell literal — the one context in PowerShell where nothing is
+interpolated and the only special character is `'`. And the dry-run allowlist
+for those commands lives with the backend (`Windows::is_read_only_probe`),
+statement by statement, because `argv` alone cannot tell a probe from a
+mutation there.
 
 ## Profiles
 

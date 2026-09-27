@@ -22,8 +22,9 @@ maintained release branches.
 ## Scope
 
 `vlanctl` configures host network interfaces. `apply` and `down` refuse to run
-unelevated and, when run under `sudo`, execute `ifconfig`/`route` on macOS or
-`ip` on Linux. Three properties follow from what the tool is, and are the
+unelevated and, when run under `sudo` or from an elevated Windows shell,
+execute `ifconfig`/`route` on macOS, `ip` on Linux, or Hyper-V cmdlets and
+`netsh` on Windows. Three properties follow from what the tool is, and are the
 design rather than defects:
 
 - **It is privileged by design.** Creating VLAN interfaces, assigning
@@ -45,16 +46,20 @@ What is in scope:
   argv-style — `Command::new(&cmd.program).args(&cmd.args)` in `src/net.rs` —
   never through a shell, so profile fields cannot inject shell syntax. A
   profile value that escapes its argument slot, introduces an additional
-  argument, or reaches a shell is a real vulnerability.
+  argument, or reaches a shell is a real vulnerability. On Windows the
+  Hyper-V cmdlets are reached through `powershell.exe -Command <script>`,
+  the script being one argument; every value in it is a single-quoted
+  PowerShell literal (`ps_literal` in `src/plan/windows.rs`), and a value that
+  ends that literal or adds a statement is the same vulnerability.
 - **Validation that admits what it should reject.** `Profile::validate` in
   `src/config.rs` enforces that a route's `gateway` and `mac` are mutually
   exclusive, that a `mac` appears only on a single-host `/32`, and that it
   parses as a MAC. A bypass belongs here.
 - **Anything that lets an unprivileged user steer a privileged run.** vlanctl
   records what it created in a state file at
-  `/usr/local/var/vlanctl/state.json`, which `down` later reads to decide what
-  to tear down. A path by which a non-root user influences that teardown is in
-  scope.
+  `/usr/local/var/vlanctl/state.json` (`%ProgramData%\vlanctl\state.json` on
+  Windows), which `down` later reads to decide what to tear down. A path by
+  which a non-root user influences that teardown is in scope.
 - **Panics or hangs on a malformed profile**, notwithstanding that profiles are
   trusted input — the parser should fail cleanly.
 
