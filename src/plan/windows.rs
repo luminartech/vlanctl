@@ -480,6 +480,12 @@ fn create_script(interface: &Interface, device: &str) -> String {
          New-VMSwitch -Name {switch} -NetAdapterName {device} -AllowManagementOS $false | Out-Null; \
          $created = $true }}; \
          try {{ \
+         $swType = (Get-VMSwitch -Name {switch}).SwitchType; \
+         if ($swType -ne 'External') {{ \
+         throw 'switch ' + {switch} + ' is ' + $swType + ', not External — ' + \
+         {device} + ' was not bound (Hyper-V accepted the request without ' + \
+         'erroring, which happens when the adapter cannot be claimed as an ' + \
+         'external uplink right now)' }}; \
          Add-VMNetworkAdapter -ManagementOS -SwitchName {switch} -Name {vnic} | Out-Null; \
          Set-VMNetworkAdapterVlan -ManagementOS -VMNetworkAdapterName {vnic} {vlan_mode}; \
          $tries = 0; \
@@ -612,6 +618,12 @@ mod tests {
              New-VMSwitch -Name 'vlanctl' -NetAdapterName 'Ethernet 2' -AllowManagementOS $false | Out-Null; \
              $created = $true }; \
              try { \
+             $swType = (Get-VMSwitch -Name 'vlanctl').SwitchType; \
+             if ($swType -ne 'External') { \
+             throw 'switch ' + 'vlanctl' + ' is ' + $swType + ', not External — ' + \
+             'Ethernet 2' + ' was not bound (Hyper-V accepted the request without ' + \
+             'erroring, which happens when the adapter cannot be claimed as an ' + \
+             'external uplink right now)' }; \
              Add-VMNetworkAdapter -ManagementOS -SwitchName 'vlanctl' -Name 'vlan11' | Out-Null; \
              Set-VMNetworkAdapterVlan -ManagementOS -VMNetworkAdapterName 'vlan11' -Access -VlanId 11; \
              $tries = 0; \
@@ -622,6 +634,42 @@ mod tests {
              Remove-VMNetworkAdapter -ManagementOS -Name 'vlan11' -ErrorAction SilentlyContinue; \
              if ($created) { Remove-VMSwitch -Name 'vlanctl' -Force -ErrorAction SilentlyContinue }; \
              throw }"
+        );
+    }
+
+    /// Bench-measured 2026-09-28: `New-VMSwitch` can accept a request it
+    /// cannot actually fulfil — no terminating error, just an `Internal`
+    /// switch with no adapter bound — when the requested adapter cannot be
+    /// claimed as an external uplink right now (observed after manually
+    /// toggling the adapter's Hyper-V extensibility binding outside this
+    /// backend's own create/teardown lifecycle). Every vNIC added to that
+    /// switch then reports created successfully and shows `Disconnected`
+    /// forever, and the apply as a whole reports `ok: true`. This pins that
+    /// the create script itself catches that shape and never reports
+    /// success over it: the `SwitchType` check runs before
+    /// `Add-VMNetworkAdapter`, inside the same `try` the adapter-wait
+    /// timeout uses, so both failure shapes roll back through the same
+    /// path.
+    #[test]
+    fn the_create_script_checks_switch_type_before_adding_the_vnic() {
+        let script = create_script(&tagged(11, "192.168.11.87/24"), "Ethernet 2");
+        let switch_check_pos = script
+            .find("$swType = (Get-VMSwitch -Name 'vlanctl')")
+            .unwrap();
+        let add_vnic_pos = script.find("Add-VMNetworkAdapter").unwrap();
+        assert!(
+            switch_check_pos < add_vnic_pos,
+            "the SwitchType check must run before a vNIC is ever added to the switch"
+        );
+        let try_pos = script.find("try {").unwrap();
+        let catch_pos = script.find("} catch {").unwrap();
+        assert!(
+            try_pos < switch_check_pos && switch_check_pos < catch_pos,
+            "the check must be inside the try block so a throw reaches the rollback catch"
+        );
+        assert!(
+            script.contains("not External"),
+            "the failure must name what went wrong, not just that something did: {script}"
         );
     }
 
