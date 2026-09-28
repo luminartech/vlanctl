@@ -1,9 +1,37 @@
 use anyhow::{Context, Result};
+use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
+use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 
 #[cfg(not(windows))]
 const STATE_PATH: &str = "/usr/local/var/vlanctl/state.json";
+
+/// The parent device's own IPv4 configuration as it stood before an apply
+/// took the device over, recorded so `down` can put it back.
+///
+/// Only a backend whose apply *destroys* the parent's configuration records
+/// one. On macOS and Linux a VLAN sub-interface sits beside the parent's own
+/// addressing and nothing is lost, so the state file carries `None`. The
+/// Hyper-V backend binds the parent to an external switch, and Windows
+/// clears the parent's addresses when it does — measured 2026-09-28: a
+/// parent with a static `192.168.11.87/24` came back from `Remove-VMSwitch`
+/// still marked static but holding no address at all, so it sat on an APIPA
+/// address and nothing on the host could reach the sensor's subnet again.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ParentConfig {
+    /// The parent device, in the platform's own naming (`Ethernet 2`).
+    pub device: String,
+    /// Whether the device obtained its address by DHCP. A DHCP device is
+    /// put back on DHCP; a static one gets its addresses back.
+    pub dhcp: bool,
+    /// The statically configured IPv4 addresses, with prefix length. Empty
+    /// for a DHCP device (its lease is not something to restore by hand)
+    /// and for a static device that had none.
+    pub addresses: Vec<IpNet>,
+    /// The default gateway on the device, if it had one.
+    pub gateway: Option<Ipv4Addr>,
+}
 
 /// Persistent record of what vlanctl has brought up.
 #[derive(Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -19,6 +47,13 @@ pub struct State {
     /// backend such a file can have come from.
     #[serde(default)]
     pub backend: Option<String>,
+    /// What the parent device carried before the active profile was applied,
+    /// for the backends whose apply destroys it
+    /// ([`Platform::parent_snapshot`](crate::plan::Platform::parent_snapshot)).
+    /// `None` when nothing needs putting back, and in a state file written
+    /// before this field existed.
+    #[serde(default)]
+    pub parent: Option<ParentConfig>,
 }
 
 impl State {
@@ -87,6 +122,7 @@ mod tests {
             active_profile: Some("example_bench".to_string()),
             interfaces: vec!["vlan0".to_string(), "vlan1".to_string()],
             backend: Some("macos".to_string()),
+            parent: None,
         };
         state.save(&path).unwrap();
         assert_eq!(State::load(&path).unwrap(), state);

@@ -73,8 +73,10 @@
 use super::{Platform, ipv4_netmask};
 use crate::config::{Interface, Route};
 use crate::net::{Cmd, CommandRunner};
+use crate::state::ParentConfig;
 use anyhow::{Context, Result};
 use ipnet::IpNet;
+use std::net::{IpAddr, Ipv4Addr};
 
 /// Name of the Hyper-V external switch this backend creates on the parent
 /// device. One per host: a physical adapter binds to at most one external
@@ -101,6 +103,13 @@ const SCRIPT_PREFIX: &str = "$ErrorActionPreference = 'Stop'; ";
 /// appears within a second or two; the bound is for a Hyper-V that never
 /// finishes.
 const ADAPTER_WAIT_POLLS: u32 = 40;
+
+/// How long the parent-restore script waits for the parent to be back in
+/// the IP stack after the switch is removed: 40 polls of 500 ms, the same
+/// bound as [`ADAPTER_WAIT_POLLS`]. `Remove-VMSwitch` returns before
+/// Windows has rebound TCP/IP to the parent, and `netsh` cannot set an
+/// address on an adapter the stack does not list yet.
+const PARENT_RETURN_POLLS: u32 = 40;
 
 /// Windows, through Hyper-V. See the module documentation for the model.
 pub struct WindowsHyperV;
@@ -134,6 +143,10 @@ impl WindowsHyperV {
                     || statement.starts_with("$a = Get-NetAdapter | Where-Object")
                     || statement.starts_with("if (-not $a) { throw")
                     || statement.starts_with("$a.")
+                    // The parent-config probe ([`parent_config_probe`]).
+                    || statement.starts_with("$i = Get-NetIPInterface -InterfaceAlias")
+                    || statement.starts_with("if ($i) { 'dhcp ' + $i.Dhcp }")
+                    || statement.starts_with("Get-NetRoute -InterfaceAlias")
                     || statement == "exit 0"
             })
     }
@@ -363,6 +376,158 @@ impl Platform for WindowsHyperV {
             && powershell_script(cmd)
                 .is_some_and(|s| s.contains("Add-VMNetworkAdapter -ManagementOS"))
     }
+
+    fn parent_snapshot(
+        &self,
+        runner: &mut dyn CommandRunner,
+        device: &str,
+    ) -> Result<Option<ParentConfig>> {
+        // Binding the parent to the switch clears its addresses, and
+        // removing the switch does not bring them back (measured
+        // 2026-09-28: a static `192.168.11.87/24` came back from
+        // `Remove-VMSwitch` as "static, no address", i.e. APIPA). Read
+        // what is there now, before `New-VMSwitch` runs, so `down` can put
+        // it back.
+        let out = runner
+            .run(&parent_config_probe(device))
+            .with_context(|| format!("cannot read the IPv4 configuration of {device}"))?;
+        Ok(parse_parent_config(device, &out))
+    }
+
+    fn parent_restore_commands(&self, parent: &ParentConfig) -> Vec<Cmd> {
+        restore_parent_commands(parent)
+    }
+}
+
+/// The probe [`WindowsHyperV::parent_snapshot`] runs: one line per fact,
+/// each tagged with what it is so the parse cannot mistake one for another.
+///
+/// - `dhcp Enabled|Disabled` from the IPv4 interface object. Its absence
+///   means the adapter has no IPv4 stack at all — it is already bound to a
+///   switch, or TCP/IP is unbound — and there is nothing to record.
+/// - `address <ip>/<prefix>` for each manually configured address. A DHCP
+///   lease or an APIPA address (`PrefixOrigin` `Dhcp` / `WellKnown`) is not
+///   configuration and is not restored.
+/// - `gateway <ip>` for the default route on the adapter, if any.
+///
+/// The trailing `exit 0` is for the same reason as in
+/// [`WindowsHyperV::addresses_on`]: a missing alias leaves the last
+/// statement's `$?` false, and `-Command` would exit 1 over it.
+fn parent_config_probe(device: &str) -> Cmd {
+    let dev = ps_literal(device);
+    powershell(&format!(
+        "$i = Get-NetIPInterface -InterfaceAlias {dev} -AddressFamily IPv4 \
+         -ErrorAction SilentlyContinue; \
+         if ($i) {{ 'dhcp ' + $i.Dhcp }}; \
+         Get-NetIPAddress -InterfaceAlias {dev} -AddressFamily IPv4 -ErrorAction SilentlyContinue \
+         | Where-Object {{ $_.PrefixOrigin -eq 'Manual' }} \
+         | ForEach-Object {{ 'address ' + $_.IPAddress + '/' + $_.PrefixLength }}; \
+         Get-NetRoute -InterfaceAlias {dev} -DestinationPrefix '0.0.0.0/0' -AddressFamily IPv4 \
+         -ErrorAction SilentlyContinue | ForEach-Object {{ 'gateway ' + $_.NextHop }}; \
+         exit 0"
+    ))
+}
+
+/// Parse [`parent_config_probe`]'s output. `None` when the probe reported
+/// no IPv4 interface, which is the "nothing to put back" answer.
+fn parse_parent_config(device: &str, out: &str) -> Option<ParentConfig> {
+    let mut dhcp = None;
+    let mut addresses = Vec::new();
+    let mut gateway = None;
+    for line in out.lines().map(str::trim) {
+        if let Some(v) = line.strip_prefix("dhcp ") {
+            dhcp = Some(v.trim().eq_ignore_ascii_case("Enabled"));
+        } else if let Some(v) = line.strip_prefix("address ") {
+            if let Ok(net) = v.trim().parse::<IpNet>()
+                && matches!(net, IpNet::V4(_))
+            {
+                addresses.push(net);
+            }
+        } else if let Some(v) = line.strip_prefix("gateway ")
+            && let Ok(ip) = v.trim().parse::<Ipv4Addr>()
+            && !ip.is_unspecified()
+        {
+            gateway = Some(ip);
+        }
+    }
+    Some(ParentConfig {
+        device: device.to_string(),
+        dhcp: dhcp?,
+        addresses,
+        gateway,
+    })
+}
+
+/// The commands that put a recorded parent configuration back, after the
+/// switch that took the parent over is gone.
+///
+/// First a wait for the parent to be listed by the IP stack again —
+/// `Remove-VMSwitch` returns before TCP/IP is rebound — then `netsh`, in
+/// the same positional form bring-up uses: `set address ... dhcp` for a
+/// DHCP device, `set address ... static <ip> <mask> [gateway]` for the
+/// first static address and `add address` for any further one. A static
+/// device that held no address has nothing to put back and gets no
+/// commands at all, not even the wait.
+fn restore_parent_commands(parent: &ParentConfig) -> Vec<Cmd> {
+    let statics: Vec<(String, String)> = parent
+        .addresses
+        .iter()
+        .filter_map(|net| match net.addr() {
+            IpAddr::V4(addr) => Some((addr.to_string(), ipv4_netmask(net.prefix_len()))),
+            IpAddr::V6(_) => None,
+        })
+        .collect();
+    if !parent.dhcp && statics.is_empty() {
+        return Vec::new();
+    }
+    let dev = parent.device.as_str();
+    let mut cmds = vec![powershell(&parent_return_script(dev))];
+    if parent.dhcp {
+        cmds.push(Cmd::new(
+            "netsh",
+            &["interface", "ipv4", "set", "address", dev, "dhcp"],
+        ));
+    }
+    for (index, (addr, mask)) in statics.iter().enumerate() {
+        if index == 0 && !parent.dhcp {
+            let mut args = vec![
+                "interface",
+                "ipv4",
+                "set",
+                "address",
+                dev,
+                "static",
+                addr,
+                mask,
+            ];
+            let gateway = parent.gateway.map(|g| g.to_string());
+            if let Some(gateway) = gateway.as_deref() {
+                args.push(gateway);
+            }
+            cmds.push(Cmd::new("netsh", &args));
+        } else {
+            cmds.push(Cmd::new(
+                "netsh",
+                &["interface", "ipv4", "add", "address", dev, addr, mask],
+            ));
+        }
+    }
+    cmds
+}
+
+/// The script that waits for `device` to be back in the IPv4 stack after
+/// the switch released it, so the `netsh` that follows has something to
+/// configure. The throw names the adapter so a stuck rebind is legible.
+fn parent_return_script(device: &str) -> String {
+    let dev = ps_literal(device);
+    format!(
+        "$tries = 0; \
+         while (-not (Get-NetIPInterface -InterfaceAlias {dev} -AddressFamily IPv4 \
+         -ErrorAction SilentlyContinue)) {{ \
+         if (++$tries -gt {PARENT_RETURN_POLLS}) {{ \
+         throw 'adapter ' + {dev} + ' did not return to the IP stack after the switch was removed' }}; \
+         Start-Sleep -Milliseconds 500 }}"
+    )
 }
 
 /// Hyper-V's name for the virtual adapter of one entry.
@@ -501,11 +666,23 @@ fn create_script(interface: &Interface, device: &str) -> String {
 
 /// The script that removes one virtual adapter, and the switch when that
 /// was its last one.
+///
+/// The adapter's persistent routes go first, explicitly. Removing the
+/// adapter drops them from the active table, but `netsh ... add route`
+/// also wrote them to the persistent store, and a persistent route whose
+/// adapter is gone has been seen to linger there and surface against the
+/// parent's own interface index after the switch released it (bench,
+/// 2026-09-28: the profile's `/32` routes still listed after a full
+/// revert). Both cmdlets run with `SilentlyContinue` because an adapter
+/// with no routes is the ordinary case, not a failure.
 fn teardown_script(vnic: &str) -> String {
+    let alias = ps_literal(&adapter_alias(vnic));
     let vnic = ps_literal(vnic);
     let switch = ps_literal(SWITCH_NAME);
     format!(
         "if (Get-VMNetworkAdapter -ManagementOS -Name {vnic} -ErrorAction SilentlyContinue) {{ \
+         Get-NetRoute -InterfaceAlias {alias} -PolicyStore PersistentStore -ErrorAction SilentlyContinue \
+         | Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue; \
          Remove-VMNetworkAdapter -ManagementOS -Name {vnic} }}; \
          if ((Get-VMSwitch -Name {switch} -ErrorAction SilentlyContinue) -and \
          -not (Get-VMNetworkAdapter -ManagementOS -SwitchName {switch} -ErrorAction SilentlyContinue)) {{ \
@@ -731,11 +908,133 @@ mod tests {
             script,
             "$ErrorActionPreference = 'Stop'; \
              if (Get-VMNetworkAdapter -ManagementOS -Name 'vlan11' -ErrorAction SilentlyContinue) { \
+             Get-NetRoute -InterfaceAlias 'vEthernet (vlan11)' -PolicyStore PersistentStore -ErrorAction SilentlyContinue \
+             | Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue; \
              Remove-VMNetworkAdapter -ManagementOS -Name 'vlan11' }; \
              if ((Get-VMSwitch -Name 'vlanctl' -ErrorAction SilentlyContinue) -and \
              -not (Get-VMNetworkAdapter -ManagementOS -SwitchName 'vlanctl' -ErrorAction SilentlyContinue)) { \
              Remove-VMSwitch -Name 'vlanctl' -Force }"
         );
+    }
+
+    // ── the parent's own configuration ──────────────────────────────────
+
+    /// Bench, 2026-09-28: after Apply → Revert the parent adapter was back
+    /// on its own stack, still marked static, and holding no address —
+    /// `New-VMSwitch` had cleared the static `192.168.11.87/24` and
+    /// `Remove-VMSwitch` did not restore it. The host sat on APIPA and
+    /// nothing could reach the sensor's subnet until an operator re-entered
+    /// the address by hand. These pin the record-and-restore round trip.
+    #[test]
+    fn the_parent_probe_is_read_only_and_parses_a_static_configuration() {
+        let probe = parent_config_probe("Ethernet 2");
+        assert!(
+            WindowsHyperV::is_read_only_probe(&probe),
+            "{}",
+            probe.display()
+        );
+        let script = powershell_script(&probe).unwrap();
+        assert!(script.contains("Get-NetIPInterface -InterfaceAlias 'Ethernet 2'"));
+        assert!(script.contains("$_.PrefixOrigin -eq 'Manual'"));
+        assert!(script.ends_with("exit 0"));
+
+        let parsed = parse_parent_config(
+            "Ethernet 2",
+            "dhcp Disabled\r\naddress 192.168.11.87/24\r\naddress 192.168.10.90/24\r\n\
+             gateway 192.168.11.1\r\n",
+        )
+        .unwrap();
+        assert_eq!(parsed.device, "Ethernet 2");
+        assert!(!parsed.dhcp);
+        assert_eq!(
+            parsed.addresses,
+            vec![
+                "192.168.11.87/24".parse::<IpNet>().unwrap(),
+                "192.168.10.90/24".parse::<IpNet>().unwrap()
+            ]
+        );
+        assert_eq!(parsed.gateway, Some("192.168.11.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn the_parent_probe_parses_dhcp_and_nothing_at_all() {
+        // DHCP: recorded as such, with the lease deliberately not captured.
+        let dhcp = parse_parent_config("Ethernet 2", "dhcp Enabled\n").unwrap();
+        assert!(dhcp.dhcp);
+        assert!(dhcp.addresses.is_empty());
+        assert_eq!(dhcp.gateway, None);
+        // No IPv4 interface at all (already bound to a switch): nothing to
+        // put back, so nothing is recorded.
+        assert_eq!(parse_parent_config("Ethernet 2", ""), None);
+        assert_eq!(
+            parse_parent_config("Ethernet 2", "address 10.0.0.1/8\n"),
+            None
+        );
+        // A zero next hop is "no gateway", and an IPv6 address is not ours.
+        let odd = parse_parent_config(
+            "Ethernet 2",
+            "dhcp Disabled\naddress fe80::1/64\ngateway 0.0.0.0\n",
+        )
+        .unwrap();
+        assert!(odd.addresses.is_empty());
+        assert_eq!(odd.gateway, None);
+    }
+
+    #[test]
+    fn restoring_a_static_parent_waits_for_it_and_sets_every_address() {
+        let parent = ParentConfig {
+            device: "Ethernet 2".to_string(),
+            dhcp: false,
+            addresses: vec![
+                "192.168.11.87/24".parse().unwrap(),
+                "192.168.10.90/24".parse().unwrap(),
+            ],
+            gateway: Some("192.168.11.1".parse().unwrap()),
+        };
+        let cmds = WindowsHyperV.parent_restore_commands(&parent);
+        let wait = powershell_script(&cmds[0]).unwrap();
+        assert!(
+            wait.contains("Get-NetIPInterface -InterfaceAlias 'Ethernet 2'")
+                && wait.contains("did not return to the IP stack"),
+            "{wait}"
+        );
+        assert_eq!(
+            render(&cmds[1..]),
+            vec![
+                "netsh interface ipv4 set address Ethernet 2 static 192.168.11.87 255.255.255.0 \
+                 192.168.11.1",
+                "netsh interface ipv4 add address Ethernet 2 192.168.10.90 255.255.255.0",
+            ]
+        );
+        // None of the restore is a probe: a dry run must not run it.
+        for cmd in &cmds {
+            assert!(!WindowsHyperV::is_read_only_probe(cmd), "{}", cmd.display());
+        }
+    }
+
+    #[test]
+    fn restoring_a_dhcp_parent_puts_it_back_on_dhcp_and_a_bare_static_one_is_left_alone() {
+        let dhcp = ParentConfig {
+            device: "Ethernet 2".to_string(),
+            dhcp: true,
+            addresses: vec![],
+            gateway: None,
+        };
+        let cmds = WindowsHyperV.parent_restore_commands(&dhcp);
+        assert_eq!(cmds.len(), 2);
+        assert_eq!(
+            cmds[1].display(),
+            "netsh interface ipv4 set address Ethernet 2 dhcp"
+        );
+        // Static with no address is what the bench found *after* the bug;
+        // recording it must not make `down` invent a configuration.
+        let bare = ParentConfig {
+            device: "Ethernet 2".to_string(),
+            dhcp: false,
+            addresses: vec![],
+            gateway: None,
+        };
+        assert!(WindowsHyperV.parent_restore_commands(&bare).is_empty());
     }
 
     #[test]
@@ -930,6 +1229,7 @@ mod tests {
             ),
             adapter_property_probe("Ethernet 2", "Status"),
             adapter_property_probe("Ethernet 2", "PhysicalMediaType"),
+            parent_config_probe("Ethernet 2"),
         ] {
             assert!(
                 WindowsHyperV::is_read_only_probe(&probe),
@@ -937,6 +1237,10 @@ mod tests {
                 probe.display()
             );
         }
+        // A probe shape with a mutation smuggled into the device name is
+        // not a probe, for the parent probe as for the others.
+        let smuggled = parent_config_probe("x'; Remove-VMSwitch -Name 'vlanctl");
+        assert!(!WindowsHyperV::is_read_only_probe(&smuggled));
         let i = tagged(11, "192.168.11.87/24");
         for mutation in bringup_commands_for(&WindowsHyperV, &i, "Ethernet 2")
             .iter()

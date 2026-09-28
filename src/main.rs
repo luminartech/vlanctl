@@ -526,11 +526,12 @@ mod tests {
             let _ = plan::WindowsHyperV.addresses_on(&mut runner, "vEthernet (vlan11)");
             let _ = plan::WindowsHyperV.is_wireless(&mut runner, "Ethernet 2");
             let _ = plan::WindowsHyperV.link_is_active(&mut runner, "Ethernet 2");
+            let _ = plan::WindowsHyperV.parent_snapshot(&mut runner, "Ethernet 2");
             windows_probes.extend(runner.commands);
         }
         assert_eq!(
             windows_probes.len(),
-            4,
+            5,
             "every Windows probe should issue one command"
         );
         let probes: Vec<Cmd> = probes.into_iter().chain(windows_probes).collect();

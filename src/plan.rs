@@ -1,5 +1,6 @@
 use crate::config::{Interface, Profile, Route};
 use crate::net::{Cmd, CommandRunner};
+use crate::state::ParentConfig;
 use anyhow::{Context, Result};
 use ipnet::IpNet;
 
@@ -128,6 +129,39 @@ pub trait Platform {
     /// [`Platform::records_created_interface`] recognises, so `apply`
     /// records it and `down` removes it like any tagged one.
     fn reverts_parent_config(&self) -> bool;
+
+    /// The parent device's own IPv4 configuration, read before an apply
+    /// takes the device over, so `down` can put it back.
+    ///
+    /// `Ok(None)` by default, and that is the right answer for macOS and
+    /// Linux: a VLAN sub-interface sits beside the parent's own addressing,
+    /// which the apply never touches. A backend answers `Some` when its
+    /// apply *destroys* that addressing — the Hyper-V backend binds the
+    /// parent to an external switch, and Windows clears the parent's
+    /// addresses when it does and does not restore them when the switch is
+    /// removed. `commands::apply` records the answer in the state file and
+    /// `commands::down` hands it to [`Platform::parent_restore_commands`]
+    /// after the last interface is gone; a failed apply's rollback does the
+    /// same.
+    ///
+    /// A device with no IPv4 stack at all (already bound to something) is
+    /// `Ok(None)`: there is nothing to put back. Only a genuine failure to
+    /// ask is an `Err`, and it refuses the apply — an apply that cannot
+    /// promise to undo itself must not start.
+    fn parent_snapshot(
+        &self,
+        _runner: &mut dyn CommandRunner,
+        _device: &str,
+    ) -> Result<Option<ParentConfig>> {
+        Ok(None)
+    }
+
+    /// Commands that put `parent` back on its device: the inverse of what
+    /// the apply's bring-up destroyed. Empty by default, matching
+    /// [`Platform::parent_snapshot`]'s default of nothing to restore.
+    fn parent_restore_commands(&self, _parent: &ParentConfig) -> Vec<Cmd> {
+        Vec::new()
+    }
 
     /// Whether attaching to a parent device takes it away from the host's
     /// own use, so that picking the wrong one would sever the host from a

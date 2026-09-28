@@ -2,7 +2,7 @@ use crate::config::Profile;
 use crate::device::resolve_device;
 use crate::net::{Cmd, CommandRunner};
 use crate::plan::{Platform, bringup_commands_for};
-use crate::state::State;
+use crate::state::{ParentConfig, State};
 use anyhow::{Context, Result, bail};
 use ipnet::IpNet;
 use std::path::Path;
@@ -155,6 +155,12 @@ pub fn apply<R: CommandRunner>(
         }
     }
 
+    // What the parent carries before this apply takes it over, for `down`
+    // to put back. Read after every guard above, so a refused apply asks
+    // nothing, and before any bring-up command, which is what destroys it.
+    // A backend whose apply leaves the parent alone answers `None`.
+    let parent = platform.parent_snapshot(runner, &device)?;
+
     let mut created: Vec<String> = Vec::new();
     for interface in &profile.interfaces {
         let iface = platform.iface_name(interface, &device);
@@ -192,7 +198,7 @@ pub fn apply<R: CommandRunner>(
                     }
                 }
                 Err(e) => {
-                    rollback(runner, platform, &created);
+                    rollback(runner, platform, &created, parent.as_ref());
                     return Err(e).with_context(|| {
                         format!("applying profile '{}'; rolled back", profile.name)
                     });
@@ -208,6 +214,7 @@ pub fn apply<R: CommandRunner>(
     // Windows those can differ, and the other backend's teardown would not
     // undo this one's work.
     state.backend = Some(platform.name().to_string());
+    state.parent = parent;
     if !dry_run {
         // Saved before the check below, deliberately: if verification fails
         // the host is partly configured, and the caller needs a state file
@@ -364,10 +371,26 @@ impl std::fmt::Display for TeardownUnverified {
 
 impl std::error::Error for TeardownUnverified {}
 
-/// Destroy created interfaces in reverse order, ignoring errors (best effort).
-fn rollback<R: CommandRunner>(runner: &mut R, platform: &dyn Platform, created: &[String]) {
+/// Destroy created interfaces in reverse order, then put the parent's own
+/// configuration back where the backend recorded one, ignoring errors
+/// (best effort).
+///
+/// The parent restore runs even when nothing was created: on Windows the
+/// create script itself removes the switch it made when the adapter fails
+/// to appear, and the switch bind is what cleared the parent.
+fn rollback<R: CommandRunner>(
+    runner: &mut R,
+    platform: &dyn Platform,
+    created: &[String],
+    parent: Option<&ParentConfig>,
+) {
     for iface in created.iter().rev() {
         for cmd in platform.teardown_commands(iface) {
+            let _ = runner.run(&cmd);
+        }
+    }
+    if let Some(parent) = parent {
+        for cmd in platform.parent_restore_commands(parent) {
             let _ = runner.run(&cmd);
         }
     }
@@ -394,31 +417,43 @@ pub fn down<R: CommandRunner>(
             runner.run(&cmd)?;
         }
     }
-    if dry_run {
-        return Ok(());
-    }
-    // The commands exited 0; now ask the host. Something outside vlanctl can
-    // hold an interface up — a NetworkManager connection profile for the same
-    // name re-creates it as fast as the teardown removes it — and a caller
-    // that trusts the exit code tells its operator the host is clean when it
-    // is not.
-    let survivors = surviving_interfaces(runner, platform, &state.interfaces).map_err(|e| {
-        TeardownUnverified {
-            profile: state.active_profile.clone(),
-            reason: format!("{e:#}"),
+    if !dry_run {
+        // The commands exited 0; now ask the host. Something outside vlanctl
+        // can hold an interface up — a NetworkManager connection profile for
+        // the same name re-creates it as fast as the teardown removes it — and
+        // a caller that trusts the exit code tells its operator the host is
+        // clean when it is not.
+        let survivors = surviving_interfaces(runner, platform, &state.interfaces).map_err(|e| {
+            TeardownUnverified {
+                profile: state.active_profile.clone(),
+                reason: format!("{e:#}"),
+            }
+        })?;
+        if !survivors.is_empty() {
+            // The record is deliberately NOT cleared. A retry needs to know
+            // what it is still responsible for, and the caller has just been
+            // told the teardown did not finish.
+            return Err(TeardownIncomplete {
+                profile: state.active_profile.clone(),
+                survivors,
+            }
+            .into());
         }
-    })?;
-    if !survivors.is_empty() {
-        // The record is deliberately NOT cleared. A retry needs to know what
-        // it is still responsible for, and the caller has just been told the
-        // teardown did not finish.
-        return Err(TeardownIncomplete {
-            profile: state.active_profile.clone(),
-            survivors,
-        }
-        .into());
     }
-    State::default().save(state_path)?;
+    // The parent is put back only once every interface is confirmed gone:
+    // on Windows the switch that took the parent over goes with its last
+    // adapter, and the parent has no stack to configure until then. A
+    // restore that fails leaves the state file standing, so the next `down`
+    // tries again rather than declaring clean a host that is missing its
+    // address.
+    if let Some(parent) = &state.parent {
+        for cmd in platform.parent_restore_commands(parent) {
+            runner.run(&cmd)?;
+        }
+    }
+    if !dry_run {
+        State::default().save(state_path)?;
+    }
     Ok(())
 }
 
@@ -698,6 +733,8 @@ mod tests {
         State {
             active_profile: Some("t".to_string()),
             interfaces: vec!["eth0.100".to_string()],
+            backend: None,
+            parent: None,
         }
         .save(&state_path)
         .unwrap();
@@ -847,6 +884,119 @@ mod tests {
         let _ = std::fs::remove_file(&state_path);
     }
 
+    /// The parent-config probe's command line, taken from the backend so a
+    /// change to its rendering cannot silently turn the stub into an
+    /// unmapped command.
+    fn windows_parent_probe() -> String {
+        let mut probe = RecordingRunner::default();
+        WindowsHyperV
+            .parent_snapshot(&mut probe, "Ethernet 2")
+            .unwrap();
+        probe.commands[0].display()
+    }
+
+    /// Bench, 2026-09-28: Apply → Revert left the parent adapter static
+    /// with no address — `New-VMSwitch` cleared its `192.168.11.87/24` and
+    /// `Remove-VMSwitch` did not put it back — so the host sat on APIPA and
+    /// could not reach the sensor's subnet until the address was re-entered
+    /// by hand. `apply` must record what the parent carried and `down` must
+    /// restore it after the last adapter is gone.
+    #[test]
+    fn apply_with_windows_records_the_parents_addressing_and_down_puts_it_back() {
+        let state_path = std::env::temp_dir().join("vlanctl-windows-parent-restore.json");
+        let _ = std::fs::remove_file(&state_path);
+        let mut r = windows_runner(&["Ethernet 2", "Wi-Fi"]);
+        r.stdout.insert(
+            windows_parent_probe(),
+            "dhcp Disabled\r\naddress 192.168.11.87/24\r\n".to_string(),
+        );
+        apply(
+            &mut r,
+            &WindowsHyperV,
+            &windows_profile(),
+            None,
+            &state_path,
+            false,
+        )
+        .unwrap();
+        let state = State::load(&state_path).unwrap();
+        let parent = state.parent.expect("the parent's addressing is recorded");
+        assert_eq!(parent.device, "Ethernet 2");
+        assert!(!parent.dhcp);
+        assert_eq!(
+            parent.addresses,
+            vec!["192.168.11.87/24".parse::<IpNet>().unwrap()]
+        );
+
+        let mut r = windows_runner(&["Ethernet 2", "vEthernet (untagged)", "vEthernet (vlan12)"]);
+        down(&mut r, &WindowsHyperV, &state_path, false).unwrap();
+        let rendered: Vec<String> = r.commands.iter().map(|c| c.display()).collect();
+        let restore = rendered
+            .iter()
+            .position(|c| {
+                c == "netsh interface ipv4 set address Ethernet 2 static 192.168.11.87 \
+                      255.255.255.0"
+            })
+            .unwrap_or_else(|| panic!("the parent's address is put back: {rendered:?}"));
+        let last_teardown = rendered
+            .iter()
+            .rposition(|c| c.contains("Remove-VMNetworkAdapter"))
+            .unwrap();
+        assert!(
+            last_teardown < restore,
+            "the parent is restored only after its last adapter is gone: {rendered:?}"
+        );
+        assert_eq!(State::load(&state_path).unwrap(), State::default());
+        let _ = std::fs::remove_file(&state_path);
+    }
+
+    #[test]
+    fn a_failed_windows_apply_puts_the_parents_addressing_back_too() {
+        // The create script removes the switch it made when the adapter
+        // never appears, and the switch bind is what cleared the parent —
+        // so rollback must restore the parent even when nothing was
+        // recorded as created.
+        let state_path = std::env::temp_dir().join("vlanctl-windows-parent-rollback.json");
+        let _ = std::fs::remove_file(&state_path);
+        let mut probe = windows_runner(&["Ethernet 2", "Wi-Fi"]);
+        apply(
+            &mut probe,
+            &WindowsHyperV,
+            &windows_profile(),
+            None,
+            &state_path,
+            true,
+        )
+        .unwrap();
+        let fail_at = probe
+            .commands
+            .iter()
+            .position(|c| WindowsHyperV.records_created_interface(c))
+            .expect("the plan creates an adapter");
+
+        let mut r = windows_runner(&["Ethernet 2", "Wi-Fi"]);
+        r.stdout
+            .insert(windows_parent_probe(), "dhcp Enabled\r\n".to_string());
+        r.fail_at = Some(fail_at);
+        let err = apply(
+            &mut r,
+            &WindowsHyperV,
+            &windows_profile(),
+            None,
+            &state_path,
+            false,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("rolled back"), "{err}");
+        let rendered: Vec<String> = r.commands.iter().map(|c| c.display()).collect();
+        assert!(
+            rendered.contains(&"netsh interface ipv4 set address Ethernet 2 dhcp".to_string()),
+            "{rendered:?}"
+        );
+        assert_eq!(State::load(&state_path).unwrap(), State::default());
+        let _ = std::fs::remove_file(&state_path);
+    }
+
     #[test]
     fn apply_with_windows_guards_the_untagged_adapter_too() {
         // The collision guard covers every interface the platform names,
@@ -938,6 +1088,7 @@ mod tests {
             active_profile: Some("iris".to_string()),
             interfaces: vec!["vEthernet (vlan11)".to_string()],
             backend: Some("windows-hyperv".to_string()),
+            parent: None,
         }
         .save(&state_path)
         .unwrap();
@@ -977,6 +1128,7 @@ mod tests {
             active_profile: Some("live".to_string()),
             interfaces: vec!["Ethernet 2".to_string()],
             backend: Some("windows-driver-vlan".to_string()),
+            parent: None,
         };
         active.save(&state_path).unwrap();
         let mut r = windows_runner(&["Ethernet 2"]);
@@ -1228,6 +1380,7 @@ mod tests {
             active_profile: Some("t".to_string()),
             interfaces: vec!["vlan0".to_string(), "vlan1".to_string()],
             backend: None,
+            parent: None,
         };
         state.save(&state_path).unwrap();
         let mut r = RecordingRunner::default();
@@ -1267,6 +1420,7 @@ mod tests {
             active_profile: Some("t".to_string()),
             interfaces: vec!["vlan10".to_string(), "vlan11".to_string()],
             backend: None,
+            parent: None,
         }
         .save(&state_path)
         .unwrap();
@@ -1303,6 +1457,8 @@ mod tests {
         State {
             active_profile: Some("t".to_string()),
             interfaces: vec!["vlan10".to_string()],
+            backend: None,
+            parent: None,
         }
         .save(&state_path)
         .unwrap();
@@ -1468,6 +1624,7 @@ mod tests {
             active_profile: Some("t".to_string()),
             interfaces: vec!["vlan0".to_string(), "vlan9".to_string()],
             backend: None,
+            parent: None,
         }
         .save(&state_path)
         .unwrap();
