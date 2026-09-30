@@ -118,8 +118,7 @@ mod tests {
 
     #[test]
     fn show_accepts_a_device_override() {
-        let cli =
-            Cli::try_parse_from(["vlanctl", "show", "halo", "--device", "enp0s31f6"]).unwrap();
+        let cli = Cli::try_parse_from(["vlanctl", "show", "lab", "--device", "enp0s31f6"]).unwrap();
         match cli.command {
             Command::Show { device, .. } => assert_eq!(device.as_deref(), Some("enp0s31f6")),
             _ => panic!("expected Show"),
