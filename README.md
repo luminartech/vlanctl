@@ -12,9 +12,8 @@ cargo install vlanctl
 ```
 
 Profiles are read from `--profiles-dir` (default `./profiles`). The crate ships
-`profiles/example.toml` as a starting point; the sensor profiles used on our
-benches are bench configuration and live in the project repository rather than
-the published crate.
+`profiles/example.toml` as a starting point. Profiles for a specific test setup
+belong with that setup, not in the published crate.
 
 ## Usage
 
