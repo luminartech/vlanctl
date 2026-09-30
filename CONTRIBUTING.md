@@ -68,10 +68,11 @@ mutation there.
 
 ## Profiles
 
-`profiles/example.toml` is the only profile in this repository. Bench profiles
--- ones that encode a particular sensor's VLAN layout, or pin a unit's MAC for
-a static ARP entry -- are configuration for the bench that runs them, not
-examples for a general reader, and they live with that bench rather than here.
+`profiles/example.toml` is the only profile in this repository. Profiles for a
+specific test setup -- ones that encode a particular sensor's VLAN layout, or
+pin a unit's MAC for a static ARP entry -- are configuration for that setup,
+not examples for a general reader, and they belong with that setup rather than
+here.
 A new profile added to this repository should be one anybody can read and learn
 the schema from.
 

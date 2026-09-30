@@ -168,8 +168,8 @@ mod tests {
     #[test]
     fn parses_multi_vlan_profile() {
         let toml = r#"
-name = "example_bench"
-description = "bench"
+name = "example_lab"
+description = "lab"
 
 [[interface]]
 vlan = 100
@@ -184,7 +184,7 @@ vlan = 200
 address = "10.0.0.5/24"
 "#;
         let p: Profile = toml::from_str(toml).unwrap();
-        assert_eq!(p.name, "example_bench");
+        assert_eq!(p.name, "example_lab");
         assert_eq!(p.interfaces.len(), 2);
         assert_eq!(p.interfaces[0].vlan, Some(100));
         assert_eq!(p.interfaces[0].routes.len(), 1);

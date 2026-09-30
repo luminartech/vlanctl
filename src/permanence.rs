@@ -47,10 +47,10 @@
 //! re-apply instead, and if a tombstone already exists, delete the
 //! `.nmmeta` symlink and `nmcli con reload`.
 //!
-//! Cost a full bench day, with five correct-but-irrelevant hypotheses
-//! (a write/scan race, content rejection, a missing `uuid=`,
-//! `unmanaged-devices`, a keyfile path override) ruled out before anyone
-//! looked in `/etc` for debris left by an earlier `nmcli con delete`.
+//! The symptom is easy to misattribute. A write/scan race, content
+//! rejection, a missing `uuid=`, `unmanaged-devices` and a keyfile path
+//! override all look plausible and are all irrelevant; the cause is debris
+//! in `/etc` left by an earlier `nmcli con delete`, so check there first.
 
 use crate::config::{Profile, Route};
 use anyhow::{Result, bail};
@@ -196,7 +196,7 @@ pub fn render_netplan(profile: &Profile, device: &str, renderer: Renderer) -> St
         // than one VLAN links to an undefined parent, so `netplan apply`
         // writes nothing at all. Exactly one VLAN happens to survive, which
         // is how a single-interface fixture passes while every real
-        // two-VLAN profile fails. Measured on the bench.
+        // two-VLAN profile fails. This is observed netplan behavior.
         //
         // `link-local: []` is honored by networkd and **ignored by the NM
         // backend**, which gives the parent `ipv4.method=link-local` and a
@@ -279,8 +279,8 @@ fn push_nm_renderer(out: &mut String, renderer: Renderer, indent: usize) {
 
 /// Keys that decide the parent's fate on a NetworkManager host.
 ///
-/// Both were measured against the generated keyfile, and both fix a real
-/// failure seen on a bench:
+/// Both were checked against the generated keyfile, and each prevents a
+/// failure that occurs in practice:
 ///
 /// - `autoconnect-priority` outranks NM's stock `Wired connection 1`, which
 ///   ships at `-999` with `ipv4.method=auto`. Without this it wins the
@@ -332,9 +332,9 @@ mod tests {
     use super::*;
     use crate::config::{Interface, Profile, Route};
 
-    fn iris_profile() -> Profile {
+    fn tagged_profile() -> Profile {
         Profile {
-            name: "derived-iris".to_string(),
+            name: "lab".to_string(),
             description: None,
             device: Some("eth0".to_string()),
             interfaces: vec![Interface {
@@ -350,9 +350,9 @@ mod tests {
         }
     }
 
-    fn halo_profile() -> Profile {
+    fn untagged_profile() -> Profile {
         Profile {
-            name: "derived-halo".to_string(),
+            name: "lab-two".to_string(),
             description: None,
             device: Some("eth0".to_string()),
             interfaces: vec![Interface {
@@ -370,11 +370,8 @@ mod tests {
     /// `netplan_generate_accepts_the_tagged_rendering`.
     #[test]
     fn path_is_namespaced_and_ordered_after_the_distro_defaults() {
-        let p = netplan_path("derived-iris").expect("a safe name");
-        assert_eq!(
-            p,
-            PathBuf::from("/etc/netplan/90-vlanctl-derived-iris.yaml")
-        );
+        let p = netplan_path("lab").expect("a safe name");
+        assert_eq!(p, PathBuf::from("/etc/netplan/90-vlanctl-lab.yaml"));
     }
 
     /// `Profile::validate` never inspects `name`, so this is the only thing
@@ -392,9 +389,9 @@ mod tests {
 
     #[test]
     fn renders_a_tagged_interface_with_its_host_route() {
-        let yaml = render_netplan(&iris_profile(), "eth0", Renderer::Networkd);
+        let yaml = render_netplan(&tagged_profile(), "eth0", Renderer::Networkd);
         let expected = "\
-# Written by vlanctl for profile 'derived-iris'. Safe to delete.
+# Written by vlanctl for profile 'lab'. Safe to delete.
 network:
   version: 2
   ethernets:
@@ -418,7 +415,7 @@ network:
     /// addresses under `ethernets`, not `vlans`.
     #[test]
     fn renders_an_untagged_entry_under_ethernets() {
-        let yaml = render_netplan(&halo_profile(), "eth0", Renderer::Networkd);
+        let yaml = render_netplan(&untagged_profile(), "eth0", Renderer::Networkd);
         assert!(yaml.contains("ethernets:"), "got {yaml}");
         assert!(yaml.contains("eth0:"), "got {yaml}");
         assert!(!yaml.contains("vlans:"), "got {yaml}");
@@ -431,7 +428,7 @@ network:
     /// rejects the whole file — see `netplan_generate_accepts_the_tagged_rendering`.
     #[test]
     fn stubs_the_parent_device_when_no_untagged_interface_exists() {
-        let yaml = render_netplan(&iris_profile(), "eth0", Renderer::Networkd);
+        let yaml = render_netplan(&tagged_profile(), "eth0", Renderer::Networkd);
         assert!(
             yaml.contains("  ethernets:\n    eth0:\n      dhcp4: false\n"),
             "got {yaml}"
@@ -443,11 +440,11 @@ network:
     /// `dhcp4: false` alone does not achieve that: under the
     /// NetworkManager renderer a netdef with no addresses becomes
     /// `ipv4.method=link-local`, and NM autoconfigures a persistent
-    /// `169.254.0.0/16` on a NIC that had no IPv4 at all. Measured on the
-    /// bench, and Revert does not clean it up.
+    /// `169.254.0.0/16` on a NIC that had no IPv4 at all, and Revert does
+    /// not clean it up.
     #[test]
     fn stubbed_parent_does_not_take_a_link_local_address() {
-        let yaml = render_netplan(&iris_profile(), "eth0", Renderer::Networkd);
+        let yaml = render_netplan(&tagged_profile(), "eth0", Renderer::Networkd);
         assert!(
             yaml.contains("  ethernets:\n    eth0:\n      dhcp4: false\n      link-local: []\n"),
             "got {yaml}"
@@ -456,7 +453,7 @@ network:
 
     #[test]
     fn renders_mtu_when_the_interface_sets_it() {
-        let mut profile = iris_profile();
+        let mut profile = tagged_profile();
         profile.interfaces[0].mtu = Some(1500);
         let yaml = render_netplan(&profile, "eth0", Renderer::Networkd);
         assert!(yaml.contains("      mtu: 1500\n"), "got {yaml}");
@@ -464,7 +461,7 @@ network:
 
     #[test]
     fn renders_mtu_on_an_untagged_interface() {
-        let mut profile = halo_profile();
+        let mut profile = untagged_profile();
         profile.interfaces[0].mtu = Some(9000);
         let yaml = render_netplan(&profile, "eth0", Renderer::Networkd);
         assert!(yaml.contains("      mtu: 9000\n"), "got {yaml}");
@@ -477,7 +474,7 @@ network:
     /// "made permanent" covers.
     #[test]
     fn warns_in_the_header_when_a_route_carries_a_static_arp_entry() {
-        let mut profile = halo_profile();
+        let mut profile = untagged_profile();
         profile.interfaces[0].routes.push(Route {
             destination: "192.168.10.151/32".to_string(),
             gateway: None,
@@ -609,7 +606,7 @@ network:
     #[test]
     fn netplan_generate_accepts_the_tagged_rendering() {
         assert_netplan_generate_accepts(
-            &render_netplan(&iris_profile(), "eth0", Renderer::Networkd),
+            &render_netplan(&tagged_profile(), "eth0", Renderer::Networkd),
             "tagged",
         );
     }
@@ -683,7 +680,7 @@ network:
     /// to networkd, which is worse than the problem.
     #[test]
     fn the_network_manager_rendering_pins_every_netdef_it_owns() {
-        let yaml = render_netplan(&iris_two_vlan_profile(), "eth0", Renderer::NetworkManager);
+        let yaml = render_netplan(&two_vlan_profile(), "eth0", Renderer::NetworkManager);
         assert_eq!(
             yaml.matches("renderer: NetworkManager").count(),
             3,
@@ -700,7 +697,7 @@ network:
     /// connection 1` from capturing it after a netplan apply.
     #[test]
     fn the_network_manager_parent_disables_ipv4_and_outranks_autoconnect() {
-        let yaml = render_netplan(&iris_two_vlan_profile(), "eth0", Renderer::NetworkManager);
+        let yaml = render_netplan(&two_vlan_profile(), "eth0", Renderer::NetworkManager);
         assert!(
             yaml.contains("connection.autoconnect-priority: \"999\""),
             "got {yaml}"
@@ -713,7 +710,7 @@ network:
     /// already works on both backends.
     #[test]
     fn the_networkd_rendering_carries_no_network_manager_keys() {
-        let yaml = render_netplan(&iris_two_vlan_profile(), "eth0", Renderer::Networkd);
+        let yaml = render_netplan(&two_vlan_profile(), "eth0", Renderer::Networkd);
         assert!(!yaml.contains("renderer:"), "got {yaml}");
         assert!(!yaml.contains("networkmanager:"), "got {yaml}");
         assert!(
@@ -722,11 +719,10 @@ network:
         );
     }
 
-    /// Two tagged interfaces on one parent — the shape every derived
-    /// profile now has, since a qualified conventional VLAN brings its
-    /// sibling along.
-    fn iris_two_vlan_profile() -> Profile {
-        let mut p = iris_profile();
+    /// Two tagged interfaces on one parent — a common real-world shape,
+    /// and the one that exposes the undefined-parent crash below.
+    fn two_vlan_profile() -> Profile {
+        let mut p = tagged_profile();
         p.interfaces.push(Interface {
             vlan: Some(11),
             address: "192.168.11.87/24".parse().expect("valid CIDR"),
@@ -740,7 +736,7 @@ network:
         p
     }
 
-    /// The regression that cost a bench round trip.
+    /// Guards a regression that unit fixtures alone do not catch.
     ///
     /// One tagged interface survives an undefined parent netdef; two do
     /// not. Omitting the `ethernets:` stub therefore passed every
@@ -767,7 +763,7 @@ network:
         write_fixture(
             &netplan_dir,
             "90-vlanctl-test.yaml",
-            &render_netplan(&iris_two_vlan_profile(), "eth0", Renderer::NetworkManager),
+            &render_netplan(&two_vlan_profile(), "eth0", Renderer::NetworkManager),
         );
 
         let out = netplan_generate(bin, &root);
@@ -816,7 +812,7 @@ network:
     #[test]
     fn netplan_generate_accepts_a_two_vlan_rendering() {
         assert_netplan_generate_accepts(
-            &render_netplan(&iris_two_vlan_profile(), "eth0", Renderer::Networkd),
+            &render_netplan(&two_vlan_profile(), "eth0", Renderer::Networkd),
             "two-vlan",
         );
     }
@@ -825,7 +821,7 @@ network:
     #[test]
     fn netplan_generate_accepts_the_untagged_rendering() {
         assert_netplan_generate_accepts(
-            &render_netplan(&halo_profile(), "eth0", Renderer::Networkd),
+            &render_netplan(&untagged_profile(), "eth0", Renderer::Networkd),
             "untagged",
         );
     }
@@ -841,8 +837,8 @@ network:
     /// that backend may not even be installed.
     ///
     /// Fixture: an installer-style file with its own explicit `renderer:
-    /// networkd` and an unrelated `ens3` NIC, alongside our derived-iris
-    /// rendering. Proves our file does not move `ens3` off networkd by
+    /// networkd` and an unrelated `ens3` NIC, alongside our rendering of a
+    /// tagged profile. Proves our file does not move `ens3` off networkd by
     /// checking it still gets a systemd-networkd unit after `generate`,
     /// rather than ending up under NetworkManager instead.
     #[cfg_attr(not(feature = "netplan-tests"), ignore)]
@@ -865,8 +861,8 @@ network:
         );
         write_fixture(
             &netplan_dir,
-            "90-vlanctl-derived-iris.yaml",
-            &render_netplan(&iris_profile(), "eth0", Renderer::Networkd),
+            "90-vlanctl-lab.yaml",
+            &render_netplan(&tagged_profile(), "eth0", Renderer::Networkd),
         );
 
         let out = netplan_generate(bin, &root);

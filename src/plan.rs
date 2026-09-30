@@ -551,8 +551,7 @@ impl Platform for Linux {
     }
 
     fn is_candidate_device(&self, name: &str) -> bool {
-        // Mirrors the exclusion list of the shell script this replaced, which
-        // was known to pick the right parent on our hardware. Linux wired
+        // This exclusion list picks the right parent in practice. Linux wired
         // names are too varied to allow-list (`eth0`, `enp0s31f6`,
         // `enx<mac>`, `eno1`, `ens5`), so exclude what is definitely not a
         // parent instead. A name containing `.` is a VLAN sub-interface.
@@ -2183,7 +2182,7 @@ mod tests {
 
     #[test]
     fn linux_existing_vlans_reports_ids_with_the_names_holding_them() {
-        // Fixture is real `ip -d -json link show` output from the bench.
+        // Fixture is real `ip -d -json link show` output from a Linux host.
         let mut r = RecordingRunner::default();
         r.stdout.insert(
             "ip -d -json link show".to_string(),

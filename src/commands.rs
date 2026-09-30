@@ -568,7 +568,7 @@ mod tests {
 
     fn untagged_profile() -> Profile {
         let p: Profile = toml::from_str(
-            "name=\"halo\"\ndevice=\"en0\"\n\
+            "name=\"lab\"\ndevice=\"en0\"\n\
              [[interface]]\naddress=\"192.168.1.100/24\"\n\
              [[interface.route]]\ndestination=\"192.168.10.151/32\"\n\
              [[interface]]\nvlan=12\naddress=\"192.168.10.1/24\"\n",
@@ -1252,8 +1252,9 @@ mod tests {
     #[test]
     fn the_cli_device_override_beats_the_profile_field() {
         // A committed profile cannot know the host's device name, so the
-        // runtime override must win. Profile pins "en7" (a macOS name from
-        // one bench); the override names this host's real parent.
+        // runtime override must win. Profile pins "en7" (a macOS name that
+        // is valid on some other host); the override names this host's real
+        // parent.
         let mut p = linux_profile();
         p.device = Some("en7".to_string());
         let state_path = std::env::temp_dir().join("vlanctl-device-override.json");
@@ -1485,8 +1486,8 @@ mod tests {
     /// `down` exiting 0 is not the same as the host being clean. Something
     /// outside vlanctl can hold an interface up — a NetworkManager
     /// connection profile for the same name re-creates it as fast as
-    /// `ip link del` removes it, which was measured on a bench where the
-    /// ifindex moved while the interface never disappeared.
+    /// `ip link del` removes it. When that happens the ifindex changes
+    /// while the interface never disappears.
     ///
     /// Reporting success there is the worst answer available: the caller
     /// tells its operator the host is clean and everyone stops looking.
@@ -1632,7 +1633,7 @@ mod tests {
 
     fn mac_profile() -> Profile {
         let p: Profile = toml::from_str(
-            "name=\"halo\"\ndevice=\"en0\"\n\
+            "name=\"lab\"\ndevice=\"en0\"\n\
              [[interface]]\naddress=\"192.168.1.100/24\"\n\
              [[interface.route]]\ndestination=\"192.168.10.151/32\"\nmac=\"00:00:5e:00:53:01\"\n",
         )
