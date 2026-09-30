@@ -417,7 +417,9 @@ pub fn down<R: CommandRunner>(
             runner.run(&cmd)?;
         }
     }
-    if !dry_run {
+    // A backend whose teardown leaves the interface in place (it is the
+    // parent device) has nothing to confirm by absence.
+    if !dry_run && platform.teardown_removes_interface() {
         // The commands exited 0; now ask the host. Something outside vlanctl
         // can hold an interface up — a NetworkManager connection profile for
         // the same name re-creates it as fast as the teardown removes it — and

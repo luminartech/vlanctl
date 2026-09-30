@@ -203,6 +203,12 @@ impl Platform for WindowsDriverVlan {
         true
     }
 
+    fn teardown_removes_interface(&self) -> bool {
+        // The interface is the parent adapter; teardown resets its keyword
+        // and address and the adapter stays exactly where it was.
+        false
+    }
+
     fn validate_profile(&self, profile: &Profile) -> Result<()> {
         if profile.interfaces.len() > 1 {
             bail!(

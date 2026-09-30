@@ -177,6 +177,19 @@ pub trait Platform {
         false
     }
 
+    /// Whether [`Platform::teardown_commands`] removes the interface it is
+    /// given, so that `commands::down` can confirm the teardown by the
+    /// interface's absence from [`Platform::list_devices`].
+    ///
+    /// `true` (the default) for every backend that creates an interface.
+    /// A backend whose interface is the parent device itself answers
+    /// `false`: teardown reconfigures the parent and leaves it listed, and
+    /// checking for its absence would report every clean `down` as
+    /// incomplete.
+    fn teardown_removes_interface(&self) -> bool {
+        true
+    }
+
     /// Whether this backend can apply `profile` at all, checked by
     /// `commands::apply` before it touches anything — before it even tears
     /// down the previously active profile, so a refusal changes nothing.
