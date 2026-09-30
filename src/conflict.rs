@@ -20,7 +20,7 @@
 use std::fmt;
 use std::io;
 use std::net::Ipv4Addr;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// How long [`probe`] listens when the caller has no reason to choose.
 ///
@@ -197,7 +197,8 @@ fn claimant(frame: &[u8], address: Ipv4Addr, own_mac: [u8; 6]) -> Option<[u8; 6]
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod imp {
-    use super::{Conflict, Duration, Instant, Ipv4Addr, ProbeError, build_probe, claimant};
+    use super::{Conflict, Duration, Ipv4Addr, ProbeError, build_probe, claimant};
+    use std::time::Instant;
 
     /// Per-read wait. Bounds how far past the window one non-matching frame
     /// on a busy segment can carry the probe.
