@@ -15,12 +15,13 @@ description = "Apply and tear down named VLAN profiles for lidar sensor networki
 repository = "https://github.com/luminartech/vlanctl"
 homepage = "https://github.com/luminartech/vlanctl"
 documentation = "https://docs.rs/vlanctl"
-keywords = ["vlan", "networking", "cli", "macos", "linux"]
+keywords = ["vlan", "networking", "macos", "linux", "windows"]
 categories = [
     "command-line-utilities",
     "network-programming",
     "os::macos-apis",
     "os::linux-apis",
+    "os::windows-apis",
 ]
 # CI and release tooling are not part of what a consumer builds against.
 exclude = [".github/", ".gitignore", "deny.toml", "release.toml", "release-plz.toml"]
@@ -35,7 +36,10 @@ path = "src/main.rs"
 
 [features]
 default = ["cli"]
-cli = ["dep:clap", "dep:libc"]
+# The CLI's elevation check: `getuid` through `libc` on Unix, the process
+# token's elevation state through `windows-sys` on Windows. Each is pulled in
+# only on the platform that uses it.
+cli = ["dep:clap", "dep:libc", "dep:windows-sys"]
 # Opt-in: runs the permanence tests that shell out to a real `netplan
 # generate` and read what it produced. Off by default because CI containers
 # do not ship `netplan.io`; on a Linux host that has opted in, a missing
@@ -46,13 +50,22 @@ netplan-tests = []
 anyhow = "1.0"
 clap = { version = "4.6", features = ["derive"], optional = true }
 ipnet = { version = "2.12", features = ["serde"] }
-libc = { version = "0.2", optional = true }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "1.1"
 
-# `conflict::probe` sends and reads raw ARP. Linux and macOS only, the two
-# platforms vlanctl has a backend for; elsewhere the probe reports itself
-# unavailable rather than pulling in a WinPcap link dependency.
+[target.'cfg(unix)'.dependencies]
+libc = { version = "0.2", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", optional = true, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Threading",
+] }
+
+# `conflict::probe` sends and reads raw ARP. Linux and macOS only; elsewhere
+# the probe reports itself unavailable rather than pulling in a WinPcap link
+# dependency.
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 pnet_datalink = "0.35"

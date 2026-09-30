@@ -1,10 +1,15 @@
 use anyhow::{Context, Result, bail};
 use ipnet::IpNet;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 use std::path::Path;
 
-#[derive(Debug, Deserialize, PartialEq)]
+/// A named set of interfaces to bring up together.
+///
+/// `Serialize` as well as `Deserialize` so an embedder that derives a
+/// profile in memory can hand it to the `vlanctl` binary as the same TOML a
+/// person would write — see [`Profile::to_toml`].
+#[derive(Debug, Deserialize, Serialize, PartialEq)]
 pub struct Profile {
     pub name: String,
     #[serde(default)]
@@ -15,7 +20,7 @@ pub struct Profile {
     pub interfaces: Vec<Interface>,
 }
 
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Debug, Deserialize, Serialize, PartialEq)]
 pub struct Interface {
     /// 802.1Q VLAN tag. `None` means untagged: configure the parent device directly.
     #[serde(default)]
@@ -27,7 +32,7 @@ pub struct Interface {
     pub routes: Vec<Route>,
 }
 
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Debug, Deserialize, Serialize, PartialEq)]
 pub struct Route {
     pub destination: String,
     /// Next-hop gateway. If omitted, the route is scoped to the owning
@@ -49,6 +54,13 @@ impl Profile {
             toml::from_str(&text).with_context(|| format!("parsing profile {}", path.display()))?;
         profile.validate()?;
         Ok(profile)
+    }
+
+    /// Render as the TOML [`Profile::load`] reads, so a profile built in
+    /// memory can be written to a `--profiles-dir` and applied by the
+    /// binary. Round-trips: `load(to_toml(p)) == p` for a valid profile.
+    pub fn to_toml(&self) -> Result<String> {
+        toml::to_string(self).with_context(|| format!("rendering profile '{}'", self.name))
     }
 
     /// Semantic validation beyond what the type system enforces.

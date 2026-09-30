@@ -12,6 +12,10 @@ use anyhow::{Result, bail};
 /// - several active -> error (ask the user to pin `device`);
 /// - none active but exactly one wired interface exists -> use it;
 /// - none active and several wired exist -> error (ask the user to pin `device`).
+///
+/// On a platform that [claims the parent exclusively](Platform::claims_parent_exclusively)
+/// there is no auto-detection at all: a wrong guess there disconnects the
+/// host, so the device must be named.
 pub fn resolve_device(
     platform: &dyn Platform,
     runner: &mut dyn CommandRunner,
@@ -19,6 +23,14 @@ pub fn resolve_device(
 ) -> Result<String> {
     if let Some(dev) = override_device {
         return Ok(dev.to_string());
+    }
+    if platform.claims_parent_exclusively() {
+        bail!(
+            "on {} the parent adapter is taken over entirely (it loses its own \
+             addressing until `down`), so vlanctl will not guess which one; name \
+             it with --device or the profile's `device` field",
+            platform.name()
+        );
     }
 
     // Every probe below goes through `platform`, so this works on any host

@@ -100,12 +100,16 @@ fn is_read_only_probe(cmd: &net::Cmd) -> bool {
         "cat" | "ls" => {
             matches!(args.as_slice(), [path] if path.starts_with("/sys/class/net/"))
         }
+        // Windows. A PowerShell command line cannot be told apart on argv
+        // alone — the script is one argument — so the backend owns the
+        // allowlist for its own probes, statement by statement.
+        "powershell.exe" => plan::WindowsHyperV::is_read_only_probe(cmd),
         _ => false,
     }
 }
 
-/// macOS: root has uid 0. Bail if not elevated.
-#[cfg(feature = "cli")]
+/// Unix: root has uid 0. Bail if not elevated.
+#[cfg(all(feature = "cli", unix))]
 fn require_root() -> Result<()> {
     // SAFETY: getuid is always safe to call and has no preconditions.
     let uid = unsafe { libc::getuid() };
@@ -115,16 +119,146 @@ fn require_root() -> Result<()> {
     Ok(())
 }
 
+/// Windows: the process token must be elevated. Membership of the
+/// Administrators group is not enough — under UAC an administrator's normal
+/// shell runs with a filtered token, and Hyper-V cmdlets and `netsh` both
+/// fail from it.
+#[cfg(all(feature = "cli", windows))]
+fn require_root() -> Result<()> {
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::Security::{
+        GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    let mut token: HANDLE = std::ptr::null_mut();
+    // SAFETY: `GetCurrentProcess` returns a pseudo-handle that needs no
+    // closing, and `token` is a valid out-pointer that `OpenProcessToken`
+    // fills on success.
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        bail!(
+            "cannot read this process's token to check for elevation: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
+    let mut returned: u32 = 0;
+    // SAFETY: `token` is the open handle from above; `elevation` is a
+    // correctly-sized, writable buffer for the `TokenElevation` class, and
+    // its size is passed alongside it.
+    let ok = unsafe {
+        GetTokenInformation(
+            token,
+            TokenElevation,
+            (&raw mut elevation).cast(),
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut returned,
+        )
+    };
+    let query_error = (ok == 0).then(std::io::Error::last_os_error);
+    // SAFETY: `token` came from `OpenProcessToken` and is closed exactly once.
+    unsafe { CloseHandle(token) };
+    if let Some(e) = query_error {
+        bail!("cannot read this process's elevation state: {e}");
+    }
+    if elevation.TokenIsElevated == 0 {
+        bail!(
+            "this command modifies network interfaces and must be run from an \
+             elevated (Run as administrator) shell"
+        );
+    }
+    Ok(())
+}
+
+/// Any other platform has no backend, so `host_platform()` refuses before
+/// anything here could run; this only has to compile.
+#[cfg(all(feature = "cli", not(any(unix, windows))))]
+fn require_root() -> Result<()> {
+    bail!("vlanctl cannot check for elevation on this platform")
+}
+
+/// The backend `down` and `status` run through: the one the state file
+/// says applied the active profile, so an apply through one Windows backend
+/// is never torn down through the other. A state file with no backend
+/// recorded predates the field and can only have come from the host's
+/// default backend, which is the fallback — the preview flavour for a dry
+/// run or `status`, which must keep working on a host with no backend.
+#[cfg(feature = "cli")]
+fn platform_for_state(
+    state_path: &std::path::Path,
+    preview: bool,
+) -> Result<Box<dyn plan::Platform>> {
+    let state = State::load(state_path)?;
+    match state.backend.as_deref().and_then(plan::platform_named) {
+        Some(platform) => Ok(platform),
+        None if preview => Ok(plan::preview_platform()),
+        None => plan::host_platform(),
+    }
+}
+
 #[cfg(not(feature = "cli"))]
 fn main() {
     eprintln!("vlanctl was built without the `cli` feature");
     std::process::exit(2);
 }
 
+/// What `--report` writes. One shape for every command: `created` is
+/// empty for anything but a successful `apply`.
+#[cfg(feature = "cli")]
+#[derive(serde::Serialize)]
+struct Report<'a> {
+    command: &'a str,
+    ok: bool,
+    message: String,
+    created: &'a [String],
+}
+
+/// Write the report `--report` asked for. A failure to write it is its own
+/// error only when the command itself succeeded: a reader that finds no
+/// file already treats that as "vlanctl did not get as far as running",
+/// and a write failure must not hide the command's own error.
+#[cfg(feature = "cli")]
+fn write_report(path: &std::path::Path, command: &str, result: &Result<Vec<String>>) {
+    let (ok, message, created): (bool, String, &[String]) = match result {
+        Ok(created) => (true, String::new(), created),
+        Err(e) => (false, format!("{e:#}"), &[]),
+    };
+    let report = Report {
+        command,
+        ok,
+        message,
+        created,
+    };
+    let write = serde_json::to_string_pretty(&report)
+        .map_err(anyhow::Error::from)
+        .and_then(|text| std::fs::write(path, text).map_err(anyhow::Error::from));
+    if let Err(e) = write {
+        eprintln!(
+            "vlanctl: could not write --report {}: {e:#}",
+            path.display()
+        );
+    }
+}
+
 #[cfg(feature = "cli")]
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    let report_path = cli.report.clone();
+    let command = cli.command.name();
+    let result = run(cli);
+    if let Some(path) = &report_path {
+        write_report(path, command, &result);
+    }
+    result.map(|_| ())
+}
+
+/// Run the parsed command. Returns the interfaces a successful `apply`
+/// created, and nothing for every other command, which is what the report
+/// carries.
+#[cfg(feature = "cli")]
+fn run(cli: Cli) -> Result<Vec<String>> {
     let state_path = State::default_path();
+    let mut created_interfaces = Vec::new();
 
     match cli.command {
         Command::List => {
@@ -139,17 +273,20 @@ fn main() -> Result<()> {
             let mut probe = SystemRunner;
             // Resolved through the SAME reference platform the preview renders
             // with, so the device it picks and the commands it prints agree.
+            // Chosen for this profile: on Windows its shape decides between
+            // the two backends there.
+            let platform = plan::preview_platform_for(&p);
             let device = device::resolve_device(
-                &*plan::preview_platform(),
+                &*platform,
                 &mut probe,
                 device.as_deref().or(p.device.as_deref()),
             )?;
-            // A preview renders through the fixed reference platform, not
-            // `host_platform()`: like `apply --dry-run`/`down --dry-run`
+            // A preview renders through the reference platform, not
+            // `host_platform_for()`: like `apply --dry-run`/`down --dry-run`
             // below, it touches no real system and must keep working on any
             // host, so it must not fail just because this build has no real
             // backend for the host OS.
-            for line in commands::show_plan(&*plan::preview_platform(), &p, &device) {
+            for line in commands::show_plan(&*platform, &p, &device) {
                 println!("{line}");
             }
         }
@@ -176,7 +313,7 @@ fn main() -> Result<()> {
                 };
                 commands::apply(
                     &mut runner,
-                    &*plan::preview_platform(),
+                    &*plan::preview_platform_for(&p),
                     &p,
                     device.as_deref(),
                     &state_path,
@@ -185,7 +322,7 @@ fn main() -> Result<()> {
                 print_planned_commands(&runner.recorded);
             } else {
                 require_root()?;
-                let platform = plan::host_platform()?;
+                let platform = plan::host_platform_for(&p)?;
                 let mut runner = SystemRunner;
                 let created = commands::apply(
                     &mut runner,
@@ -196,23 +333,27 @@ fn main() -> Result<()> {
                     false,
                 )?;
                 println!("applied '{}': {}", p.name, created.join(", "));
+                created_interfaces = created;
             }
         }
         Command::Down { dry_run } => {
             if dry_run {
                 // See the matching comment in `Command::Apply`: dry runs must
-                // keep working on any host, so they render through
-                // `plan::preview_platform()`, never the fallible
-                // `host_platform()`.
+                // keep working on any host, so a state file naming no
+                // backend falls back to `plan::preview_platform()`, never
+                // the fallible `host_platform()`.
                 let mut runner = PreviewRunner {
                     probe: SystemRunner,
                     recorded: Vec::new(),
                 };
-                commands::down(&mut runner, &*plan::preview_platform(), &state_path, true)?;
+                let platform = platform_for_state(&state_path, true)?;
+                commands::down(&mut runner, &*platform, &state_path, true)?;
                 print_planned_commands(&runner.recorded);
             } else {
                 require_root()?;
-                let platform = plan::host_platform()?;
+                // Through the backend that applied, not the one this host
+                // would pick for a fresh profile.
+                let platform = platform_for_state(&state_path, false)?;
                 let mut runner = SystemRunner;
                 commands::down(&mut runner, &*platform, &state_path, false)?;
                 println!("torn down");
@@ -220,19 +361,21 @@ fn main() -> Result<()> {
         }
         Command::Status => {
             let mut runner = SystemRunner;
+            let platform = platform_for_state(&state_path, true)?;
             print!(
                 "{}",
-                commands::status(&mut runner, &*plan::preview_platform(), &state_path)?
+                commands::status(&mut runner, &*platform, &state_path)?
             );
         }
     }
-    Ok(())
+    Ok(created_interfaces)
 }
 
 #[cfg(all(test, feature = "cli"))]
 mod tests {
     use super::*;
     use net::Cmd;
+    use plan::Platform;
 
     /// THE safety property. `is_read_only_probe` decides what a dry run
     /// executes for real, so a false positive here turns a preview into an
@@ -277,7 +420,76 @@ mod tests {
                 &["add", "-host", "192.168.10.151", "-interface", "en7"],
             ),
             Cmd::new("arp", &["-s", "192.168.10.151", "00:00:5e:00:53:01"]),
+            // Windows. `netsh` never passes (the backend issues no probe
+            // through it), and a PowerShell command line passes only when
+            // every statement is one of the backend's probe shapes.
+            Cmd::new(
+                "netsh",
+                &[
+                    "interface",
+                    "ipv4",
+                    "set",
+                    "address",
+                    "vEthernet (vlan11)",
+                    "static",
+                    "192.168.11.87",
+                    "255.255.255.0",
+                ],
+            ),
+            Cmd::new(
+                "netsh",
+                &[
+                    "interface",
+                    "ipv4",
+                    "add",
+                    "route",
+                    "239.255.0.255/32",
+                    "vEthernet (vlan11)",
+                ],
+            ),
+            Cmd::new(
+                "powershell.exe",
+                &[
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-Command",
+                    "$ErrorActionPreference = 'Stop'; Remove-VMSwitch -Name 'vlanctl' -Force",
+                ],
+            ),
+            // A probe shape with a mutation appended.
+            Cmd::new(
+                "powershell.exe",
+                &[
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-Command",
+                    "$ErrorActionPreference = 'Stop'; Get-NetAdapter | ForEach-Object { $_.Name }; \
+                     Remove-VMSwitch -Name 'vlanctl' -Force",
+                ],
+            ),
         ];
+        // And every mutation the Windows backend itself renders.
+        let tagged = config::Interface {
+            vlan: Some(11),
+            address: "192.168.11.87/24".parse().unwrap(),
+            mtu: Some(1500),
+            routes: vec![config::Route {
+                destination: "192.168.11.151/32".to_string(),
+                gateway: None,
+                mac: Some("00:00:5e:00:53:01".to_string()),
+            }],
+        };
+        let mut mutations = mutations.to_vec();
+        mutations.extend(plan::bringup_commands_for(
+            &plan::WindowsHyperV,
+            &tagged,
+            "Ethernet 2",
+        ));
+        mutations.extend(plan::WindowsHyperV.teardown_commands("vEthernet (vlan11)"));
         for cmd in &mutations {
             assert!(
                 !is_read_only_probe(cmd),
@@ -303,6 +515,26 @@ mod tests {
             Cmd::new("ifconfig", &["en0"]),
             Cmd::new("networksetup", &["-listallhardwareports"]),
         ];
+        // The Windows probes are rendered by the backend rather than spelled
+        // out here, so this test follows the backend's own shapes. Each is
+        // issued against a recording runner and the command it recorded is
+        // what the allowlist must recognise.
+        let mut windows_probes = Vec::new();
+        {
+            let mut runner = net::RecordingRunner::default();
+            let _ = plan::WindowsHyperV.list_devices(&mut runner);
+            let _ = plan::WindowsHyperV.addresses_on(&mut runner, "vEthernet (vlan11)");
+            let _ = plan::WindowsHyperV.is_wireless(&mut runner, "Ethernet 2");
+            let _ = plan::WindowsHyperV.link_is_active(&mut runner, "Ethernet 2");
+            let _ = plan::WindowsHyperV.parent_snapshot(&mut runner, "Ethernet 2");
+            windows_probes.extend(runner.commands);
+        }
+        assert_eq!(
+            windows_probes.len(),
+            5,
+            "every Windows probe should issue one command"
+        );
+        let probes: Vec<Cmd> = probes.into_iter().chain(windows_probes).collect();
         for cmd in &probes {
             assert!(
                 is_read_only_probe(cmd),

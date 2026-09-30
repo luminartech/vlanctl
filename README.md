@@ -1,8 +1,9 @@
 # vlanctl
 
 Apply and tear down named VLAN profiles for working with differently-configured
-lidar sensors. Supports macOS (`ifconfig`/`route`) and Linux (`ip`); the backend
-is chosen from the host at run time.
+lidar sensors. Supports macOS (`ifconfig`/`route`), Linux (`ip`) and Windows
+(Hyper-V virtual adapters plus `netsh`); the backend is chosen from the host at
+run time.
 
 ## Installation
 
@@ -36,9 +37,66 @@ your own `profiles/lum.toml`, or name a profile explicitly.
 the VLANs attach to and overrides any `device` field in the profile. The parent
 is **host-local** — macOS numbers adapters `enN` per machine, so a USB dongle
 can be `en7` on one Mac and `en12` on another, while Linux uses
-`eth0`/`enp*`/`enx*` — so the shipped profiles deliberately do not pin one.
-Auto-detect takes the single active wired adapter and skips Wi-Fi (which cannot
-carry 802.1Q VLANs); use `--device` when it is ambiguous or picks wrong.
+`eth0`/`enp*`/`enx*` and Windows uses the adapter's display name (`Ethernet 2`)
+— so the shipped profiles deliberately do not pin one. Auto-detect takes the
+single active wired adapter and skips Wi-Fi (which cannot carry 802.1Q VLANs);
+use `--device` when it is ambiguous or picks wrong. On Windows there is no
+auto-detect and `--device` is required — see below for why.
+
+### Windows
+
+Windows has no general 802.1Q sub-interface, so vlanctl has two Windows
+backends and picks one by the profile's shape:
+
+- **One `[[interface]]` entry: the adapter driver's own VLAN setting.** Most
+  wired drivers implement the standardized `VlanID` keyword; with it set, the
+  driver tags everything it sends, accepts only that VLAN on receive, and
+  strips the tag. The physical adapter becomes an access port for that VLAN
+  and gets the entry's address directly. No virtual switch is involved. The
+  keyword holds one id, which is why this backend takes only single-entry
+  profiles: to work with a sensor's live-data VLAN most of the time and its
+  diagnostics VLAN occasionally, keep them as two profiles and apply the one
+  you need.
+- **Several entries: Hyper-V.** The parent adapter is bound to an external
+  virtual switch named `vlanctl`, with one management-OS virtual adapter per
+  entry in access mode for that entry's VLAN. Interface names are the
+  adapters Windows creates, `vEthernet (vlan11)` for VLAN 11 and `vEthernet
+  (untagged)` for an untagged entry; because the parent's own stack is gone
+  once bound, the untagged entry is a virtual adapter too and is removed on
+  `down`. Hyper-V must be enabled (`Enable-WindowsOptionalFeature -Online
+  -FeatureName Microsoft-Hyper-V-All`, which reboots; Windows 10/11 Pro,
+  Enterprise, Education and Server, not Home). vlanctl never enables it.
+
+Either way, addresses, routes and static neighbor entries are set with
+`netsh`, and:
+
+- **`apply` and `down` need an elevated shell** (Run as administrator), the
+  Windows equivalent of `sudo`.
+- **The parent adapter is taken over.** Under the driver setting it transmits
+  tagged only; under the switch it has no addressing of its own. Pointing
+  vlanctl at the machine's uplink disconnects the machine until `down`. That
+  is why `--device` is required on Windows: vlanctl will not guess.
+- **The state file records which backend applied**, and `down` runs through
+  that one, so switching between the two across profiles is safe.
+- **Everything persists across a reboot** — the keyword, the switch and its
+  adapters, their addresses and routes. One thing does not recover by itself:
+  if the parent adapter is absent at boot (a dock that did not enumerate, a
+  USB NIC that was unplugged), Hyper-V leaves the switch unbound and does not
+  rebind it when the adapter returns. `vlanctl down` then `vlanctl apply`
+  recovers it.
+- **Setting the driver keyword restarts the adapter**: the link drops for a
+  few seconds on apply and again on `down`.
+- **A peer that has cached the address's MAC keeps using it.** The two
+  backends put the same address on different MACs (the physical adapter's
+  under the driver setting, a virtual adapter's under the switch). A device
+  that resolves a peer's MAC address once and keeps streaming to it will not
+  follow the address to the other adapter after a switch between backends; it
+  goes on sending to the old MAC until it restarts that stream. vlanctl cannot
+  detect this, so plan a restart of the peer's stream into any such switch.
+- The Hyper-V cmdlets and the keyword run through `powershell.exe -Command`,
+  which is not subject to script execution policy (no script file is
+  involved), and `netsh` is a plain executable, so nothing here needs signing
+  or a policy change.
 
 ## Library use
 
@@ -96,8 +154,9 @@ Each `[[interface]]` takes:
 
 - **`vlan`** — the 802.1Q tag. **Optional**: omit it for an *untagged* interface,
   and vlanctl configures the parent device directly instead of creating a VLAN
-  sub-interface. An untagged interface is left configured on `down`, since
-  vlanctl did not create the device.
+  sub-interface. On macOS and Linux an untagged interface is left configured on
+  `down`, since vlanctl did not create the device; on Windows it is a virtual
+  adapter vlanctl created, and is removed.
 - **`address`** — required, in CIDR form.
 - **`mtu`** — optional.
 - **`[[interface.route]]`** — zero or more routes, described below.
@@ -112,7 +171,8 @@ Each `[[interface.route]]` is one of two kinds:
   else as a network route.
 
 The exact commands are the host backend's business — macOS renders
-`route add -host <ip> -interface vlan11`, Linux `ip route add <ip> dev eth0.11`.
+`route add -host <ip> -interface vlan11`, Linux `ip route add <ip> dev eth0.11`,
+Windows `netsh interface ipv4 add route <ip>/32 "vEthernet (vlan11)"`.
 `vlanctl show <profile>` prints what would run on the current host.
 
 Interface-scoped routes are needed when several VLANs share a subnet (so a
@@ -147,14 +207,17 @@ form above is what real sensor profiles use.
 ## Notes
 
 - Mutating commands (`apply`, `down`) modify network interfaces and must run
-  under `sudo`. Read-only commands (`list`, `show`, `validate`, `status`) do not.
+  under `sudo`, or from an elevated shell on Windows. Read-only commands
+  (`list`, `show`, `validate`, `status`) do not.
 - `apply` tears down any currently-active profile first, then brings up the new
   one. If a step fails mid-way, it rolls back the interfaces it created.
-- State (the active profile and the `vlanN` interfaces vlanctl created) is tracked
-  at `/usr/local/var/vlanctl/state.json`. macOS assigns arbitrary `vlanN` unit
-  numbers, so vlanctl records what it created in order to tear it down later.
-- `--dry-run` previews the exact `ifconfig`/`route` commands without executing
-  them and without touching the state file.
+- State (the active profile and the interfaces vlanctl created) is tracked at
+  `/usr/local/var/vlanctl/state.json` on macOS and Linux and at
+  `%ProgramData%\vlanctl\state.json` on Windows. macOS assigns arbitrary `vlanN`
+  unit numbers, so vlanctl records what it created in order to tear it down
+  later.
+- `--dry-run` previews the exact commands without executing them and without
+  touching the state file.
 
 ## License
 

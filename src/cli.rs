@@ -14,8 +14,32 @@ pub struct Cli {
     #[arg(long, default_value = "profiles", global = true)]
     pub profiles_dir: PathBuf,
 
+    /// Also write the outcome as JSON to this file: `{"command", "ok",
+    /// "message", "created"}`. For a program that runs vlanctl in a process
+    /// whose output it cannot read — one launched elevated on Windows, say —
+    /// this is how it learns what happened. Written on success and failure
+    /// alike; a missing file afterwards means vlanctl never got as far as
+    /// running the command.
+    #[arg(long, global = true, value_name = "FILE")]
+    pub report: Option<PathBuf>,
+
     #[command(subcommand)]
     pub command: Command,
+}
+
+impl Command {
+    /// The subcommand's name as typed, for the report.
+    #[must_use]
+    pub fn name(&self) -> &'static str {
+        match self {
+            Command::List => "list",
+            Command::Show { .. } => "show",
+            Command::Validate { .. } => "validate",
+            Command::Apply { .. } => "apply",
+            Command::Down { .. } => "down",
+            Command::Status => "status",
+        }
+    }
 }
 
 #[derive(Subcommand)]
