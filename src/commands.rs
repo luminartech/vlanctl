@@ -197,10 +197,160 @@ pub fn apply<R: CommandRunner>(
     state.active_profile = Some(profile.name.clone());
     state.interfaces = created.clone();
     if !dry_run {
+        // Saved before the check below, deliberately: if verification fails
+        // the host is partly configured, and the caller needs a state file
+        // for `down` to have something to clean up.
         state.save(state_path)?;
+        // The bring-up commands exited 0; now ask the host, the way `down`
+        // does. A command that succeeds and an interface that exists are
+        // different claims.
+        let present =
+            surviving_interfaces(runner, platform, &created).map_err(|e| BringUpUnverified {
+                profile: profile.name.clone(),
+                reason: format!("{e:#}"),
+            })?;
+        let missing: Vec<String> = created
+            .iter()
+            .filter(|c| !present.contains(c))
+            .cloned()
+            .collect();
+        if !missing.is_empty() {
+            return Err(BringUpIncomplete {
+                profile: profile.name.clone(),
+                missing,
+            }
+            .into());
+        }
     }
     Ok(created)
 }
+
+/// [`apply`]'s bring-up commands all succeeded, but some interfaces it
+/// created were not on the host when it looked afterward.
+///
+/// Returned inside the `anyhow::Error`, so a caller that needs the names —
+/// to show the operator exactly what is missing — can
+/// `err.downcast_ref::<BringUpIncomplete>()` instead of parsing the message.
+/// The state file has already been saved, so [`down`] can clean up.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BringUpIncomplete {
+    pub profile: String,
+    pub missing: Vec<String>,
+}
+
+impl std::fmt::Display for BringUpIncomplete {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let one = self.missing.len() == 1;
+        write!(
+            f,
+            "applied profile '{}', but {} not on this host afterward: {}. \
+             The commands reported success, so something removed or \
+             refused {} after creation",
+            self.profile,
+            if one {
+                "one interface is"
+            } else {
+                "some interfaces are"
+            },
+            self.missing.join(", "),
+            if one { "it" } else { "them" },
+        )
+    }
+}
+
+impl std::error::Error for BringUpIncomplete {}
+
+/// [`down`]'s teardown commands all succeeded, but some recorded interfaces
+/// were still on the host afterward — typically because a connection
+/// manager re-creates them as fast as they are removed.
+///
+/// Returned inside the `anyhow::Error`; `err.downcast_ref::<TeardownIncomplete>()`
+/// recovers the names. The state file is deliberately left in place, so a
+/// retry still knows what it is responsible for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TeardownIncomplete {
+    /// The profile the state file recorded, if it named one.
+    pub profile: Option<String>,
+    pub survivors: Vec<String>,
+}
+
+impl std::fmt::Display for TeardownIncomplete {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let one = self.survivors.len() == 1;
+        write!(
+            f,
+            "tore down '{}', but {} still present on this host: {}. \
+             Something outside vlanctl is holding {} up — a connection \
+             manager with a profile for {} will re-create {} as fast as it \
+             is removed",
+            self.profile.as_deref().unwrap_or("(unnamed)"),
+            if one {
+                "one interface is"
+            } else {
+                "some interfaces are"
+            },
+            self.survivors.join(", "),
+            if one { "it" } else { "them" },
+            if one { "that name" } else { "those names" },
+            if one { "it" } else { "them" },
+        )
+    }
+}
+
+impl std::error::Error for TeardownIncomplete {}
+
+/// [`apply`]'s bring-up commands all succeeded, but the host could not be
+/// listed afterward, so whether the interfaces exist is unknown.
+///
+/// Distinct from a failed apply, which a caller must treat differently:
+/// the state file has been saved, so [`down`] can take down whatever was
+/// created. Recover it with `err.downcast_ref::<BringUpUnverified>()`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BringUpUnverified {
+    pub profile: String,
+    /// Why the listing failed.
+    pub reason: String,
+}
+
+impl std::fmt::Display for BringUpUnverified {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "applied profile '{}', but could not list this host's interfaces \
+             afterward to confirm it ({})",
+            self.profile, self.reason
+        )
+    }
+}
+
+impl std::error::Error for BringUpUnverified {}
+
+/// [`down`]'s teardown commands all succeeded, but the host could not be
+/// listed afterward, so whether anything survived is unknown.
+///
+/// The state file is left in place, as for [`TeardownIncomplete`]. Recover
+/// it with `err.downcast_ref::<TeardownUnverified>()`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TeardownUnverified {
+    /// The profile the state file recorded, if it named one.
+    pub profile: Option<String>,
+    /// Why the listing failed.
+    pub reason: String,
+}
+
+impl std::fmt::Display for TeardownUnverified {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "tore down '{}', but could not list this host's interfaces \
+             afterward to confirm it ({})",
+            self.profile.as_deref().unwrap_or("(unnamed)"),
+            self.reason
+        )
+    }
+}
+
+impl std::error::Error for TeardownUnverified {}
 
 /// Destroy created interfaces in reverse order, ignoring errors (best effort).
 fn rollback<R: CommandRunner>(runner: &mut R, platform: &dyn Platform, created: &[String]) {
@@ -232,10 +382,50 @@ pub fn down<R: CommandRunner>(
             runner.run(&cmd)?;
         }
     }
-    if !dry_run {
-        State::default().save(state_path)?;
+    if dry_run {
+        return Ok(());
     }
+    // The commands exited 0; now ask the host. Something outside vlanctl can
+    // hold an interface up — a NetworkManager connection profile for the same
+    // name re-creates it as fast as the teardown removes it — and a caller
+    // that trusts the exit code tells its operator the host is clean when it
+    // is not.
+    let survivors = surviving_interfaces(runner, platform, &state.interfaces).map_err(|e| {
+        TeardownUnverified {
+            profile: state.active_profile.clone(),
+            reason: format!("{e:#}"),
+        }
+    })?;
+    if !survivors.is_empty() {
+        // The record is deliberately NOT cleared. A retry needs to know what
+        // it is still responsible for, and the caller has just been told the
+        // teardown did not finish.
+        return Err(TeardownIncomplete {
+            profile: state.active_profile.clone(),
+            survivors,
+        }
+        .into());
+    }
+    State::default().save(state_path)?;
     Ok(())
+}
+
+/// Which of `interfaces` are still present on the host.
+///
+/// Its own function because both [`down`] and [`apply`] need the same
+/// question asked of the host rather than of the exit codes — one to confirm
+/// interfaces went away, the other to confirm they arrived.
+fn surviving_interfaces<R: CommandRunner>(
+    runner: &mut R,
+    platform: &dyn Platform,
+    interfaces: &[String],
+) -> Result<Vec<String>> {
+    let live = platform.list_devices(runner)?;
+    Ok(interfaces
+        .iter()
+        .filter(|name| live.contains(name))
+        .cloned()
+        .collect())
 }
 
 /// Render the full bring-up plan for a profile as displayable command lines,
@@ -341,8 +531,18 @@ mod tests {
 
     fn runner_with_device() -> RecordingRunner {
         let mut r = RecordingRunner::default();
-        r.stdout
-            .insert("ifconfig -l".to_string(), "lo0 en0".to_string());
+        // The pre-apply host, consumed by the collision guard.
+        r.stdout_queue.insert(
+            "ifconfig -l".to_string(),
+            ["lo0 en0"].into_iter().map(String::from).collect(),
+        );
+        // Every later answer is the host *after* bring-up, carrying the
+        // interfaces `profile()` creates. `apply` verifies its own work now,
+        // so a fixture that never gains them describes a failed apply.
+        r.stdout.insert(
+            "ifconfig -l".to_string(),
+            "lo0 en0 vlan100 vlan200".to_string(),
+        );
         r
     }
 
@@ -372,7 +572,23 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join(",")
         );
-        r.stdout.insert("ip -json link show".to_string(), json);
+        // The pre-apply host, consumed by the collision guard...
+        r.stdout_queue.insert(
+            "ip -json link show".to_string(),
+            [json.clone()].into_iter().collect(),
+        );
+        // ...and every later answer is the host after bring-up, carrying what
+        // `linux_profile()` creates. `apply` verifies its own work now, so a
+        // fixture that never gains them describes a failed apply.
+        let after = format!(
+            "[{}]",
+            live.split_whitespace()
+                .chain(["eth0.100", "eth0.200"])
+                .map(|n| format!(r#"{{"ifname":"{n}"}}"#))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        r.stdout.insert("ip -json link show".to_string(), after);
         // The vlan-id guard's probe. A real host always emits a JSON array,
         // so an empty default here would be an unrealistic fixture — and the
         // parse is deliberately strict, treating unreadable output as a
@@ -397,6 +613,112 @@ mod tests {
         let state = State::load(&state_path).unwrap();
         assert_eq!(state.active_profile.as_deref(), Some("t"));
         assert_eq!(state.interfaces, vec!["eth0.100", "eth0.200"]);
+        std::fs::remove_file(&state_path).unwrap();
+    }
+
+    /// The bring-up commands exiting 0 is not the same as the interfaces
+    /// existing. `apply` asks the host afterward, the way `down` does.
+    #[test]
+    fn apply_reports_interfaces_that_never_appeared() {
+        let state_path = std::env::temp_dir().join("vlanctl-apply-missing.json");
+        let _ = std::fs::remove_file(&state_path);
+        let mut r = linux_runner("lo eth0");
+        // Override the post-apply answer: the commands succeeded but the
+        // host never gained the interfaces.
+        r.stdout.insert(
+            "ip -json link show".to_string(),
+            r#"[{"ifname":"lo"},{"ifname":"eth0"}]"#.to_string(),
+        );
+
+        let err = apply(&mut r, &Linux, &linux_profile(), None, &state_path, false)
+            .expect_err("interfaces that never appeared are not a successful apply");
+        let text = err.to_string();
+        assert!(
+            text.contains("eth0.100"),
+            "the missing interface must be named: {text}"
+        );
+        // And recoverable as data, so a caller can act on the names without
+        // parsing the message.
+        let typed = err
+            .downcast_ref::<BringUpIncomplete>()
+            .expect("a failed verification is a BringUpIncomplete");
+        assert_eq!(typed.profile, "t");
+        assert_eq!(typed.missing, vec!["eth0.100", "eth0.200"]);
+
+        // State is still written: the caller needs `down` to be able to clean
+        // up whatever *did* get created.
+        assert_eq!(
+            State::load(&state_path).unwrap().active_profile.as_deref(),
+            Some("t")
+        );
+        let _ = std::fs::remove_file(&state_path);
+    }
+
+    /// A post-apply listing that fails is not a failed apply: the commands
+    /// ran and the state was saved. It has to be distinguishable from one, or
+    /// a caller tells its operator nothing was touched.
+    #[test]
+    fn apply_whose_host_cannot_be_listed_afterward_is_unverified() {
+        let state_path = std::env::temp_dir().join("vlanctl-apply-unverified.json");
+        let _ = std::fs::remove_file(&state_path);
+        let mut r = linux_runner("lo eth0");
+        r.stdout
+            .insert("ip -json link show".to_string(), "not json".to_string());
+
+        let err = apply(&mut r, &Linux, &linux_profile(), None, &state_path, false)
+            .expect_err("an unconfirmed apply is not a success");
+        let typed = err
+            .downcast_ref::<BringUpUnverified>()
+            .unwrap_or_else(|| panic!("expected BringUpUnverified; got {err:#}"));
+        assert_eq!(typed.profile, "t");
+        assert_eq!(
+            State::load(&state_path).unwrap().active_profile.as_deref(),
+            Some("t"),
+            "the state is saved so `down` can clean up"
+        );
+        let _ = std::fs::remove_file(&state_path);
+    }
+
+    /// The teardown counterpart: commands ran, the host could not be asked.
+    #[test]
+    fn down_whose_host_cannot_be_listed_afterward_is_unverified() {
+        let state_path = std::env::temp_dir().join("vlanctl-down-unverified.json");
+        State {
+            active_profile: Some("t".to_string()),
+            interfaces: vec!["eth0.100".to_string()],
+        }
+        .save(&state_path)
+        .unwrap();
+        let mut r = RecordingRunner::default();
+        // Live before teardown; unreadable after it.
+        r.stdout_queue.insert(
+            "ip -json link show".to_string(),
+            [r#"[{"ifname":"eth0"},{"ifname":"eth0.100"}]"#.to_string()]
+                .into_iter()
+                .collect(),
+        );
+        r.stdout
+            .insert("ip -json link show".to_string(), "not json".to_string());
+
+        let err = down(&mut r, &Linux, &state_path, false)
+            .expect_err("an unconfirmed teardown is not a clean one");
+        assert_eq!(
+            err.downcast_ref::<TeardownUnverified>()
+                .map(|t| t.profile.as_deref()),
+            Some(Some("t")),
+            "expected TeardownUnverified; got {err:#}"
+        );
+        assert!(
+            r.commands
+                .iter()
+                .any(|c| c.display().starts_with("ip link del")),
+            "the teardown itself must have run"
+        );
+        assert_eq!(
+            State::load(&state_path).unwrap().interfaces,
+            vec!["eth0.100".to_string()],
+            "state survives an unconfirmed teardown"
+        );
         std::fs::remove_file(&state_path).unwrap();
     }
 
@@ -677,8 +999,16 @@ mod tests {
         };
         state.save(&state_path).unwrap();
         let mut r = RecordingRunner::default();
-        r.stdout
-            .insert("ifconfig -l".to_string(), "lo0 en0 vlan0 vlan1".to_string());
+        // Live before teardown, gone after it — `down` now asks twice, and a
+        // constant answer would make a successful teardown indistinguishable
+        // from one that did nothing.
+        r.stdout_queue.insert(
+            "ifconfig -l".to_string(),
+            ["lo0 en0 vlan0 vlan1", "lo0 en0"]
+                .into_iter()
+                .map(String::from)
+                .collect(),
+        );
         down(&mut r, &MacOs, &state_path, false).unwrap();
         // Drop the `ifconfig -l` probe; assert on the teardown commands only.
         let rendered: Vec<String> = r
@@ -709,14 +1039,69 @@ mod tests {
         .unwrap();
         let mut r = RecordingRunner::default();
         // vlan10 survived (somehow), vlan11 is gone. Only vlan10 should be
-        // destroyed; the missing vlan11 is silently skipped.
-        r.stdout
-            .insert("ifconfig -l".to_string(), "lo0 en0 vlan10".to_string());
+        // destroyed; the missing vlan11 is silently skipped. The second
+        // answer is the post-teardown host, with vlan10 now gone too.
+        r.stdout_queue.insert(
+            "ifconfig -l".to_string(),
+            ["lo0 en0 vlan10", "lo0 en0"]
+                .into_iter()
+                .map(String::from)
+                .collect(),
+        );
         down(&mut r, &MacOs, &state_path, false).unwrap();
         let rendered: Vec<String> = r.commands.iter().map(|c| c.display()).collect();
         assert!(rendered.contains(&"ifconfig vlan10 destroy".to_string()));
         assert!(!rendered.contains(&"ifconfig vlan11 destroy".to_string()));
         assert_eq!(State::load(&state_path).unwrap(), State::default());
+        std::fs::remove_file(&state_path).unwrap();
+    }
+
+    /// `down` exiting 0 is not the same as the host being clean. Something
+    /// outside vlanctl can hold an interface up — a NetworkManager
+    /// connection profile for the same name re-creates it as fast as
+    /// `ip link del` removes it, which was measured on a bench where the
+    /// ifindex moved while the interface never disappeared.
+    ///
+    /// Reporting success there is the worst answer available: the caller
+    /// tells its operator the host is clean and everyone stops looking.
+    #[test]
+    fn down_reports_interfaces_that_survive_teardown() {
+        let state_path = std::env::temp_dir().join("vlanctl-down-survivor.json");
+        State {
+            active_profile: Some("t".to_string()),
+            interfaces: vec!["vlan10".to_string()],
+        }
+        .save(&state_path)
+        .unwrap();
+        let mut r = RecordingRunner::default();
+        // Live before teardown, and still live after it.
+        r.stdout
+            .insert("ifconfig -l".to_string(), "lo0 en0 vlan10".to_string());
+
+        let err = down(&mut r, &MacOs, &state_path, false)
+            .expect_err("a surviving interface is not a clean teardown");
+        let text = err.to_string();
+        assert!(
+            text.contains("vlan10"),
+            "the survivor must be named: {text}"
+        );
+        assert_eq!(
+            err.downcast_ref::<TeardownIncomplete>(),
+            Some(&TeardownIncomplete {
+                profile: Some("t".to_string()),
+                survivors: vec!["vlan10".to_string()],
+            }),
+            "a failed teardown is a TeardownIncomplete carrying the survivors"
+        );
+
+        // The record is kept, not cleared: a retry needs to know what it is
+        // still responsible for, and the caller was just told the host is
+        // not clean.
+        assert_eq!(
+            State::load(&state_path).unwrap().interfaces,
+            vec!["vlan10".to_string()],
+            "state must survive a teardown that did not finish"
+        );
         std::fs::remove_file(&state_path).unwrap();
     }
 
@@ -748,7 +1133,11 @@ mod tests {
     fn apply_untagged_configures_parent_and_records_only_vlan() {
         let state_path = std::env::temp_dir().join("vlanctl-apply-untagged.json");
         let _ = std::fs::remove_file(&state_path);
-        let mut r = runner_with_device(); // "ifconfig -l" -> "lo0 en0"; "ifconfig en0" -> empty
+        let mut r = runner_with_device();
+        // This profile creates vlan12, not the vlan100/200 the shared
+        // helper scripts; `apply` verifies against the host afterward.
+        r.stdout
+            .insert("ifconfig -l".to_string(), "lo0 en0 vlan12".to_string()); // "ifconfig -l" -> "lo0 en0"; "ifconfig en0" -> empty
         let created = apply(
             &mut r,
             &MacOs,
@@ -774,6 +1163,10 @@ mod tests {
         let state_path = std::env::temp_dir().join("vlanctl-apply-untagged-idem.json");
         let _ = std::fs::remove_file(&state_path);
         let mut r = runner_with_device();
+        // This profile creates vlan12, not the vlan100/200 the shared
+        // helper scripts; `apply` verifies against the host afterward.
+        r.stdout
+            .insert("ifconfig -l".to_string(), "lo0 en0 vlan12".to_string());
         r.stdout.insert(
             "ifconfig en0".to_string(),
             "\tinet 192.168.1.100 netmask 0xffffff00 broadcast 192.168.1.255".to_string(),

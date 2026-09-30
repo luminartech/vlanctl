@@ -37,6 +37,16 @@ pub struct RecordingRunner {
     pub commands: Vec<Cmd>,
     pub fail_at: Option<usize>,
     pub stdout: std::collections::HashMap<String, String>,
+    /// Successive answers for a command whose output *changes* as earlier
+    /// commands run, consumed in order and falling back to [`Self::stdout`]
+    /// once exhausted.
+    ///
+    /// A single fixed answer cannot express the one thing a verification
+    /// step exists to notice: that the host looked one way before the
+    /// commands ran and another way after. Scripting `ifconfig -l` as
+    /// "present" forever makes a successful teardown indistinguishable from
+    /// one that silently did nothing.
+    pub stdout_queue: std::collections::HashMap<String, std::collections::VecDeque<String>>,
 }
 
 impl CommandRunner for RecordingRunner {
@@ -45,6 +55,13 @@ impl CommandRunner for RecordingRunner {
         self.commands.push(cmd.clone());
         if Some(index) == self.fail_at {
             bail!("simulated failure running `{}`", cmd.display());
+        }
+        if let Some(queued) = self
+            .stdout_queue
+            .get_mut(&cmd.display())
+            .and_then(std::collections::VecDeque::pop_front)
+        {
+            return Ok(queued);
         }
         Ok(self.stdout.get(&cmd.display()).cloned().unwrap_or_default())
     }

@@ -10,7 +10,9 @@
 
 pub mod commands;
 pub mod config;
+pub mod conflict;
 pub mod device;
 pub mod net;
+pub mod permanence;
 pub mod plan;
 pub mod state;
