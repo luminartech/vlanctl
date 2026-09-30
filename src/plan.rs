@@ -1091,7 +1091,7 @@ mod tests {
             toml::from_str("name=\"live\"\n[[interface]]\nvlan=11\naddress=\"192.168.11.87/24\"\n")
                 .unwrap();
         let two: Profile = toml::from_str(
-            "name=\"iris\"\n[[interface]]\nvlan=10\naddress=\"192.168.10.90/24\"\n\
+            "name=\"lab\"\n[[interface]]\nvlan=10\naddress=\"192.168.10.90/24\"\n\
              [[interface]]\nvlan=11\naddress=\"192.168.11.87/24\"\n",
         )
         .unwrap();

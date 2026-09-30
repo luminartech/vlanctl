@@ -52,10 +52,10 @@
 //!
 //! **A peer that cached the address's MAC keeps using it.** This backend
 //! keeps the parent's MAC, so switching from a Hyper-V profile back to
-//! this one moves the address to a different MAC. A sensor that resolved
-//! the address while the Hyper-V profile was up keeps sending to the
-//! virtual adapter's MAC until its own datapath restarts. Nothing here
-//! can tell it; the caller has to.
+//! this one moves the address to a different MAC. A device that resolved
+//! the address while the Hyper-V profile was up and keeps streaming to it
+//! goes on sending to the virtual adapter's MAC until it restarts that
+//! stream. Nothing here can detect that; the caller has to plan for it.
 //!
 //! Elevation, `powershell.exe -Command` and the literal escape
 //! ([`ps_literal`]) are as for the Hyper-V backend.
@@ -135,8 +135,8 @@ impl Platform for WindowsDriverVlan {
         // The adapter outlives the profile here, and so would every route
         // and static neighbor the apply added to it — persistent, and a
         // `netsh add route` of the same prefix refuses a duplicate, which
-        // is how the second apply after a revert failed on the bench
-        // (2026-09-27). So the routes and neighbors go first, then the
+        // makes the second apply after a revert fail if they are left
+        // behind. So the routes and neighbors go first, then the
         // address, while the adapter is stable; then the keyword, which
         // restarts it. DHCP is where a sensor-facing adapter rests when
         // nothing is applied: it is what the adapter had before the first
@@ -312,8 +312,8 @@ fn set_neighbor_script(host: &str, mac: &str, iface: &str) -> String {
 /// (`Protocol` `NetMgmt`), and so is anything an operator added by hand —
 /// which this removes too, and the module doc says so: this backend takes
 /// the adapter over. The stack's own multicast and broadcast neighbor
-/// entries are `Permanent` too (measured 2026-09-27: `224.0.0.22`,
-/// `239.255.255.250`, the subnet broadcast), so the neighbor filter is on
+/// entries are `Permanent` too (in practice `224.0.0.22`,
+/// `239.255.255.250` and the subnet broadcast), so the neighbor filter is on
 /// the link-layer address: a static neighbor an apply added is never a
 /// multicast or broadcast MAC. Ends in `exit 0` for the same reason the
 /// address probe does: a removal that found nothing must not fail the
@@ -407,9 +407,9 @@ mod tests {
         assert_eq!(cmds.len(), 4);
     }
 
-    /// The adapter persists across applies, and so do its routes: the second
-    /// apply after a revert failed on the bench (2026-09-27) because `netsh
-    /// add route` refused the prefix the first apply had left behind. A
+    /// The adapter persists across applies, and so do its routes: without
+    /// this, the second apply after a revert fails because `netsh add route`
+    /// refuses the prefix the first apply left behind. A
     /// route command must therefore replace, not add — and a gateway and a
     /// static neighbor each ride the same remove-then-add shape.
     #[test]
@@ -512,7 +512,7 @@ mod tests {
                 .unwrap();
         assert!(WindowsDriverVlan.validate_profile(&one).is_ok());
         let two: Profile = toml::from_str(
-            "name=\"iris\"\n[[interface]]\nvlan=10\naddress=\"192.168.10.90/24\"\n\
+            "name=\"lab\"\n[[interface]]\nvlan=10\naddress=\"192.168.10.90/24\"\n\
              [[interface]]\nvlan=11\naddress=\"192.168.11.87/24\"\n",
         )
         .unwrap();

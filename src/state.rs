@@ -14,10 +14,10 @@ const STATE_PATH: &str = "/usr/local/var/vlanctl/state.json";
 /// one. On macOS and Linux a VLAN sub-interface sits beside the parent's own
 /// addressing and nothing is lost, so the state file carries `None`. The
 /// Hyper-V backend binds the parent to an external switch, and Windows
-/// clears the parent's addresses when it does — measured 2026-09-28: a
-/// parent with a static `192.168.11.87/24` came back from `Remove-VMSwitch`
-/// still marked static but holding no address at all, so it sat on an APIPA
-/// address and nothing on the host could reach the sensor's subnet again.
+/// clears the parent's addresses when it does, and `Remove-VMSwitch` does
+/// not restore them: a parent with a static `192.168.11.87/24` comes back
+/// still marked static but holding no address at all, so it sits on an
+/// APIPA address and nothing on the host can reach that subnet again.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct ParentConfig {
     /// The parent device, in the platform's own naming (`Ethernet 2`).

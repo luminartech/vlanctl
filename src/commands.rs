@@ -819,7 +819,7 @@ mod tests {
     /// VLAN 12, both of which become Hyper-V virtual adapters there.
     fn windows_profile() -> Profile {
         let p: Profile = toml::from_str(
-            "name=\"halo\"\ndevice=\"Ethernet 2\"\n\
+            "name=\"lab\"\ndevice=\"Ethernet 2\"\n\
              [[interface]]\naddress=\"192.168.1.100/24\"\n\
              [[interface.route]]\ndestination=\"192.168.10.151/32\"\n\
              [[interface]]\nvlan=12\naddress=\"192.168.10.1/24\"\n",
@@ -922,12 +922,13 @@ mod tests {
         probe.commands[0].display()
     }
 
-    /// Bench, 2026-09-28: Apply → Revert left the parent adapter static
-    /// with no address — `New-VMSwitch` cleared its `192.168.11.87/24` and
-    /// `Remove-VMSwitch` did not put it back — so the host sat on APIPA and
-    /// could not reach the sensor's subnet until the address was re-entered
-    /// by hand. `apply` must record what the parent carried and `down` must
-    /// restore it after the last adapter is gone.
+    /// `New-VMSwitch` clears the parent adapter's static address (here
+    /// `192.168.11.87/24`) and `Remove-VMSwitch` does not put it back, so
+    /// without a restore, apply followed by `down` leaves the parent static
+    /// with no address: the host sits on APIPA and cannot reach that subnet
+    /// until the address is re-entered by hand. `apply` must record what the
+    /// parent carried and `down` must restore it after the last adapter is
+    /// gone.
     #[test]
     fn apply_with_windows_records_the_parents_addressing_and_down_puts_it_back() {
         let state_path = std::env::temp_dir().join("vlanctl-windows-parent-restore.json");
@@ -1123,7 +1124,7 @@ mod tests {
         // on a virtual adapter and leave the switch bound.
         let state_path = std::env::temp_dir().join("vlanctl-cross-backend-teardown.json");
         State {
-            active_profile: Some("iris".to_string()),
+            active_profile: Some("lab".to_string()),
             interfaces: vec!["vEthernet (vlan11)".to_string()],
             backend: Some("windows-hyperv".to_string()),
             parent: None,

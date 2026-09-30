@@ -76,8 +76,8 @@ impl CommandRunner for SystemRunner {
         if !output.status.success() {
             // stderr is where a failure's reason belongs, but not every tool
             // puts it there: `netsh` explains a refused route on stdout and
-            // leaves stderr empty, which rendered as "failed: " on the
-            // bench. Fall back to stdout so the message carries something.
+            // leaves stderr empty, which would render as a bare "failed: ".
+            // Fall back to stdout so the message carries something.
             let stderr = String::from_utf8_lossy(&output.stderr);
             let stdout = String::from_utf8_lossy(&output.stdout);
             let reason = if stderr.trim().is_empty() {

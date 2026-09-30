@@ -19,8 +19,8 @@
 //! - `netsh` for the address, MTU, routes and static neighbor entries, in
 //!   the same argv form the other backends use.
 //!
-//! `netsh` rather than the `Net*` cmdlets for addressing is a bench finding,
-//! not a preference: `New-NetIPAddress` fails on a virtual adapter whose
+//! `netsh` rather than the `Net*` cmdlets for addressing follows observed
+//! behavior, not a preference: `New-NetIPAddress` fails on a virtual adapter whose
 //! parent has no link (`Inconsistent parameters PolicyStore PersistentStore
 //! and Dhcp Enabled`) and, when it does succeed, does not always reach the
 //! persistent store. `netsh interface ipv4 set address` works in both states
@@ -33,7 +33,7 @@
 //! removes the switch again. Point this backend at the machine's uplink and
 //! the machine loses its uplink. That is why [`WindowsHyperV`] answers `true` to
 //! [`Platform::claims_parent_exclusively`] and device auto-detection refuses
-//! to guess here: name the sensor-facing adapter explicitly.
+//! to guess here: name the device-facing adapter explicitly.
 //!
 //! **The parent is not a Linux-style interface name.** `device` is the
 //! adapter's *name* as `Get-NetAdapter` shows it — `Ethernet 2`, not a GUID
@@ -170,9 +170,9 @@ impl Platform for WindowsHyperV {
         let alias = adapter_alias(&vnic);
         let mut cmds = vec![powershell(&create_script(interface, device))];
         // `netsh ... set address <alias> static <ip> <mask>` — the form
-        // proven on the bench (see the module doc for why not
+        // known to work on a virtual adapter (see the module doc for why not
         // `New-NetIPAddress`). Positional rather than `name=` keyword form
-        // because that is the form that was proven with an alias containing
+        // because that is the form known to work with an alias containing
         // spaces, and the two are documented as equivalent.
         let addr = interface.address.addr().to_string();
         let mask = ipv4_netmask(interface.address.prefix_len());
@@ -383,9 +383,9 @@ impl Platform for WindowsHyperV {
         device: &str,
     ) -> Result<Option<ParentConfig>> {
         // Binding the parent to the switch clears its addresses, and
-        // removing the switch does not bring them back (measured
-        // 2026-09-28: a static `192.168.11.87/24` came back from
-        // `Remove-VMSwitch` as "static, no address", i.e. APIPA). Read
+        // removing the switch does not bring them back (a static
+        // `192.168.11.87/24` comes back from `Remove-VMSwitch` as "static,
+        // no address", i.e. APIPA). Read
         // what is there now, before `New-VMSwitch` runs, so `down` can put
         // it back.
         let out = runner
@@ -671,8 +671,8 @@ fn create_script(interface: &Interface, device: &str) -> String {
 /// adapter drops them from the active table, but `netsh ... add route`
 /// also wrote them to the persistent store, and a persistent route whose
 /// adapter is gone has been seen to linger there and surface against the
-/// parent's own interface index after the switch released it (bench,
-/// 2026-09-28: the profile's `/32` routes still listed after a full
+/// parent's own interface index after the switch released it (a
+/// profile's `/32` routes have been observed still listed after a full
 /// revert). Both cmdlets run with `SilentlyContinue` because an adapter
 /// with no routes is the ordinary case, not a failure.
 fn teardown_script(vnic: &str) -> String {
@@ -814,7 +814,7 @@ mod tests {
         );
     }
 
-    /// Bench-measured 2026-09-28: `New-VMSwitch` can accept a request it
+    /// `New-VMSwitch` can accept a request it
     /// cannot actually fulfil — no terminating error, just an `Internal`
     /// switch with no adapter bound — when the requested adapter cannot be
     /// claimed as an external uplink right now (observed after manually
@@ -919,12 +919,13 @@ mod tests {
 
     // ── the parent's own configuration ──────────────────────────────────
 
-    /// Bench, 2026-09-28: after Apply → Revert the parent adapter was back
-    /// on its own stack, still marked static, and holding no address —
-    /// `New-VMSwitch` had cleared the static `192.168.11.87/24` and
-    /// `Remove-VMSwitch` did not restore it. The host sat on APIPA and
-    /// nothing could reach the sensor's subnet until an operator re-entered
-    /// the address by hand. These pin the record-and-restore round trip.
+    /// `New-VMSwitch -AllowManagementOS $false` clears the parent adapter's
+    /// IPv4 configuration (here a static `192.168.11.87/24`), and
+    /// `Remove-VMSwitch` does not restore it: after teardown the parent is
+    /// back on its own stack, still marked static, and holding no address,
+    /// so the host sits on APIPA and nothing can reach that subnet until an
+    /// operator re-enters the address by hand. These pin the
+    /// record-and-restore round trip.
     #[test]
     fn the_parent_probe_is_read_only_and_parses_a_static_configuration() {
         let probe = parent_config_probe("Ethernet 2");
@@ -1026,8 +1027,9 @@ mod tests {
             cmds[1].display(),
             "netsh interface ipv4 set address Ethernet 2 dhcp"
         );
-        // Static with no address is what the bench found *after* the bug;
-        // recording it must not make `down` invent a configuration.
+        // Static with no address is the state a parent is left in *after*
+        // an unrestored teardown; recording it must not make `down` invent a
+        // configuration.
         let bare = ParentConfig {
             device: "Ethernet 2".to_string(),
             dhcp: false,

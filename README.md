@@ -89,10 +89,10 @@ Either way, addresses, routes and static neighbor entries are set with
 - **A peer that has cached the address's MAC keeps using it.** The two
   backends put the same address on different MACs (the physical adapter's
   under the driver setting, a virtual adapter's under the switch). A device
-  that resolved the address under one and keeps streaming to it, as a sensor
-  does with its point cloud, goes on sending to the old MAC after a switch to
-  the other until its own datapath restarts. vlanctl cannot tell it; plan a
-  restart of the peer's stream into any such switch.
+  that resolves a peer's MAC address once and keeps streaming to it will not
+  follow the address to the other adapter after a switch between backends; it
+  goes on sending to the old MAC until it restarts that stream. vlanctl cannot
+  detect this, so plan a restart of the peer's stream into any such switch.
 - The Hyper-V cmdlets and the keyword run through `powershell.exe -Command`,
   which is not subject to script execution policy (no script file is
   involved), and `netsh` is a plain executable, so nothing here needs signing
