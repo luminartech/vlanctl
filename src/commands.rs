@@ -834,12 +834,26 @@ mod tests {
     /// backend rather than spelled out, so a change to how it is rendered
     /// cannot silently turn this stub into an unmapped command.
     fn windows_runner(live: &[&str]) -> RecordingRunner {
+        let mut r = RecordingRunner::default();
+        r.stdout.insert(windows_list_probe(), live.join("\r\n"));
+        r
+    }
+
+    /// A runner whose Windows `list_devices` probe answers `before` the
+    /// first time and `after` from then on: the host as the first listing
+    /// finds it, and as `apply` and `down` see it when they check their own
+    /// work.
+    fn windows_runner_changing(before: &[&str], after: &[&str]) -> RecordingRunner {
+        let mut r = windows_runner(after);
+        r.stdout_queue
+            .insert(windows_list_probe(), [before.join("\r\n")].into());
+        r
+    }
+
+    fn windows_list_probe() -> String {
         let mut probe = RecordingRunner::default();
         WindowsHyperV.list_devices(&mut probe).unwrap();
-        let mut r = RecordingRunner::default();
-        r.stdout
-            .insert(probe.commands[0].display(), live.join("\r\n"));
-        r
+        probe.commands[0].display()
     }
 
     #[test]
@@ -850,7 +864,15 @@ mod tests {
         // it, and with it the switch binding that took the parent over.
         let state_path = std::env::temp_dir().join("vlanctl-windows-apply-ok.json");
         let _ = std::fs::remove_file(&state_path);
-        let mut r = windows_runner(&["Ethernet 2", "Wi-Fi"]);
+        let mut r = windows_runner_changing(
+            &["Ethernet 2", "Wi-Fi"],
+            &[
+                "Ethernet 2",
+                "Wi-Fi",
+                "vEthernet (untagged)",
+                "vEthernet (vlan12)",
+            ],
+        );
         let created = apply(
             &mut r,
             &WindowsHyperV,
@@ -865,7 +887,10 @@ mod tests {
         assert_eq!(state.interfaces, created);
 
         // Both adapters are live now; `down` must remove both, in reverse.
-        let mut r = windows_runner(&["Ethernet 2", "vEthernet (untagged)", "vEthernet (vlan12)"]);
+        let mut r = windows_runner_changing(
+            &["Ethernet 2", "vEthernet (untagged)", "vEthernet (vlan12)"],
+            &["Ethernet 2"],
+        );
         down(&mut r, &WindowsHyperV, &state_path, false).unwrap();
         let teardowns: Vec<&str> = r
             .commands
@@ -907,7 +932,15 @@ mod tests {
     fn apply_with_windows_records_the_parents_addressing_and_down_puts_it_back() {
         let state_path = std::env::temp_dir().join("vlanctl-windows-parent-restore.json");
         let _ = std::fs::remove_file(&state_path);
-        let mut r = windows_runner(&["Ethernet 2", "Wi-Fi"]);
+        let mut r = windows_runner_changing(
+            &["Ethernet 2", "Wi-Fi"],
+            &[
+                "Ethernet 2",
+                "Wi-Fi",
+                "vEthernet (untagged)",
+                "vEthernet (vlan12)",
+            ],
+        );
         r.stdout.insert(
             windows_parent_probe(),
             "dhcp Disabled\r\naddress 192.168.11.87/24\r\n".to_string(),
@@ -930,7 +963,10 @@ mod tests {
             vec!["192.168.11.87/24".parse::<IpNet>().unwrap()]
         );
 
-        let mut r = windows_runner(&["Ethernet 2", "vEthernet (untagged)", "vEthernet (vlan12)"]);
+        let mut r = windows_runner_changing(
+            &["Ethernet 2", "vEthernet (untagged)", "vEthernet (vlan12)"],
+            &["Ethernet 2"],
+        );
         down(&mut r, &WindowsHyperV, &state_path, false).unwrap();
         let rendered: Vec<String> = r.commands.iter().map(|c| c.display()).collect();
         let restore = rendered
@@ -1099,7 +1135,7 @@ mod tests {
              [[interface]]\nvlan=11\naddress=\"192.168.11.87/24\"\n",
         )
         .unwrap();
-        let mut r = windows_runner(&["Ethernet 2", "vEthernet (vlan11)"]);
+        let mut r = windows_runner_changing(&["Ethernet 2", "vEthernet (vlan11)"], &["Ethernet 2"]);
         apply(&mut r, &WindowsDriverVlan, &live, None, &state_path, false).unwrap();
         let rendered: Vec<String> = r.commands.iter().map(|c| c.display()).collect();
         assert!(
